@@ -1,0 +1,18 @@
+[package]
+name = "lattice-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lattice shared core: Envelope / frame codec / protocol constants (design §5, §17)"
+
+[dependencies]
+bytes.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+ulid.workspace = true
+base64.workspace = true
+sha2.workspace = true
+xxhash-rust.workspace = true

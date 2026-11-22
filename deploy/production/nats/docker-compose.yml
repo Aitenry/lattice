@@ -1,0 +1,64 @@
+# =============================================================================
+# Lattice production NATS — 3-node JetStream cluster (Raft; a single node failure does not stop service
+# or lose committed messages)
+# -----------------------------------------------------------------------------
+# Notes (read these first):
+#   1) This file is a **topology reference** for 3 containers on one host; production is 3 hosts each
+#      running one nats-server. The authoritative parameters are nats-0/1/2.conf (the three differ only
+#      in server_name).
+#   2) **streams.sh must run before the nodes start** to pre-create the Streams with replicas=3 (see the
+#      header of nats-0.conf for why).
+#   3) No host ports are published: the dev stack already uses 4222/8222; production provides a stable
+#      endpoint through the LB (the node's [bus] nats_url accepts a single URL and cannot fail over across
+#      a server list, see README §3).
+#   4) Client auth/TLS are commented-out placeholders in the template (mandatory in production); dev
+#      drills may run without auth.
+#
+#   docker compose -f deploy/production/nats/docker-compose.yml config   # offline check
+# =============================================================================
+name: lattice-nats-ha
+
+networks:
+  natsnet:
+    driver: bridge
+
+volumes:
+  nats-0-data:
+  nats-1-data:
+  nats-2-data:
+
+services:
+  nats-0: &nats
+    image: nats:2.10-alpine
+    container_name: lattice-nats-0
+    hostname: nats-0
+    networks: [natsnet]
+    restart: unless-stopped
+    volumes:
+      - nats-0-data:/data
+      - ./nats-0.conf:/etc/nats/nats.conf:ro
+      # [enable in production] TLS certificates (mounted from a Secret)
+      # - ./tls:/etc/nats/tls:ro
+    command: ["-c", "/etc/nats/nats.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q 'ok'"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  nats-1:
+    <<: *nats
+    container_name: lattice-nats-1
+    hostname: nats-1
+    volumes:
+      - nats-1-data:/data
+      - ./nats-1.conf:/etc/nats/nats.conf:ro
+
+  nats-2:
+    <<: *nats
+    container_name: lattice-nats-2
+    hostname: nats-2
+    volumes:
+      - nats-2-data:/data
+      - ./nats-2.conf:/etc/nats/nats.conf:ro

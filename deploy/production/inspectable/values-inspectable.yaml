@@ -1,0 +1,179 @@
+# =============================================================================
+# Inspectable isolated cluster — Helm values overlay (E28 / PL-15 15.12 / design §17.7)
+# =============================================================================
+#
+# Purpose: render the existing chart into the "inspectable mode + physically isolated cluster" shape for
+# **offline comparison**:
+#
+#   helm template lattice deploy/helm/lattice -n lattice-inspectable \
+#       -f deploy/production/inspectable/values-inspectable.yaml
+#   helm lint deploy/helm/lattice -f deploy/production/inspectable/values-inspectable.yaml
+#
+# Generate the comparison report (asserting that differences are limited to expected items and that the
+# checker catches unexpected differences):
+#   python scripts/inspectable-diff.py
+#
+# -----------------------------------------------------------------------------
+# Boundaries (read first; never let values outrun the code's capabilities)
+# -----------------------------------------------------------------------------
+# 1) This file only covers **deployment-layer** differences: mode declaration, dedicated dependency
+#    endpoints, a dedicated Secret/key domain, network policy, and a dedicated entry point. The node-side
+#    capability of "inspectable = server can decrypt payload" is **not implemented in this repo yet**
+#    (REMAINING E15: KEK wrapping/re-encryption/audit hooks are placeholders only, there is no KMS client,
+#    and `/v1/admin/keys/rotate?target=kek` explicitly returns 202 + implemented:false). Therefore:
+#      * **no KMS/KEK Secret, environment variable, or configuration item is rendered here** — the node
+#        does not consume them, and rendering them would only create the illusion that "KMS is wired in";
+#      * the KEK is hosted and rotated by a KMS/Vault outside the cluster (see
+#        deploy/production/inspectable-cluster.md).
+# 2) TLS / backup / PITR / HPA are production requirements **common to both shapes** and are not
+#    inspectable differences, so this overlay does not re-enable them; for production, stack the same
+#    chart profile on the CLI:
+#      -f values-inspectable.yaml --set tls.enabled=true ... (the same switches as tls-hardened)
+#      -f values-inspectable.yaml --set backup.enabled=true --set backup.pitr.enabled=true ...
+#    `scripts/inspectable-diff.py` additionally performs one "inspectable + hardened profile" combined
+#    render, asserting only that rendering succeeds + key items are present (no verbatim diff, to avoid
+#    mistaking common hardening items for inspectable differences).
+# 3) All endpoints/passwords are **placeholders**: real values are injected from the existingSecret of the
+#    isolated namespace (Vault / ExternalSecrets / cloud KMS custody); this file must never contain
+#    plaintext credentials.
+# 4) Isolation is **physical** (design §17.7 "must be a physically isolated cluster"): dedicated
+#    LB/Ingress, dedicated PG/Redis/NATS/MinIO, a dedicated Secret domain, and a dedicated
+#    monitoring/audit pipeline. values can only express the "pointing" part; real isolation is guaranteed
+#    by the cluster boundary (dedicated namespace + dedicated node pool/network segment + dedicated
+#    account system), see the implementation checklist in deploy/production/inspectable-cluster.md.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1) Mode declaration (implemented locally in the node; fixed at startup, cannot be switched at runtime —
+#    ② §4.6 / PL-06)
+# -----------------------------------------------------------------------------
+# This is the only switch that puts the node into inspectable: config.toml `[policy] mode`.
+# Note it only changes the **mode gate/mode reporting**; the node does not actually decrypt yet (E15 not
+# closed).
+# Deployment pitfall: the node's `config.rs::mode()` only recognizes the literal "inspectable"; any other
+# value **silently falls back** to zero-knowledge (without erroring). So the rendered value must be
+# asserted (python scripts/inspectable-diff.py) and re-checked after deployment with
+# `GET /v1/admin/config`; do not just look at what values says.
+policy:
+  mode: inspectable
+
+# -----------------------------------------------------------------------------
+# 2) Dedicated dependency endpoints (the inspectable cluster shares no stateful component with the main cluster)
+# -----------------------------------------------------------------------------
+# Note: PG/Redis URLs go through a Secret (see secrets.existingSecret) and are never written in plaintext
+# in values; what is given here are the **reachable addresses of the dedicated object storage/bus** (they
+# are rendered into config.toml).
+deps:
+  s3:
+    endpoint: "http://minio.inspectable.internal:9000"
+    publicEndpoint: "https://objects.inspectable.internal"
+    # Bucket names keep the same logical names as the main cluster but live on a **dedicated MinIO
+    # instance** (physical isolation, dedicated accounts/bucket policies)
+    region: us-east-1
+    bucketLarge: lattice-large
+    bucketMedia: lattice-media
+    bucketCold: lattice-cold
+    bucketPlugins: lattice-plugins
+  bus:
+    # Dedicated NATS JetStream (audit/broadcast streams are not shared with the main cluster, preventing
+    # cross-shape data leakage)
+    kind: nats
+    natsUrl: "nats://nats.inspectable.internal:4222"
+    jetstream: true
+
+# -----------------------------------------------------------------------------
+# 3) Dedicated key domain (all Secrets are hosted by the isolated namespace's KMS/Vault)
+# -----------------------------------------------------------------------------
+secrets:
+  # Dedicated Secret name: contains pg-url / redis-url / s3-access-key / s3-secret-key /
+  # admin-bootstrap-password (+ pg-replication-url when backup.pitr is enabled).
+  # A completely separate account and KEK custody domain from the main cluster — **reuse across shapes is forbidden**.
+  existingSecret: lattice-inspectable-node-secrets
+
+auth:
+  # JWT signing keys are dedicated as well (tokens are not interchangeable across shapes); the private key
+  # is generated on the KMS/HSM side and injected into the Secret
+  keysSecret: lattice-inspectable-jwt-keys
+  keysSecretKey: jwt.key.pem
+  keyDir: /etc/lattice/keys
+  fingerprintRequired: true
+
+# -----------------------------------------------------------------------------
+# 4) Dedicated entry point (dedicated LB/Ingress; host is a placeholder only, the real domain comes from the
+#    isolated DNS zone)
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  host: inspectable.lattice.internal
+  tls:
+    # TLS termination is the same as the main cluster (a requirement common to both shapes); stack the
+    # tls-hardened switches in production
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# 5) Network policy: default deny + allow only the isolated dependencies (the technical landing point of
+#    the compliance boundary)
+# -----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Allow only the isolated cluster's own Ingress Controller namespace → 8080
+  ingressControllerNamespace: ingress-nginx
+  # Metrics are open only to the isolated cluster's monitoring namespace
+  metricsNamespace: monitoring
+  # No additional sources are allowed (MQTT/QUIC are disabled by default in this shape; if enabled, the
+  # sources must be listed explicitly)
+  ingressFrom: []
+  mqttFrom: []
+  udpFrom: []
+  web:
+    enabled: true
+  egress:
+    # Default deny egress: allow only DNS + the isolated dependencies below (network segments/IPs are
+    # placeholders, replace with the real isolated network segments)
+    enabled: true
+    dnsNamespace: kube-system
+    allow:
+      - to:
+          - ipBlock:
+              cidr: 10.20.0.0/24          # inspectable PG (dedicated primary/replica/VIP)
+        ports:
+          - protocol: TCP
+            port: 5432
+      - to:
+          - ipBlock:
+              cidr: 10.20.1.0/24          # inspectable Redis (dedicated Sentinel group)
+        ports:
+          - protocol: TCP
+            port: 6379
+      - to:
+          - ipBlock:
+              cidr: 10.20.2.0/24          # inspectable NATS JetStream (dedicated 3 nodes)
+        ports:
+          - protocol: TCP
+            port: 4222
+      - to:
+          - ipBlock:
+              cidr: 10.20.3.0/24          # inspectable MinIO (dedicated EC cluster)
+        ports:
+          - protocol: TCP
+            port: 9000
+      - to:
+          - ipBlock:
+              cidr: 10.20.4.10/32         # external KMS/Vault (**provided outside the cluster**; the node does not consume it today)
+        ports:
+          - protocol: TCP
+            port: 8200
+
+# -----------------------------------------------------------------------------
+# 6) Audit/compliance labels (Pod annotations are collected by the ops-side policy engine and audit system;
+#    they do not change node behavior)
+# -----------------------------------------------------------------------------
+node:
+  podAnnotations:
+    lattice.io/deployment-mode: "inspectable"
+    lattice.io/isolation: "physical-dedicated"
+    lattice.io/kek-custodian: "external-kms"
+    # The node does not report payload audit events today (E15); this annotation only declares cluster
+    # ownership and does not mean the audit pipeline is ready
+    lattice.io/audit-pipeline: "external-siem"

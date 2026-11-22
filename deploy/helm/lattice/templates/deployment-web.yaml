@@ -1,0 +1,129 @@
+{{- if .Values.web.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lattice.web.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "lattice.web.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lattice.web.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/nginx: {{ include (print $.Template.BasePath "/web-configmap.yaml") . | sha256sum }}
+    spec:
+      # web needs no K8s API permissions: no ServiceAccount token is mounted
+      automountServiceAccountToken: false
+      securityContext:
+        # The official nginx image's master starts as root (binds 80); only workers drop to the nginx user.
+        # So runAsNonRoot is not set here—setting it would prevent the Pod from starting. Non-root requires an unprivileged image
+        # and listening on 8080 (the chart does not do this, to avoid an implicit dependency on custom images).
+        seccompProfile:
+          type: {{ .Values.security.seccompProfile }}
+      containers:
+        - name: web
+          image: "{{ .Values.webImage.repository }}:{{ .Values.webImage.tag }}"
+          imagePullPolicy: {{ .Values.webImage.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            {{- if include "lattice.webTlsEnabled" . }}
+            - name: https
+              containerPort: {{ .Values.tls.http.web.port }}
+              protocol: TCP
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: {{ .Values.security.web.readOnlyRootFilesystem }}
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE", "CHOWN", "SETGID", "SETUID"]  # nginx master binds 80 / drops worker privileges
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d/lattice.conf
+              subPath: lattice.conf
+              readOnly: true
+            {{- if include "lattice.webTlsEnabled" . }}
+            - name: web-tls
+              mountPath: /etc/nginx/tls
+              readOnly: true
+            {{- end }}
+            {{- range .Values.security.web.writableEmptyDirs }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+            {{- end }}
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: {{ include "lattice.web.fullname" . }}-nginx
+        {{- if include "lattice.webTlsEnabled" . }}
+        - name: web-tls
+          secret:
+            secretName: {{ .Values.tls.http.web.secretName }}
+            defaultMode: 0400
+        {{- end }}
+        {{- range .Values.security.web.writableEmptyDirs }}
+        - name: {{ .name }}
+          emptyDir:
+            sizeLimit: {{ .sizeLimit }}
+        {{- end }}
+      {{- with .Values.web.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lattice.web.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "lattice.web.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    {{- if include "lattice.webTlsEnabled" . }}
+    - name: https
+      port: {{ .Values.tls.http.web.port }}
+      targetPort: https
+      protocol: TCP
+    {{- end }}
+{{- end }}

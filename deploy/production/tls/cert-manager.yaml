@@ -1,0 +1,234 @@
+# =============================================================================
+# Lattice production TLS — cert-manager Issuer / Certificate example manifests (template, never applied)
+# -----------------------------------------------------------------------------
+# Applies to: a cluster with cert-manager installed (CRD `certificates.cert-manager.io` present),
+#             with the Helm chart rendering Certificates via `tls.provider=certManager` (or apply this file directly).
+#
+# Order of use:
+#   1) Generate the internal CA offline and put the CA key pair into the `cert-manager` namespace (see the import comment block);
+#   2) apply the ClusterIssuers in this file (lattice-internal-ca; lattice-acme optional for public domains);
+#   3) apply the Certificates (or let Helm render them — pick one, **never create both under the same name**);
+#   4) verify: kubectl -n lattice get certificate (all READY=True).
+#
+# Placeholders: `CHANGE_ME_*` / `*.example.internal` must be replaced with real namespaces, domains, and SANs.
+# Security requirement: no private key ever appears in this file; the CA private key exists only in CA
+#          custody and in cert-manager's `lattice-internal-ca-key-pair` Secret (RBAC-restricted to the
+#          cert-manager namespace).
+#
+# Offline check: python scripts/ha-prod-validate.py (this file gets YAML/field/placeholder structural checks
+#          only; there is no cert-manager on this machine, so no issuance path has been validated).
+# =============================================================================
+
+# --- Internal CA: root private key kept offline, only the issuing key pair lives in the cluster ---
+# Pre-provision (manual, one-off):
+#   kubectl -n cert-manager create secret tls lattice-internal-ca-key-pair \
+#     --cert=lattice-ca.crt --key=lattice-ca.key
+# Note: the Secret needs the tls.crt/tls.key keys that cert-manager recognizes (`create secret tls` guarantees them).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lattice-internal-ca
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: tls
+spec:
+  ca:
+    secretName: lattice-internal-ca-key-pair
+
+---
+# --- Public domain (optional): use ACME for the Ingress's external certificate; do not mix it with the
+# --- internal mTLS CA
+# Enable only when public internet/browser trust is needed; configure DNS/HTTP challenge per the actual DNS provider.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lattice-acme
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: tls
+spec:
+  acme:
+    # Production uses https://acme-v02.api.letsencrypt.org/directory; use staging in tests to avoid rate limits
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: CHANGE_ME_OPS_EMAIL@example.com
+    privateKeySecretRef:
+      name: lattice-acme-account-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx
+        selector:
+          dnsZones:
+            - "example.com"
+# -----------------------------------------------------------------------------
+# HTTP/WS: Ingress TLS certificate (chart: ingress.enabled + ingress.tls.enabled)
+# -----------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lattice-ingress
+  namespace: lattice
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: ingress
+spec:
+  secretName: lattice-tls
+  duration: 2160h        # 90 days
+  renewBefore: 360h      # renew 15 days early
+  issuerRef:
+    name: lattice-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    - lattice.example.internal
+    - lattice.local
+
+# -----------------------------------------------------------------------------
+# Internal gRPC mTLS: the 3 nodes share one certificate (SANs cover the Service DNS)
+# Key contract: server.crt / server.key / ca.crt (Helm mounts /etc/lattice/tls/grpc)
+# -----------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lattice-node-grpc
+  namespace: lattice
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: node
+spec:
+  secretName: lattice-node-grpc-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: lattice-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth     # the same certificate also serves as the node's outbound gRPC client identity
+  dnsNames:
+    - lattice-node
+    - lattice-node.lattice
+    - lattice-node.lattice.svc
+    - lattice-node.lattice.svc.cluster.local
+
+# -----------------------------------------------------------------------------
+# MQTT TLS / mTLS: server certificate (device client certificates are issued by a separate client CA,
+# not in this file)
+# Key contract: server.crt / server.key / client-ca.crt
+# -----------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lattice-node-mqtt
+  namespace: lattice
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: mqtt
+spec:
+  secretName: lattice-node-mqtt-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: lattice-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    - lattice-node
+    - lattice-node.lattice.svc
+    - lattice-node-mqtt
+    - lattice-node-mqtt.lattice.svc
+    - mqtt.example.internal
+
+# -----------------------------------------------------------------------------
+# QUIC / WebTransport: UDP TLS (QUIC has no client certificates; identity relies on the join token)
+# Key contract: server.crt / server.key
+# -----------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lattice-node-quic
+  namespace: lattice
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: node
+spec:
+  secretName: lattice-node-quic-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: lattice-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    - lattice-node
+    - lattice-node.lattice.svc
+    - quic.example.internal
+
+# -----------------------------------------------------------------------------
+# web nginx 8443 ssl (only for the form without Ingress/LB, where web terminates TLS itself)
+# Key contract: tls.crt / tls.key
+# -----------------------------------------------------------------------------
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lattice-web
+  namespace: lattice
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: web
+spec:
+  secretName: lattice-web-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: lattice-internal-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    - lattice.example.internal
+    - lattice-web
+    - lattice-web.lattice.svc

@@ -1,0 +1,13 @@
+{
+  "ns": "signed-echo",
+  "version": 1,
+  "entry": "",
+  "deps": [],
+  "limits": {
+    "memory_mb": 0,
+    "fuel": 0,
+    "timeout_ms": 0
+  },
+  "signature": "JZlxSuwvGH3VA2fFEBaXChREssRmnAUH1au6f3ceyrTubAKEDHcjdIHl7LTT2ELz6FKZAOL081Spf27onBYCDw==",
+  "signing_key_id": "lattice-e2e-fixture-1"
+}

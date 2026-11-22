@@ -1,0 +1,36 @@
+# =============================================================================
+# Patroni TLS overlay fragment (NOT a complete configuration! Merge it into patroni.yml before use)
+# -----------------------------------------------------------------------------
+# For: production requiring TLS/mTLS on the Patroni REST API and etcd.
+# Merge in one of two ways:
+#   a) Append the `restapi.certfile/keyfile/cafile/verify_client` and `etcd3.protocol/...` entries below to
+#      the matching sections of patroni.yml (never have two `restapi:` keys in the same YAML);
+#   b) Deep-merge with yq/configuration management: `yq '.restapi *= load("patroni-restapi-tls.overlay.yml").restapi'`.
+#
+# Certificates (example paths; actually mounted by a Secret/configuration management):
+#   /etc/patroni/tls/server.crt|server.key|ca.crt      -- REST API server (SAN=RESTAPI_IP/PG hostname)
+#   /etc/etcd/tls/client.crt|client.key|ca.crt         -- etcd client mTLS
+# Private key permissions: 0600, owner patroni/postgres; never write private keys into this file or git.
+#
+# Impact: with TLS enabled on the REST API, HAProxy health checks must switch to https (option httpchk +
+#       ssl verify), and patronictl must carry the same certificates in --config; forgetting to change them
+#       means all health checks go red / manual switchover fails.
+# =============================================================================
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${RESTAPI_IP}:8008
+  # TLS: server certificate between Patroni and HAProxy/patronictl; verify_client=required enforces mutual TLS
+  certfile: /etc/patroni/tls/server.crt
+  keyfile: /etc/patroni/tls/server.key
+  cafile: /etc/patroni/tls/ca.crt
+  verify_client: required      # none | optional | required (required = the REST API also does mTLS)
+
+etcd3:
+  hosts:
+    - ${ETCD0}:2379
+    - ${ETCD1}:2379
+    - ${ETCD2}:2379
+  protocol: https
+  cacert: /etc/etcd/tls/ca.crt
+  cert: /etc/etcd/tls/client.crt
+  key: /etc/etcd/tls/client.key

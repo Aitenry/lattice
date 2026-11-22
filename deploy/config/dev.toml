@@ -1,0 +1,67 @@
+# Development/integration config (mounted as /etc/lattice/config.toml by the dev compose).
+#
+# Values stay identical to `SAMPLE_TOML` in `crates/lattice-node/src/config.rs`—that is the
+# single compile-time source of defaults; this file only lands the same content on disk to avoid drift between the two.
+# Production overrides always go through env vars `LATTICE__{SECTION}__{FIELD}` (config.rs::apply_env).
+
+[node]
+id = ""                                  # empty → generate a ULID at startup (§17.1)
+listen_http = "0.0.0.0:8080"             # REST + WS upgrade on the same port (② §3.1)
+listen_ws = "0.0.0.0:8443"               # reserved: dedicated WS port (LB terminates TLS in front)
+metrics = "127.0.0.1:9100"               # Prometheus scrape endpoint (0.0.0.0 inside containers)
+log = "json"
+
+[auth]
+jwt_alg = "RS256"                        # §17.11: RS256 is the only supported algorithm
+jwt_ttl = 900
+jwt_issuer = "lattice"
+key_dir = "/etc/lattice/keys"            # dual-key rotation in parallel: jwt.key.pem + jwt.key.prev.pem
+fingerprint_required = true
+
+[pg]
+url = "postgres://lattice_app:lattice_dev_pw@pg:5432/lattice?sslmode=disable"
+pool_size = 32
+statement_timeout_ms = 5000
+admin_statement_timeout_ms = 30000
+
+[redis]
+url = "redis://redis:6379"
+pool_size = 64
+
+[s3]
+endpoint = "http://minio:9000"
+public_endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+access_key = "lattice_dev"
+secret_key = "lattice_dev_secret"
+bucket_large = "lattice-large"
+bucket_media = "lattice-media"
+bucket_cold = "lattice-cold"
+bucket_plugins = "lattice-plugins"
+presign_ttl = 900
+upload_parallel = 8
+
+[mqtt]
+enabled = true
+bind = "0.0.0.0:1883"
+max_connections = 10000
+
+[grpc]
+enabled = true
+bind = "0.0.0.0:9090"
+
+[bus]
+kind = "redis-pubsub"                    # nats is P3; this is the default of the ② §4.8 degradation matrix
+
+[policy]
+mode = "zero-knowledge"                  # inspectable must be enabled explicitly (§17.7)
+dedup_ttl = 86400
+chunk_threshold_max = 33554432
+chunk_part = 262144
+msg_per_s = 100                          # §17.13 user quota
+bytes_per_s = 26214400
+topics_per_user = 100
+
+[admin]
+bootstrap_username = "admin"             # ⑤ §8.2 "first administrator": create the account this way on an empty database
+bootstrap_password = "lattice_dev_admin_pw"  # dev only; inject via Secret in production and rotate immediately after the first start

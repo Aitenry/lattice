@@ -1,0 +1,42 @@
+{{/*
+ lattice-node: stateless cluster members. When the node identity (node_id) is empty, each Pod generates a ULID at startup;
+ cross-node routing relies on Redis/NATS, not local state, so rolling updates and scaling are unrestricted.
+
+ The PodSpec lives in `_node.tpl` as `lattice.node.podSpec`: the stable and canary Deployments
+ share the same env/volumes/securityContext/probes and differ only in image/replicas/selector—so canary and stable machines cannot
+ drift in key injection or security settings.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lattice.node.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # message-plane nodes: start new before stopping old to avoid capacity shortfalls during rollout (② §7.2)
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "lattice.node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lattice.node.selectorLabels" . | nindent 8 }}
+      annotations:
+        # config changes trigger a rollout (ConfigMaps only, not Secrets: Secret rotation is a deliberate operations decision)
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.node.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- include "lattice.node.podSpec" (dict
+          "root" .
+          "image" (printf "%s:%s" .Values.image.repository .Values.image.tag)
+          "pullPolicy" .Values.image.pullPolicy
+          "labels" (include "lattice.node.selectorLabels" .)) | nindent 4 }}

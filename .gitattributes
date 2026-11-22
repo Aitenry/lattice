@@ -1,0 +1,12 @@
+# Normalise line endings: LF in the repository, so shell scripts and Dockerfiles do not
+# reach containers with CRLF after a Windows checkout.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Binary
+*.wasm binary
+*.png binary
+*.jpg binary
+*.ico binary

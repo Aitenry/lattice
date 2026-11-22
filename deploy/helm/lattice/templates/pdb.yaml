@@ -1,0 +1,30 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lattice.node.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "lattice.node.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if and .Values.web.enabled .Values.podDisruptionBudget.enabled .Values.podDisruptionBudget.web.enabled }}
+---
+# web PDB: enable only when replicas >1 (a single replica with minAvailable>0 permanently blocks node draining)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lattice.web.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.web.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "lattice.web.selectorLabels" . | nindent 6 }}
+{{- end }}

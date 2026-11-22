@@ -1,0 +1,67 @@
+# =============================================================================
+# etcd configuration template (etcd v3.5+) — render one copy per machine
+# -----------------------------------------------------------------------------
+# Render (password/certificate paths come from a Secret/configuration management, never committed to git):
+#   export ETCD_NAME=etcd0 NODE_IP=10.20.0.11 \
+#          ETCD_INITIAL_CLUSTER="etcd0=https://10.20.0.11:2380,etcd1=https://10.20.0.12:2380,etcd2=https://10.20.0.13:2380"
+#   envsubst < etcd.conf.template > /etc/etcd/etcd.conf.yml
+#   chmod 0600 /etc/etcd/etcd.conf.yml
+#
+# Notes (why these values):
+#   * 3 nodes = tolerates 1 failure; 2 nodes have no quorum fault tolerance, so they are forbidden in production;
+#   * TLS everywhere on client/peer; client-cert-auth = Patroni must also present a client certificate (mTLS);
+#   * auto-compaction 1h + quota 8GiB: without them, a growing db hits NOSPACE → DCS writes fail → automatic
+#     switchover stops;
+#   * The disk must be an SSD (fsync latency directly determines leader key renewal and election latency).
+#
+# Authoritative notes and failure handling: etcd-dcs.md in this directory.
+# =============================================================================
+name: ${ETCD_NAME}
+
+# Data directory: mount point of a dedicated disk; never the same disk as PG data
+data-dir: /var/lib/etcd/${ETCD_NAME}
+wal-dir: /var/lib/etcd/${ETCD_NAME}/wal
+
+# --- Client (Patroni → etcd, port 2379, internal network only) ----------------
+listen-client-urls: https://0.0.0.0:2379
+advertise-client-urls: https://${NODE_IP}:2379
+client-transport-security:
+  cert-file: /etc/etcd/tls/server.crt
+  key-file: /etc/etcd/tls/server.key
+  trusted-ca-file: /etc/etcd/tls/ca.crt
+  client-cert-auth: true
+  # Optional: allow only certificates whose SAN contains etcd-client
+  # allowed-cn: ["etcd-client"]
+
+# --- peer (between etcd nodes, port 2380, internal-network mTLS only) ----------
+listen-peer-urls: https://0.0.0.0:2380
+initial-advertise-peer-urls: https://${NODE_IP}:2380
+initial-cluster: ${ETCD_INITIAL_CLUSTER}
+initial-cluster-token: lattice-etcd
+initial-cluster-state: new          # brand-new cluster=new; scale-out/disk replacement=existing (per the official member add procedure)
+peer-transport-security:
+  cert-file: /etc/etcd/tls/server.crt
+  key-file: /etc/etcd/tls/server.key
+  trusted-ca-file: /etc/etcd/tls/ca.crt
+  client-cert-auth: true
+
+# --- Reliability/capacity -----------------------------------------------------
+quota-backend-bytes: 8589934592     # 8GiB; the 2GiB default is too small
+auto-compaction-retention: "1h"
+auto-compaction-mode: periodic
+heartbeat-interval: 250             # ms (internal RTT <10ms)
+election-timeout: 1250              # ms (must be ≥ 5×heartbeat; cross-region deployments would need much larger values, not recommended)
+snapshot-count: 10000
+
+# --- Logging ------------------------------------------------------------------
+logger: zap
+log-level: info
+log-outputs:
+  - /var/log/etcd/etcd.log
+  - stderr
+
+# --- Performance/security (optional, tune to host resources) -------------------
+max-request-bytes: 1572864
+# max-wals: 5
+# max-snapshots: 5
+# enable-v2: false                   # the v2 API is not needed, keep it off

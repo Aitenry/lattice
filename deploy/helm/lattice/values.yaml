@@ -1,0 +1,362 @@
+# Helm values — only the values that must change at deploy time.
+#
+# Principles (consistent with SAMPLE_TOML in config.rs): **unlisted fields always take the node's compile-time defaults**;
+# duplicate defaults appear here only so `helm show values` is readable; change defaults in `config.rs::SAMPLE_TOML`.
+# Secret values all come from Secrets (`secrets.*` or `secrets.existingSecret`), never ConfigMaps.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: lattice-node
+  tag: dev
+  pullPolicy: IfNotPresent
+
+webImage:
+  repository: lattice-web
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Node replicas: stateless and horizontally scalable; ② §7.1 requires ≥3 to tolerate a single-node failure
+replicaCount: 3
+
+node:
+  # Empty = generate a distinct ULID per Pod (recommended); setting it explicitly makes replicas share one node_id
+  id: ""
+  listenHttp: "0.0.0.0:8080"
+  metrics: "0.0.0.0:9100"
+  log: json
+  # Additional environment variables (LATTICE__SECTION__FIELD)
+  extraEnv: []
+  podAnnotations: {}
+  resources:
+    # ② §7.3: request 2C4G per node; limits keep 2× burst headroom
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # The graceful shutdown window must cover node draining (② §7.2: 30s)
+  terminationGracePeriodSeconds: 45
+  # preStop: sleep first so LB/Endpoint draining propagates, then let the process receive SIGTERM and enter /ready 503 + byef drain.
+  # Do not call admin drain directly (no long-lived admin token in the Pod); see ② §7.2 / PL-15 15.7 for rolling-upgrade orchestration.
+  preStopSleepSeconds: 10
+
+web:
+  enabled: true
+  replicaCount: 1
+  # Plugin upload cap 20MiB + headroom; aligned with the platform's 20MiB in ⑤ §12.4 (the backend returns a contract error when exceeded)
+  clientMaxBodySize: 24m
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# External dependencies (the chart does not embed production PG/Redis/MinIO/NATS clusters; dev uses deploy/compose/dev.yaml)
+deps:
+  pg:
+    # Production should use a Secret: `secrets.pgUrl` or the pg-url key of `secrets.existingSecret`
+    url: "postgres://lattice_app@postgres:5432/lattice?sslmode=disable"
+    poolSize: 32
+  redis:
+    url: "redis://redis:6379"
+    poolSize: 64
+  bus:
+    # redis-pubsub (default degradation path) | nats (P3 main path, requires natsUrl as well)
+    kind: redis-pubsub
+    natsUrl: "nats://nats:4222"
+    jetstream: true
+  s3:
+    # Object storage as accessed by nodes (in-cluster address)
+    endpoint: "http://minio:9000"
+    # Address reachable by browser/desktop clients (Host of presigned URLs); empty = same as endpoint
+    publicEndpoint: ""
+    region: us-east-1
+    bucketLarge: lattice-large
+    bucketMedia: lattice-media
+    bucketCold: lattice-cold
+    bucketPlugins: lattice-plugins
+
+auth:
+  issuer: lattice
+  jwtTtl: 900
+  # Pre-created by operations (RS256 private key jwt.key.pem); the chart generates no keys
+  keysSecret: lattice-jwt-keys
+  keysSecretKey: jwt.key.pem
+  keyDir: /etc/lattice/keys
+  fingerprintRequired: true
+
+mqtt:
+  enabled: false
+  bind: "0.0.0.0:1883"
+  maxConnections: 10000
+  # Create an MQTT Service (TLS terminated by the front proxy/gateway)
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 1883
+
+grpc:
+  # Internal gRPC (⑤ §10): cross-node fallback / chunk origin fetch / watermark reconciliation. Exposed only on the internal network.
+  enabled: true
+  bind: "0.0.0.0:9090"
+  port: 9090
+  # [kept for compatibility] legacy location; new deployments should use the top-level `tls.grpc` (when this section is non-empty it is rendered instead).
+  tls:
+    enabled: false
+    secretName: ""
+    mountPath: /etc/lattice/tls
+
+policy:
+  mode: zero-knowledge
+  # For the remaining policy thresholds see design §17.6/§17.13; unlisted ones use node defaults
+
+admin:
+  bootstrapUsername: admin
+
+secrets:
+  # When present, takes over completely (recommended in production): must contain pg-url / redis-url / s3-access-key /
+  # s3-secret-key / admin-bootstrap-password; add pg-replication-url when backup.pitr is enabled
+  # (a replication account; `pg_basebackup` cannot use a normal application account—it lacks the REPLICATION privilege).
+  existingSecret: ""
+  pgUrl: ""
+  pgReplicationUrl: ""
+  redisUrl: ""
+  s3AccessKey: ""
+  s3SecretKey: ""
+  adminBootstrapPassword: ""
+
+service:
+  type: ClusterIP
+  httpPort: 8080
+  metricsPort: 9100
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  host: lattice.local
+  tls:
+    enabled: false
+    secretName: lattice-tls
+
+# Metrics Service name and port (referenced by ServiceMonitor/scrape config)
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    labels: {}
+
+autoscaling:
+  enabled: false
+  # ② §7.3: min 3 / max 20. The CPU threshold is the portable default; scaling on "connections ≥ 30k/node" requires
+  # prometheus-adapter to expose custom metrics; without it the HPA cannot read metrics and refuses to scale, so this is off by default.
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  # ② §7.3 N-1: with the default 3 replicas → at least 2 stay available
+  minAvailable: 2
+  # Enable when web replicas >1; with a single replica the PDB blocks node draining (K8s cannot satisfy both), so it is off by default
+  web:
+    enabled: false
+    minAvailable: 1
+
+# ---------------------------------------------------------------------------
+# Canary release (disabled by default)
+# ---------------------------------------------------------------------------
+# Implementation: two Deployments (stable node + canary node) + two Services + the canary
+# annotations of ingress-nginx (`canary-weight` / `canary-by-header`). Native K8s Services have no weight field, and this chart's
+# constraint is "K8s native APIs + ingress-nginx only", so ingress annotations are used and no service mesh
+# VirtualService is introduced (see README §10 for the tradeoff). Default enabled=false: no canary resources are rendered,
+# and `helm template` output is **byte-identical** to the no-feature output (asserted by `scripts/helm-canary-validate.py`).
+canary:
+  enabled: false
+  # Split weight (integer 0-100): 0 = canary replicas kept but take no traffic (pre-check / stop-the-bleeding), 100 = all traffic to canary.
+  # Applies only to /v1 traffic through ingress-nginx; weights for MQTT/QUIC and direct external-LB ingress are handled by the external LB
+  # (Nginx/Envoy ×2 in the production topology); the chart only provides the two weightable Services, stable/canary.
+  weight: 20
+  # Canary node replicas: canary validates the new version only; do not mix with replicaCount; canary is excluded from HPA/PDB.
+  # Must be ≥1 when weight>0 (0 replicas + traffic = 503s from an empty Service, and the template fails outright).
+  replicaCount: 1
+  # Canary image: empty repository/pullPolicy = reuse image.*; empty tag = same tag as stable
+  # (equivalent to no canary, and NOTES warns about it; `helm template --set canary.enabled=true` still works for render self-checks).
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  # Exact canary by request header (ingress-nginx `canary-by-header`): when non-empty, matching-header requests always go to
+  # canary regardless of weight (good for early validation by internal accounts/test devices). Empty = split by weight only.
+  # Empty byHeaderValue = any presence of the header matches (ingress-nginx semantics).
+  byHeader: ""
+  byHeaderValue: ""
+
+# Pod security context (seccomp / non-root / read-only root filesystem). Directories that must be writable under a read-only root
+# are mounted explicitly as emptyDirs; node's /var/lib/lattice (local WAL) is already a separate emptyDir volume.
+security:
+  seccompProfile: RuntimeDefault
+  node:
+    readOnlyRootFilesystem: true
+    # Writable directories besides /var/lib/lattice (temp files); the Rust runtime occasionally writes temp_dir
+    writableEmptyDirs:
+      - name: tmp
+        mountPath: /tmp
+        sizeLimit: 128Mi
+  web:
+    # The nginx:latest master starts as root (binds 80/reads /etc/nginx), so runAsNonRoot is not set;
+    # a read-only root filesystem plus explicit emptyDirs is the least-privilege combination that works with this image shape.
+    readOnlyRootFilesystem: true
+    writableEmptyDirs:
+      - name: nginx-cache
+        mountPath: /var/cache/nginx
+        sizeLimit: 1Gi
+      - name: nginx-run
+        mountPath: /var/run
+        sizeLimit: 16Mi
+      - name: tmp
+        mountPath: /tmp
+        sizeLimit: 64Mi
+
+networkPolicy:
+  enabled: false
+  # Extra sources allowed into node:8080 (K8s NetworkPolicyPeers list, passed through toYaml).
+  ingressFrom: []
+  # Set to the Ingress Controller's namespace (e.g. ingress-nginx): only that namespace may reach 8080.
+  # Empty = do not generate this rule (external traffic needs ingressFrom / LB source CIDRs instead).
+  ingressControllerNamespace: ""
+  # Set to the monitoring namespace (e.g. monitoring): 9100 opens only to it; empty = 9100 open to all sources (degraded).
+  metricsNamespace: ""
+  # MQTT client sources (NetworkPolicyPeers); empty = restrict by port only, not by source.
+  mqttFrom: []
+  # QUIC/WebTransport UDP sources; empty = unrestricted (cloud LB source addresses are usually outside the cluster and need CNI support).
+  udpFrom: []
+  # web NetworkPolicy: deny ingress by default, allow only the ingress namespace → 80/8443, egress only to node:8080 + DNS.
+  web:
+    enabled: true
+  # Egress policy: disabled by default (nodes connect to external PG/Redis/NATS/S3 and the targets vary per deployment).
+  # Once enabled, egress is denied by default; only DNS + the egress.allow list pass.
+  egress:
+    enabled: false
+    dnsNamespace: kube-system
+    allow: []
+
+# PG backup: a CronJob runs pg_dump from postgres:16-alpine → uploads to object storage (needs the mc image or aws cli)
+backup:
+  enabled: false
+  schedule: "0 3 * * *"
+  pgImage: postgres:16-alpine
+  mcImage: minio/mc:latest
+  keepDays: 30
+  bucket: lattice-cold
+  s3Endpoint: "http://minio:9000"
+  scratchSize: 8Gi
+  # PITR (production-grade): scheduled physical base backups via pg_basebackup + a CronJob that checks WAL archiving health.
+  # WAL archiving itself is done by the PG-side archive_command (deploy/production/patroni/wal-gateway.sh → same bucket/prefix)
+  # and the chart cannot replace it; what is added here is automation for "baseline + is archiving actually progressing".
+  pitr:
+    enabled: false
+    # Base backup time: staggered from pg_dump (02:15 by default) to avoid loading the primary simultaneously
+    baseBackupSchedule: "15 2 * * *"
+    # Archive verification frequency: must be < the alert window (every 15 minutes by default)
+    verifySchedule: "*/15 * * * *"
+    # Physical base backups kept 14 days (full + incremental WAL can restore to any point within the retention window)
+    keepDays: 14
+    bucket: lattice-cold
+    # Matches the WAL_PREFIX default in deploy/production/patroni/wal-gateway.sh (same prefix = same recovery chain)
+    prefix: "wal/pg/lattice-pg"
+    scratchSize: 64Gi
+    # pg_basebackup flags (tar + gzip + WAL fetched with the baseline by default; restore sets restore_command to replay archives)
+    baseBackupArgs: "-Ft -z -Xfetch -c fast -P"
+    # RPO upper-bound check: archive_timeout=60s + upload time; >300s counts as stalled archiving (consistent with the design's RPO ≤5min)
+    maxArchiveLagSeconds: 300
+    # Whether at least one streaming replica exists (missing under synchronous replication = the RPO=0 guarantee is already lost)
+    requireReplica: true
+  # Retention policy/encryption notes are in deploy/production/backup/README.md (SSE-KMS, object lock, off-site replicas as needed).
+
+# ---------------------------------------------------------------------------
+# TLS / mTLS (production transport encryption)
+# ---------------------------------------------------------------------------
+# Principle: **the chart neither generates nor stores private keys**. Certificates have only two sources:
+#   1) provider=existingSecret: operations pre-creates the Secret with cert-manager / Vault / SealedSecrets (recommended);
+#   2) provider=certManager: the chart only renders a `cert-manager.io/v1` Certificate CR;
+#      actual issuance and renewal happen in the cluster's cert-manager (issuerRef points at an Issuer/ClusterIssuer created by operations).
+#
+# TLS termination point per interface (matches the code; do not configure from assumptions):
+#   * HTTP/WS: node only binds `[node] listen_http` (main.rs); there is **no** built-in HTTPS/WSS listener;
+#     termination can only be the Ingress/LB, or the web nginx 8443 ssl listener (tls.http.web.enabled).
+#   * MQTT: node listens for TLS itself ([mqtt] tls_enabled/tls_bind/tls_*), supporting device-certificate mTLS.
+#   * gRPC: node listens for mTLS itself ([grpc] tls_*), used for cross-node calls; exposed only via the internal Service.
+#   * QUIC/WebTransport: UDP listener with rustls server-side TLS (QUIC has no client certificates; identity relies on the join token).
+#   * TLS for PostgreSQL/MinIO/NATS/Redis is out of this chart's scope (managed by infrastructure and Secrets; see deploy/production).
+tls:
+  # Master switch: false = all plaintext (dev/internal canary); when true, the sub-items below are enabled as needed
+  enabled: false
+  # existingSecret (recommended) | certManager (the chart renders a Certificate; cert-manager must be installed in the cluster)
+  provider: existingSecret
+  certManager:
+    enabled: false
+    issuerRef:
+      name: lattice-internal-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 360h
+    # Default SANs for the rendered Certificate (empty = Service DNS names derived by the chart)
+    nodeDnsNames: []
+    # Ingress domain (empty = ingress.host)
+    ingressDnsName: ""
+  # Common mount root for certificates; one subdirectory per component
+  mountPath: /etc/lattice/tls
+  http:
+    # TLS Secret used by the Ingress (empty = fall back to ingress.tls.secretName); ingress.tls.enabled must still be on
+    ingressSecretName: ""
+    # Extra 8443 ssl listener on web nginx (for direct-connect shapes without an Ingress/LB; unnecessary when an Ingress exists)
+    web:
+      enabled: false
+      secretName: lattice-web-tls
+      port: 8443
+      # Require client certificates (browser/client mTLS; verification happens in nginx)
+      requireClientCert: false
+  grpc:
+    # In-node mTLS: [grpc] tls_cert/tls_key/tls_client_ca + outbound client identity binding
+    enabled: false
+    secretName: lattice-node-grpc-tls   # keys: server.crt / server.key / ca.crt
+    mountPath: /etc/lattice/tls/grpc
+    # Mounting ca.crt requires and verifies client certificates; the CN must be a known node_id (anti-impersonation)
+    requireKnownNodeCn: true
+    requireCallerNode: true
+    tlsDomain: lattice.internal         # the domain verified on outbound TLS (must be one of the certificate SANs)
+  mqtt:
+    # Device-access mTLS: [mqtt] tls_enabled/tls_bind/tls_*, 8883 by default
+    enabled: false
+    port: 8883
+    secretName: lattice-node-mqtt-tls   # keys: server.crt / server.key / client-ca.crt
+    # true = enforce client certificates (fail-closed); false = fall back to PSK/JWT when no certificate is presented
+    requireClientCert: true
+  quic:
+    # UDP TLS for QUIC/WebTransport (node must be built with the quic feature; the repo's Dockerfile.node already does)
+    enabled: false
+    port: 4433
+    secretName: lattice-node-quic-tls   # keys: server.crt / server.key
+    # Whether to also render a UDP Service (ClusterIP; for cloud UDP LBs see deploy/quic-lb-udp.yaml)
+    service:
+      enabled: false
+      type: ClusterIP
+
+# ServiceAccount (not created by default; the read-only API needs no RBAC binding)
+serviceAccount:
+  create: false
+  name: ""

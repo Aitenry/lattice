@@ -1,0 +1,94 @@
+{{- if .Values.web.enabled }}
+Console:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "lattice.web.fullname" . }} 8088:80
+  open http://127.0.0.1:8088 in a browser
+{{- else }}
+Console disabled (web.enabled=false); use the node Service directly:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "lattice.node.fullname" . }} 8080:{{ .Values.service.httpPort }}
+{{- end }}
+
+Node health:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "lattice.node.fullname" . }} -- curl -fsS http://127.0.0.1:8080/v1/ready
+
+First login:
+  account: {{ .Values.admin.bootstrapUsername }} (bootstrapped only when the users table is empty; the password comes from the Secret's admin-bootstrap-password)
+  change the password immediately after login, and clear the bootstrap password from values.
+
+JWT signing key (must be pre-created; the chart generates no private keys):
+  kubectl -n {{ .Release.Namespace }} create secret generic {{ .Values.auth.keysSecret }} \
+    --from-file={{ .Values.auth.keysSecretKey }}=./jwt.key.pem
+
+{{- if .Values.mqtt.enabled }}
+MQTT gateway:
+  in-cluster address {{ include "lattice.node.fullname" . }}-mqtt:{{ .Values.mqtt.service.port }}
+  {{- if and .Values.tls.enabled .Values.tls.mqtt.enabled }}
+  TLS/mTLS address {{ include "lattice.node.fullname" . }}-mqtt:{{ .Values.tls.mqtt.port }}
+    Secret {{ .Values.tls.mqtt.secretName }} (server.crt/server.key/client-ca.crt; require_client_cert={{ .Values.tls.mqtt.requireClientCert }})
+  {{- end }}
+  account = device id; password = that device's refresh token (PSK, see ⑤ §11)
+{{- end }}
+
+{{- if .Values.tls.enabled }}
+TLS (termination points and certificate sources: deploy/production/tls/README.md; the chart generates no private keys):
+  {{- if .Values.tls.certManager.enabled }}
+  issuance: cert-manager Certificate CR is rendered, issuerRef={{ .Values.tls.certManager.issuerRef.kind }}/{{ .Values.tls.certManager.issuerRef.name }} (the Issuer/ClusterIssuer must be created beforehand)
+  {{- else }}
+  source: existingSecret (the following Secrets must be created beforehand; private keys never enter values/git)
+  {{- end }}
+  {{- if .Values.ingress.tls.enabled }}
+  Ingress TLS Secret: {{ include "lattice.ingressTlsSecretName" . }}
+  {{- end }}
+  {{- if include "lattice.webTlsEnabled" . }}
+  web TLS Secret: {{ .Values.tls.http.web.secretName }} (nginx 8443 ssl)
+  {{- end }}
+  {{- if and .Values.grpc.enabled .Values.tls.grpc.enabled }}
+  gRPC mTLS Secret: {{ .Values.tls.grpc.secretName }} (server.crt/server.key/ca.crt)
+  {{- end }}
+  {{- if and .Values.mqtt.enabled .Values.tls.mqtt.enabled }}
+  MQTT TLS/mTLS Secret: {{ .Values.tls.mqtt.secretName }} (server.crt/server.key/client-ca.crt)
+  {{- end }}
+  {{- if .Values.tls.quic.enabled }}
+  QUIC TLS Secret: {{ .Values.tls.quic.secretName }} (UDP {{ .Values.tls.quic.port }})
+  {{- end }}
+{{- end }}
+
+Metrics:
+  Prometheus scrapes {{ include "lattice.node.fullname" . }}:{{ .Values.service.metricsPort }}/metrics (unauthenticated; restrict sources with NetworkPolicy)
+{{- if .Values.backup.enabled }}
+Backup:
+  CronJob {{ include "lattice.fullname" . }}-pg-backup ({{ .Values.backup.schedule }})→ {{ .Values.backup.bucket }}/backup/pg/
+{{- end }}
+{{- if .Values.backup.pitr.enabled }}
+PITR: 
+  physical baseline CronJob {{ include "lattice.fullname" . }}-pg-basebackup ({{ .Values.backup.pitr.baseBackupSchedule }}) → {{ .Values.backup.pitr.bucket }}/{{ .Values.backup.pitr.prefix }}/base/
+  archive verification CronJob {{ include "lattice.fullname" . }}-pg-pitr-verify ({{ .Values.backup.pitr.verifySchedule }})
+  note: WAL archiving is done by the PG-side archive_command (patroni/wal-gateway.sh); the chart does not replace it; policy/encryption: deploy/production/backup/README.md
+{{- end }}
+{{- if .Values.canary.enabled }}
+
+Canary release:
+  canary node Deployment: {{ include "lattice.node.canary.fullname" . }} (replicas={{ .Values.canary.replicaCount }}, 
+    image {{ .Values.canary.image.repository | default .Values.image.repository }}:{{ .Values.canary.image.tag | default .Values.image.tag }})
+  {{- if .Values.ingress.enabled }}
+  traffic: ingress-nginx canary-weight={{ .Values.canary.weight }}% (only affects /v1 HTTP/WS/SSE through the Ingress)
+    {{- if .Values.canary.byHeader }}
+    exact header match: {{ .Values.canary.byHeader }}{{ with .Values.canary.byHeaderValue }}={{ . }}{{ end }} → always canary
+    {{- end }}
+    canary Ingress: {{ include "lattice.fullname" . }}-node-api-canary (same host/path /v1 as {{ include "lattice.fullname" . }}-node-api)
+  {{- else }}
+  Ingress not enabled: canary is deployed but has no weighted traffic entry—switching weights must happen at the external LB (production Nginx/Envoy)
+  or a service mesh; this chart only provides the stable/canary Services.
+  {{- end }}
+  {{- if eq (.Values.canary.image.tag | default .Values.image.tag) .Values.image.tag }}
+  warning: canary.image.tag is empty/equal to stable—canary and stable currently run the same image, so the canary is meaningless.
+  {{- end }}
+  rollback (see chart README §10 / deploy/production/canary-runbook.md):
+    helm upgrade <release> deploy/helm/lattice -n {{ .Release.Namespace }} --reuse-values --set canary.weight=0
+    helm upgrade <release> deploy/helm/lattice -n {{ .Release.Namespace }} --reuse-values --set canary.enabled=false
+{{- end }}
+
+Upgrade notes:
+  nodes are stateless and can be rolled; database migrations run idempotently at node startup (forward-only, ⑥ §8).
+  before rolling back, confirm the migration is compatible with the old version (destructive migrations must use the expand/contract two-phase approach).
+  after TLS certificate rotation, node/web must be restarted with a rollout to reload them (certificates are read at process startup).

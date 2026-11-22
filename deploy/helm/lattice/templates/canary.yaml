@@ -1,0 +1,240 @@
+{{- if .Values.canary.enabled }}
+{{/*
+Canary release—disabled by default; when enabled it **only adds resources**, and stable workloads render identically.
+
+Why "two Deployments + ingress-nginx canary annotations" rather than Service weights / VirtualService:
+  * Native K8s Services have no weight field. Proportional splitting has only two places to land:
+    (a) ingress-nginx canary annotations (this implementation): the canary Ingress pairs with the regular Ingress on the same host + the same
+        path, splitting by weight with `canary: "true"` + `canary-weight: 0-100`, or matching precisely via
+        `canary-by-header(-value)`; no extra component is introduced and the controller computes the weight itself.
+    (b) service mesh (Istio/Linkerd) VirtualService / TrafficSplit: more expressive (by
+        header/user/percentage + retries/timeouts), but requires a mesh in the cluster and couples tightly to CRD versions.
+  Tradeoff: (a) is chosen—this chart's constraint is "K8s native APIs + ingress-nginx only"; adding a mesh dependency would make
+  the whole chart's installation prerequisites heavier. Cost = weight splitting only applies to **HTTP/WS/SSE traffic through ingress-nginx**;
+  MQTT (device long connections), QUIC/UDP and traffic that the external Nginx/Envoy sends directly to nodes in the production topology do not pass
+  through this Ingress—canary weights for those entry points are the external LB's responsibility (deploy/production/README.md §1),
+  and the chart only provides the two weightable Services, stable/canary (NodePort is not exposed here).
+
+Why a separate Ingress pair for /v1:
+  The chart's existing Ingress (ingress.yaml) points at **web** (console static assets + /v1 reverse proxy). ingress-nginx
+  canary pairing requires both Ingresses to have identical host + path; pairing web with node-canary would
+  canary the entire site (including the console). So when canary is enabled this file additionally renders:
+    regular Ingress `-node-api`        : /v1 → stable node Service
+    canary Ingress `-node-api-canary` : /v1 (same host/path) → canary node Service (with canary annotations)
+  The /v1 prefix is longer than the existing "/" so it matches with higher priority and does not shadow console routes; with canary disabled these two Ingresses
+  are not rendered at all, /v1 still goes through web's nginx reverse proxy, and behavior matches the previous version.
+  * MQTT/QUIC ports are not canaried here: device connections are stateful, and shifting 5% of traffic means 5% of devices randomly reconnect to
+    the new version; device canaries should use device-scoped configuration (`[dynamic] canary`) or a separate access pool—this chart only states
+    the capability boundary and does not pretend to canary devices (see deploy/production/canary-runbook.md §10).
+
+Rollback (see README §10 and deploy/production/canary-runbook.md):
+  helm upgrade <release> deploy/helm/lattice -n lattice --reuse-values --set canary.weight=0
+      # 0% traffic to canary, replicas kept (read logs / reproduce issues without deleting resources)
+  helm upgrade <release> deploy/helm/lattice -n lattice --reuse-values --set canary.enabled=false
+      # delete all canary resources, back to pure stable (the traffic entry is still /v1 → node, behavior unchanged)
+  helm rollback <release> <revision>
+      # roll back the whole release (including stable image tag / config); canary resources revert with the revision
+*/}}
+{{- $canaryRepo := .Values.canary.image.repository | default .Values.image.repository -}}
+{{- $canaryTag := .Values.canary.image.tag | default .Values.image.tag -}}
+{{- $canaryImage := printf "%s:%s" $canaryRepo $canaryTag -}}
+{{- $canaryPullPolicy := .Values.canary.image.pullPolicy | default .Values.image.pullPolicy -}}
+{{- $weight := int .Values.canary.weight -}}
+{{- $replicas := int .Values.canary.replicaCount -}}
+{{- if or (lt $weight 0) (gt $weight 100) -}}
+{{- fail (printf "canary.weight must be between 0 and 100 (got %v)—ingress-nginx only accepts integer percentages" .Values.canary.weight) -}}
+{{- end -}}
+{{- if lt $replicas 1 -}}
+{{- fail (printf "canary.replicaCount must be ≥1 (got %v)—0 replicas would send canary traffic to an empty Service and return 503" .Values.canary.replicaCount) -}}
+{{- end -}}
+# canary node: shares the PodSpec from `_node.tpl` with stable (identical env/volumes/securityContext/probes),
+# only the image tag, replica count and selector labels differ.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lattice.node.canary.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-canary
+    lattice.io/track: canary
+spec:
+  # canary has a fixed replica count (excluded from HPA/PDB): replicas come only from values, so scaling policy cannot interfere with stable
+  replicas: {{ $replicas }}
+  revisionHistoryLimit: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "lattice.node.canarySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lattice.node.canarySelectorLabels" . | nindent 8 }}
+        lattice.io/track: canary
+      annotations:
+        # config changes also roll canary (config is a release-level input: stable and canary share one ConfigMap)
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # makes canary Pods distinguishable to Prometheus/audit (along with the label above)
+        lattice.io/track: canary
+        {{- with .Values.node.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- include "lattice.node.podSpec" (dict
+          "root" .
+          "image" $canaryImage
+          "pullPolicy" $canaryPullPolicy
+          "labels" (include "lattice.node.canarySelectorLabels" .)) | nindent 4 }}
+---
+# canary Service: backend for ingress-nginx / an external LB only; NodePort/LoadBalancer are not exposed
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lattice.node.canary.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-canary
+    lattice.io/track: canary
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "lattice.node.canarySelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+    {{- if .Values.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.grpc.port }}
+      targetPort: grpc
+      protocol: TCP
+    {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# canary Pod NetworkPolicy: rules identical to the stable node (`_node.tpl` is the single source), only the
+# podSelector differs. In K8s semantics "a Pod selected by no NetworkPolicy = allow-all", so omitting this would let canary bypass
+# a hardened cluster's default deny.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "lattice.node.canary.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-canary
+    lattice.io/track: canary
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "lattice.node.canarySelectorLabels" . | nindent 6 }}
+  {{- include "lattice.node.networkPolicyRules" . | nindent 2 }}
+{{- end }}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+---
+# canary ServiceMonitor: canary evaluation must be able to look at canary metrics separately (not just the stable aggregate).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "lattice.node.canary.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-canary
+    lattice.io/track: canary
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lattice.node.canarySelectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}
+{{- if .Values.ingress.enabled }}
+---
+# Regular API Ingress (the control arm for canary): /v1 → stable node Service.
+# Long-connection/upload annotations must be provided here: with canary enabled, /v1 no longer passes through web's nginx (which has the same config)
+# and ingress-nginx proxies to node directly, so the 3600s timeout, SSE buffering-off and 24m upload body limit must all be declared explicitly.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "lattice.fullname" . }}-node-api
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.web.clientMaxBodySize | default "24m" | quote }}
+    {{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+    # shares the same host/TLS Secret as the web entry point; declaring the issuer twice does not issue twice (cert-manager merges by
+    # secretName), so a pure API deployment with web.enabled=false still gets automatic issuance
+    cert-manager.io/cluster-issuer: {{ .Values.tls.certManager.issuerRef.name | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      secretName: {{ include "lattice.ingressTlsSecretName" . }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "lattice.node.fullname" . }}
+                port:
+                  name: http
+---
+# canary API Ingress: **same host + same path** as the regular Ingress above, adding only ingress-nginx's
+# canary annotations. Other annotations (timeouts/buffering/upload limit) are decided by the regular Ingress location and are not repeated here.
+# When `byHeader` is non-empty, match precisely by header (early validation by internal accounts); otherwise split by weight percentage.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "lattice.fullname" . }}-node-api-canary
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-canary
+    lattice.io/track: canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: {{ $weight | quote }}
+    {{- with .Values.canary.byHeader }}
+    nginx.ingress.kubernetes.io/canary-by-header: {{ . | quote }}
+    {{- end }}
+    {{- if and .Values.canary.byHeader .Values.canary.byHeaderValue }}
+    nginx.ingress.kubernetes.io/canary-by-header-value: {{ .Values.canary.byHeaderValue | quote }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "lattice.node.canary.fullname" . }}
+                port:
+                  name: http
+{{- end }}
+{{- end }}

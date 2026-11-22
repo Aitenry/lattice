@@ -1,0 +1,110 @@
+[package]
+name = "lattice-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lattice platform node: WS/REST/gRPC/MQTT ingress + message pipeline + online routing + offline redelivery (doc ②)"
+
+[features]
+default = []
+# QUIC/WebTransport server-side proxy skeleton (design §17.9 path ②, PL-13 13.3).
+# **Off by default**: when off, quinn/rcgen do not compile and `[quic]` is parsed as config only (enabled is false).
+# Enable: `cargo build -p lattice-node --features quic`, then set `[quic] enabled=true` in TOML/env.
+# rustls / rustls-pemfile are **permanent dependencies** for the MQTT TLS listener (PL-11), no longer toggled by this feature.
+quic = ["dep:quinn", "dep:rcgen"]
+# WebTransport (HTTP/3) browser ingress gateway (PL-13 13.3 / design §17.9 path ②; off by default).
+# Depends on `quic`: the WT gateway **bridges** browser bidirectional streams to the local QUIC listener (the WT gateway is an internal QUIC client),
+# and JWT/device/participant auth + TLV/relay/rate limiting/stream caps all reuse the existing QUIC implementation instead of duplicating it.
+# Without this feature, `[webtransport]` is still parsed (enabled=false must have zero side effects).
+webtransport = ["dep:wtransport", "quic"]
+# WASM plugin host (design §4.5 / ② §4.5). **Off by default**: when off, wasmtime does not compile and
+# existing node builds are completely unchanged. When on, `lattice_plugins::wasm::WasmHost` is available, but the node request path
+# **is not wired up yet** (P5 remainder: registry reading PG/S3 + pipeline convert calls, see doc ② §11).
+wasm-host = ["lattice-plugins/wasm"]
+# OpenTelemetry OTLP/gRPC trace export (REMAINING E22 / PL-14 14.4). **Off by default**:
+# when off, the 4 opentelemetry* crates are not compiled, no global tracer is registered, no span is emitted, and behavior is
+# exactly as before OTel was implemented (all non-feature branches in `observe/otel.rs` are no-ops).
+# Enable: `cargo build -p lattice-node --features otel`, then follow the docs at the top of `observe/otel.rs`
+# and set `LATTICE_OTEL_ENABLED=1` + `OTEL_EXPORTER_OTLP_ENDPOINT` (default 127.0.0.1:4317).
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
+[[example]]
+# QUIC proxy E2E client (built and driven by scripts/quic-proxy-e2e.mjs); only meaningful under the quic feature.
+name = "quic-proxy-client"
+path = "examples/quic-proxy-client.rs"
+required-features = ["quic"]
+
+[[example]]
+# WebTransport E2E client (built and driven by scripts/webtransport-e2e.mjs):
+# a browser-identical WT CONNECT `/media` + the existing QUIC CONTROL/DATA TLV frames; only meaningful under the webtransport feature.
+name = "webtransport-client"
+path = "examples/webtransport-client.rs"
+required-features = ["webtransport"]
+
+[dependencies]
+lattice-core.workspace = true
+# Inherits `default-features = false` from the workspace: the plugin crate's default `wasm` feature
+# (wasmtime) does not take part in the default node build; enable it with `--features wasm-host` when needed.
+lattice-plugins.workspace = true
+async-nats.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tokio-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# ---- OpenTelemetry tracing (feature = "otel"; not compiled by default; versions/tradeoffs in the workspace Cargo.toml) ----
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+ulid.workspace = true
+urlencoding.workspace = true
+
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "macros", "migrate"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"] }
+jsonwebtoken = "9"
+argon2 = "0.5"
+rsa = { version = "0.9", features = ["pem", "sha2"] }
+rand = "0.8"
+prometheus = { version = "0.13", default-features = false }
+# ---- MQTT TLS / mTLS listener (PL-11; permanent dependency, toggled at runtime by [mqtt] tls_enabled) ----
+# The default build only additionally compiles rustls/tokio-rustls (the ring provider is already in Cargo.lock / cargo-vendor2),
+# and without TLS enabled the process creates no listener, with behavior exactly as before TLS was added.
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+# ---- QUIC server-side proxy skeleton (feature = "quic", not compiled by default) ----
+quinn = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+# ---- WebTransport (HTTP/3) browser ingress gateway (feature = "webtransport", not compiled by default) ----
+wtransport = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+# TLS unit tests: generate CA/server/client certificates in memory (the E2E uses openssl; unit tests depend on no external command).
+rcgen = { workspace = true }

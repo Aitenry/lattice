@@ -1,0 +1,118 @@
+// Lattice internal gRPC contract (P2/P3/P4)
+//
+// **Authority**: Doc ⑤ "Platform API Document" §10 (interface contract layer). This file is its proto realization;
+// it adds no methods and does not change field semantics. If it conflicts with §10, §10 wins and this file is backfilled.
+// Generated artifacts (`.rs` stubs) are produced by `buf generate`, are derivatives, and are not part of the doc set.
+//
+// Unwired status (2026, this round): `crates/lattice-node/src/transport/grpc.rs` is currently a skeleton
+// (it has config, contract constants, and unit tests, but does not listen on a port), landing in P2 (design §14 roadmap).
+// Therefore `protoc`/`buf` output is not yet wired into the build, and this file carries the contract itself for now.
+//
+// Known gap (registered as I7 in Doc ⑤ §13): the §10 service definitions reference
+// four messages — `WatermarkReq` / `WatermarkAck` / `Empty` / `HealthResp` —
+// but §10 only defines fields for the other messages, not these four. This file adds a **minimal provisional shape**
+// based on call semantics, marked `[provisional]`; once completed, only field/number additions are allowed — semantics
+// must not change and numbers must not be reused.
+
+syntax = "proto3";
+
+package lattice.internal.v1;
+
+// ---------------------------------------------------------------------------
+// Inter-node internal API (mTLS; client certificate CN = node identity, Doc ② §3.3)
+// ---------------------------------------------------------------------------
+service NodeInternal {
+  // Cross-node forwarding: last-resort fallback only when both NATS and Redis are unavailable; timeout 2s, 2 retries;
+  // if it still fails, the message moves to pending and an alert fires (⑤ §10 API table).
+  rpc Route(RouteReq) returns (RouteAck);
+
+  // Pull missing chunks between nodes: timeout 10s; on failure, return error{FORMAT} to the receiver and mark the message expired.
+  rpc FetchChunks(FetchReq) returns (stream ChunkStream);
+
+  // Registration/liveness: K8s Service discovery is primary and this is the fallback; timeout 1s; 3 consecutive failures → mark unhealthy
+  // (no new connections are assigned).
+  rpc Heartbeat(NodeInfo) returns (NodeInfo);
+
+  // seq watermark reconciliation (design §6.4): after a Redis failure, align to max(local, PG, peer); timeout 3s;
+  // on failure, keep the local watermark and retry next cycle.
+  rpc WatermarkSync(WatermarkReq) returns (WatermarkAck);
+}
+
+message RouteReq {
+  string target_node = 1;
+  bytes envelope = 2;          // Serialized Envelope protobuf (design §5)
+  string conn_id = 3;
+  uint32 priority = 4;         // 0 = normal; >0 = high priority (used by byef/ack/receipt/chunk)
+  string caller_node = 5;      // Calling node id (validated against the mTLS client certificate Subject CN)
+  uint32 frame_cmd = 6;        // 0 = Envelope (default); 10 = stream-sig (body still uses Envelope encoding)
+  string target_user = 7;      // Target user for generic-frame fallback (stream-sig; Envelope uses the route inside body)
+  repeated string target_devices = 8; // Target devices for generic-frame fallback (empty = all online devices)
+}
+
+message RouteAck {
+  bool accepted = 1;
+  string reason = 2;           // Reason when accepted=false (closed|backpressure|unknown_conn)
+}
+
+message FetchReq {
+  string msg_id = 1;           // Logical message id (chunk ids are <msg_id>.c<idx>, design §17.2)
+  repeated uint32 missing = 2; // Missing chunk indexes
+}
+
+message ChunkStream {
+  uint32 idx = 1;
+  bytes data = 2;
+  bytes checksum = 3;          // Chunk-level xxhash64 (design §17.6)
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string version = 2;
+  uint32 connections = 3;
+  uint32 protocol_version = 4;                 // Design §17.12; currently 1
+  map<string, uint64> seq_watermark = 5;       // conv_id -> seq
+}
+
+// [provisional] §10 does not define the fields; minimal shape derived from the
+// "report local watermark → fetch authoritative watermark" call semantics.
+message WatermarkReq {
+  string node_id = 1;
+  map<string, uint64> seq_watermark = 2;       // conv_id -> seq observed by this node
+}
+
+// [provisional] Same as above.
+message WatermarkAck {
+  bool ok = 1;
+  map<string, uint64> authoritative = 2;       // Authoritative conv_id -> seq after reconciliation
+}
+
+// ---------------------------------------------------------------------------
+// Plugin sidecar (mTLS + 500ms timeout; after a 30s circuit break, pass through as "no converter" and record metrics)
+// ---------------------------------------------------------------------------
+service PluginSidecar {
+  rpc Process(ProcessReq) returns (ProcessResp);
+  rpc Health(Empty) returns (HealthResp);
+}
+
+message ProcessReq {
+  string ns = 1;                          // Plugin namespace (plugins.ns, Doc ⑥ §2.3)
+  string op = 2;                          // Operation name (convert|validate|detect…)
+  bytes input = 3;
+  map<string, string> opts = 4;           // For example {content_type, target_format}
+}
+
+message ProcessResp {
+  bytes output = 1;
+  string error = 2;                       // Non-empty means failure; error code values are the 8 codes in design §17.10
+  uint64 elapsed_ms = 3;
+}
+
+// [provisional] ⑤ §10 only declares `Health(Empty)` and does not define Empty/HealthResp fields.
+message Empty {}
+
+// [provisional] Same as above; when healthy=false, the node trips the circuit for all calls to that ns for 30s.
+message HealthResp {
+  bool healthy = 1;
+  string version = 2;
+  uint32 inflight = 3;
+}

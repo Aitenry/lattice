@@ -1,0 +1,255 @@
+{{- if .Values.backup.pitr.enabled }}
+{{/*
+PITR productionization: two things the chart can do—and must automate:
+1) scheduled physical base backups (pg_basebackup, tar+gzip, uploaded to the same bucket/prefix as WAL archiving);
+   WAL archiving itself is done by the PG-side archive_command (deploy/production/patroni/wal-gateway.sh),
+   and the two together = restore to any point within the retention window (PITR); the chart cannot replace PG-side archiving.
+2) archive health verification (reading pg_stat_archiver / pg_stat_replication), turning "archiving stalled/no replica"
+   into Job failure (paired with the Prometheus kube_job_failed alert) instead of discovering it only when a restore is needed.
+
+Scheduling and retention (item by item against the table in deploy/production/backup/README.md §2):
+  * both CronJobs use concurrencyPolicy=Forbid—the same task never runs concurrently, so the two backup/verification paths cannot trip over each other;
+  * physical baselines keep 2 successful / 3 failed Job histories + TTL 7 days; archive verification keeps 1 successful / 3 failed + TTL 3 days.
+    TTL only cleans up leftover Jobs/Pods beyond the history counts (e.g. accumulated after a suspended schedule), and does **not** replace object-storage retention:
+    baseline objects are pruned by mc rm --older-than per backup.pitr.keepDays, and WAL archive object lifecycle is managed by
+    deploy/production/minio/bucket-setup.sh's lifecycle, and WAL retention must be >= the baseline retention window
+    (otherwise the oldest baseline cannot be replayed up to the latest point in time).
+  * failure alerting: after backoffLimit is exhausted the Job goes Failed; production hooks `kube_job_failed`/CronJob failure alerts
+    (this repo's deploy/observability covers application metrics only; Job failure alerts must be configured on the platform side);
+    the handling procedure is in deploy/production/backup/README.md §3.
+*/}}
+# verification SQL is mounted as a file: byte-identical to deploy/production/backup/archive-verify.sql,
+# so an online issue can be re-run against the same SQL (scripts/ha-prod-validate.py checks the two match).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lattice.fullname" . }}-pg-pitr-verify
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+data:
+  archive-verify.sql: |
+{{ .Files.Get "files/archive-verify.sql" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "lattice.fullname" . }}-pg-basebackup
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup-pitr
+spec:
+  schedule: {{ .Values.backup.pitr.baseBackupSchedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 7200
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # a large-database baseline may take hours; activeDeadlineSeconds is the timeout fallback (raise by data volume)
+      activeDeadlineSeconds: 21600
+      # retention: the baseline's "business data" is pruned from object storage by keepDays; only Job/Pod are kept here for troubleshooting, TTL 7 days
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            {{- include "lattice.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup-pitr
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            # postgres:16-alpine's postgres user is uid=70; pg_basebackup is only a client and needs no write access to $PGDATA
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            seccompProfile:
+              type: {{ .Values.security.seccompProfile }}
+          containers:
+            - name: basebackup
+              image: {{ .Values.backup.pgImage | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                # must use a REPLICATION-privileged account: a normal application account (lattice_app) cannot run pg_basebackup
+                - name: PG_REPLICATION_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: pg-replication-url
+                - name: BASEBACKUP_ARGS
+                  value: {{ .Values.backup.pitr.baseBackupArgs | quote }}
+                - name: TMPDIR
+                  value: /tmp
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)   # the timestamp is taken inside the Pod: rendered once by Helm it would overwrite historical baselines
+                  echo "$TS" > /backup/ts
+                  # -Ft -z -Xfetch: tar + gzip, and fetch the WAL the baseline needs (restore_command replays archives later)
+                  # shellcheck disable=SC2086  # BASEBACKUP_ARGS may be split on spaces into multiple arguments
+                  pg_basebackup "$PG_REPLICATION_URL" -D "/backup/base-${TS}" ${BASEBACKUP_ARGS}
+                  test -f "/backup/base-${TS}/base.tar.gz"
+                  {
+                    echo "ts=${TS}"
+                    echo "args=${BASEBACKUP_ARGS}"
+                    echo "tool=$(pg_basebackup --version 2>/dev/null | head -1)"
+                    echo "wal_prefix={{ .Values.backup.pitr.prefix }}"
+                  } > "/backup/base-${TS}/manifest.txt"
+                  touch /backup/.done
+              volumeMounts:
+                - name: scratch
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+            - name: upload
+              image: {{ .Values.backup.mcImage | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: s3-access-key
+                - name: S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: s3-secret-key
+                - name: S3_ENDPOINT
+                  value: {{ .Values.backup.s3Endpoint | quote }}
+                - name: BUCKET
+                  value: {{ .Values.backup.pitr.bucket | quote }}
+                - name: PREFIX
+                  value: {{ .Values.backup.pitr.prefix | quote }}
+                - name: KEEP_DAYS
+                  value: {{ .Values.backup.pitr.keepDays | quote }}
+                # mc needs a writable config directory under a read-only root filesystem
+                - name: MC_CONFIG_DIR
+                  value: /tmp/.mc
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # wait for the baseline to finish (shared emptyDir; both containers start together, so order cannot be assumed)
+                  i=0
+                  until [ -f /backup/.done ]; do
+                    i=$((i+1)); [ "$i" -gt 7200 ] && { echo "basebackup timeout"; exit 1; }
+                    sleep 2
+                  done
+                  TS=$(cat /backup/ts)
+                  mc alias set backup "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null
+                  # upload the whole baseline directory (base.tar.gz + pg_wal.tar.gz + manifest.txt); same-name overwrite = idempotent retry
+                  mc cp --recursive "/backup/base-${TS}" "backup/$BUCKET/$PREFIX/base/${TS}/"
+                  echo "uploaded $BUCKET/$PREFIX/base/${TS}/"
+                  # retention: only the baseline directory is pruned; WAL archive retention is handled by minio/bucket-setup.sh's lifecycle
+                  mc rm --recursive --force --older-than "${KEEP_DAYS}d" "backup/$BUCKET/$PREFIX/base/" || true
+              volumeMounts:
+                - name: scratch
+                  mountPath: /backup
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: scratch
+              emptyDir:
+                sizeLimit: {{ .Values.backup.pitr.scratchSize | default "64Gi" }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 256Mi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "lattice.fullname" . }}-pg-pitr-verify
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup-pitr
+spec:
+  schedule: {{ .Values.backup.pitr.verifySchedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # the verification SQL is two or three read-only queries: a 10min timeout suffices and must be < the schedule interval (15min by default),
+      # otherwise the previous run is unfinished and the next is skipped by Forbid, showing up as "verification never produces a result".
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      # keep failure evidence for 3 days (paired with failedJobsHistoryLimit=3, so Job logs are available after an incident);
+      # alerting only looks at Job failure (see the failure-alerting notes at the top of the file).
+      ttlSecondsAfterFinished: 259200
+      template:
+        metadata:
+          labels:
+            {{- include "lattice.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup-pitr
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 70
+            runAsGroup: 70
+            fsGroup: 70
+            seccompProfile:
+              type: {{ .Values.security.seccompProfile }}
+          containers:
+            - name: verify
+              image: {{ .Values.backup.pgImage | quote }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              env:
+                - name: PG_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: pg-url
+                - name: MAX_ARCHIVE_LAG_SECONDS
+                  value: {{ .Values.backup.pitr.maxArchiveLagSeconds | quote }}
+                - name: REQUIRE_REPLICA
+                  value: {{ .Values.backup.pitr.requireReplica | quote }}
+                - name: TMPDIR
+                  value: /tmp
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # SQL prints a single OK/FATAL line; FATAL → exit code 1 → Job failure → alert (do not swallow it silently)
+                  out=$(psql "$PG_URL" -v ON_ERROR_STOP=1 \
+                    -v max_archive_lag_seconds="$MAX_ARCHIVE_LAG_SECONDS" \
+                    -v require_replica="$REQUIRE_REPLICA" \
+                    -tA -f /verify/archive-verify.sql)
+                  echo "archive-check: $out"
+                  case "$out" in
+                    OK*) exit 0 ;;
+                    *) echo "archive-check FAILED (FATAL)" >&2; exit 1 ;;
+                  esac
+              volumeMounts:
+                - name: verify-sql
+                  mountPath: /verify
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: verify-sql
+              configMap:
+                name: {{ include "lattice.fullname" . }}-pg-pitr-verify
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+{{- end }}

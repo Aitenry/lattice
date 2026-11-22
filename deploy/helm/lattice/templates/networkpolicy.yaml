@@ -1,0 +1,95 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+ node NetworkPolicy: deny ingress by default, allow only by port + namespace.
+ - 8080 (HTTP/WS): web Pods, the Ingress Controller namespace, extra ingressFrom
+ - 9100 (metrics): all sources by default (degraded); with metricsNamespace set, only that namespace
+ - 9090 (gRPC): only node-to-node calls
+ - 1883/8883 (MQTT): only sources in mqttFrom (empty = restrict the port, not the source)
+ - 4433/udp (QUIC): only sources in udpFrom (empty = restrict the port, not the source)
+ Egress is unrestricted by default (nodes connect to PG/Redis/NATS/S3 and targets vary per deployment; when networkPolicy.egress.enabled
+ is turned on it becomes deny-by-default, allowing only DNS + the egress.allow list).
+
+ The rules themselves live in `_node.tpl` as `lattice.node.networkPolicyRules`: the canary node uses the same rules,
+ only the podSelector differs—otherwise canary Pods are selected by no NetworkPolicy, which in a hardened cluster equals allow-all.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "lattice.node.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "lattice.node.selectorLabels" . | nindent 6 }}
+  {{- include "lattice.node.networkPolicyRules" . | nindent 2 }}
+{{- end }}
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.web.enabled .Values.web.enabled }}
+---
+{{/*
+ web NetworkPolicy: deny ingress by default (allow only Ingress Controller/ingressFrom → 80/8443),
+ egress allows only DNS and node:8080 (when TLS terminates at web, the in-cluster upstream link is still plaintext :8080).
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "lattice.web.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "lattice.web.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if or .Values.networkPolicy.ingressControllerNamespace .Values.networkPolicy.ingressFrom }}
+    - from:
+        {{- if .Values.networkPolicy.ingressControllerNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace | quote }}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingressFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 80
+        {{- if include "lattice.webTlsEnabled" . }}
+        - protocol: TCP
+          port: {{ .Values.tls.http.web.port }}
+        {{- end }}
+    {{- else }}
+    # No ingress sources configured: an explicit empty list = deny all sources.
+    # (In NetworkPolicy an absent from means "allow all"; it cannot be omitted here or default-deny stops working.)
+    - from: []
+      ports:
+        - protocol: TCP
+          port: 80
+        {{- if include "lattice.webTlsEnabled" . }}
+        - protocol: TCP
+          port: {{ .Values.tls.http.web.port }}
+        {{- end }}
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.dnsNamespace | default "kube-system" | quote }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "lattice.node.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}

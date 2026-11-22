@@ -1,0 +1,1215 @@
+﻿/* ============================================================
+   Lattice Admin Console · global styles
+   Design rules:
+   - Colours always go through CSS variables (--bg-layout/--text/...); their values are
+     injected for both themes from CSS_VAR in `src/theme.ts` (components/ThemeProvider.tsx).
+     Hex colours must not appear in this file, and new components must not hard-code colours either;
+     the only exception: the sidebar brand area and the dark decorative panel on the login page
+     are dark by design in both themes; their fixed colours live inside that block and do not
+     participate in theme switching;
+   - this file only holds the layout skeleton and the few blocks antd does not cover;
+   - the shell is fixed to one screen: no page-level scrollbars, scrolling only inside lists.
+   ============================================================ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  /* No whole-page scrolling: only explicitly allowed inner areas scroll (lists never show a scrollbar) */
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg-layout);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+/* ---------- Sidebar ---------- */
+
+.app-sider {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+/* antd wraps Sider children in .ant-layout-sider-children, so the flex layout must live on it */
+.app-sider .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.sider-brand {
+  flex: 0 0 60px;
+  height: 60px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  color: #f8fafc;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+}
+
+.sider-logo {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 15px;
+  color: #fff;
+  letter-spacing: 0.5px;
+}
+
+.sider-brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.sider-brand-name {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.sider-brand-sub {
+  font-size: 11px;
+  color: rgba(226, 232, 240, 0.55);
+  white-space: nowrap;
+}
+
+.sider-menu {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 0 12px;
+}
+
+.sider-menu::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sider-menu::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 3px;
+}
+
+.sider-menu .ant-menu-item-group-title {
+  padding: 14px 20px 6px;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: rgba(148, 163, 184, 0.75) !important;
+  text-transform: uppercase;
+}
+
+.sider-footer {
+  flex: 0 0 auto;
+  padding: 10px 16px 14px;
+  border-top: 1px solid rgba(148, 163, 184, 0.14);
+  color: rgba(148, 163, 184, 0.7);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* ---------- Top bar ---------- */
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--border-soft);
+  /* antd Header defaults to line-height:64px; taller than 60px, it misaligns the content */
+  line-height: normal;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.header-left,
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.header-crumb {
+  color: var(--text-3);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header-crumb strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.node-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  font-size: 12px;
+  color: var(--text-2);
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node-pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 7px;
+}
+
+.node-pill.ok .dot {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.15);
+}
+
+.node-pill.warn .dot {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.15);
+}
+
+.node-pill.bad .dot {
+  background: var(--bad);
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.15);
+}
+
+.user-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px 4px 4px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.user-chip:hover {
+  background: var(--bg-hover);
+}
+
+.user-chip .name {
+  font-size: 13px;
+  color: var(--text);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Shared avatar (components/UserAvatar.tsx): colours follow the theme; pages no longer hard-code them */
+.user-avatar {
+  background: var(--avatar-bg);
+  color: var(--avatar-fg);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+
+/* ---------- Shell: fixed to one screen ---------- */
+
+.app-shell {
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-main {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- Content area ---------- */
+
+.app-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  padding: 20px 24px 22px;
+  width: 100%;
+}
+
+.app-content-inner {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  max-width: 1440px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* List pages: page header + card fill the viewport exactly */
+.page-fill {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* Info pages: content may exceed one screen; scrollable with a hidden scrollbar so nothing shows */
+.page-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.page-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---------- Stat cards ---------- */
+
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 16px 18px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  transition: box-shadow 0.2s, border-color 0.2s, background-color 0.2s;
+}
+
+.stat-card:hover {
+  box-shadow: 0 2px 10px rgba(16, 24, 40, 0.06);
+  border-color: var(--border);
+}
+
+.stat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.stat-label {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.stat-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+}
+
+/* Stat-card icon backgrounds: colours live only in the tone classes here; pages carry no colours */
+.stat-icon.tone-blue {
+  background: var(--tone-blue-bg);
+  color: var(--tone-blue-fg);
+}
+
+.stat-icon.tone-green {
+  background: var(--tone-green-bg);
+  color: var(--tone-green-fg);
+}
+
+.stat-icon.tone-orange {
+  background: var(--tone-orange-bg);
+  color: var(--tone-orange-fg);
+}
+
+.stat-icon.tone-red {
+  background: var(--tone-red-bg);
+  color: var(--tone-red-fg);
+}
+
+.stat-icon.tone-slate {
+  background: var(--tone-slate-bg);
+  color: var(--tone-slate-fg);
+}
+
+.stat-icon.tone-violet {
+  background: var(--tone-violet-bg);
+  color: var(--tone-violet-fg);
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-value.small {
+  font-size: 18px;
+}
+
+.stat-hint {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.5;
+}
+
+/* ---------- Shared blocks ---------- */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+/* Action buttons on the right of a filter row: pinned right even when first in the DOM */
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  order: 99;
+}
+
+.muted {
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+  letter-spacing: -0.01em;
+}
+
+.table-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.cell-title {
+  font-weight: 500;
+  color: var(--text-strong);
+}
+
+.cell-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.help-tip {
+  color: var(--text-4);
+  cursor: help;
+  font-size: 13px;
+  margin-left: 4px;
+}
+
+.help-tip:hover {
+  color: var(--primary);
+}
+
+.code-block {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.55;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.raw-block {
+  margin: 0;
+  max-height: 300px;
+  overflow: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  color: var(--text-2);
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.soft-panel {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.7;
+}
+
+.soft-panel b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Secondary status text in a toolbar (e.g. "Updated at 12:30:08", "Page 2") */
+.toolbar-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.toolbar-meta .dot-sep {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--text-4);
+  flex: 0 0 3px;
+}
+
+/* Inline code/config snippets (used in empty states and hints; do not use .mono: inside list cards it is a block-level ellipsis style) */
+.inline-code {
+  display: inline;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* ---------- Login page ---------- */
+
+.login-shell {
+  height: 100vh;
+  min-height: 100vh;
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  display: flex;
+  background: var(--bg-layout);
+}
+
+.login-shell::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.login-aside {
+  flex: 1 1 52%;
+  padding: 56px 64px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  background:
+    radial-gradient(900px 500px at 15% 15%, rgba(37, 99, 235, 0.35) 0%, rgba(11, 18, 32, 0) 65%),
+    radial-gradient(700px 500px at 85% 80%, rgba(14, 165, 233, 0.18) 0%, rgba(11, 18, 32, 0) 60%),
+    #0b1220;
+  color: #e2e8f0;
+}
+
+.login-aside .brand-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 17px;
+  font-weight: 600;
+  color: #f8fafc;
+}
+
+.login-aside h1 {
+  font-size: 34px;
+  line-height: 1.3;
+  margin: 0 0 14px;
+  font-weight: 600;
+  color: #f8fafc;
+  letter-spacing: -0.02em;
+}
+
+.login-aside h1 em {
+  font-style: normal;
+  color: #60a5fa;
+}
+
+.login-aside .lead {
+  font-size: 14px;
+  line-height: 1.9;
+  color: rgba(226, 232, 240, 0.72);
+  max-width: 520px;
+}
+
+.login-points {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 34px;
+}
+
+.login-point {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.8);
+}
+
+.login-point-title {
+  color: #f8fafc;
+  font-weight: 500;
+}
+
+.login-point .ico {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  border-radius: 7px;
+  background: rgba(96, 165, 250, 0.14);
+  color: #93c5fd;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+}
+
+.login-foot {
+  font-size: 12px;
+  color: rgba(148, 163, 184, 0.6);
+}
+
+.login-main {
+  flex: 1 1 48%;
+  position: relative;
+  background: var(--bg-layout);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+  transition: background-color 0.2s ease;
+}
+
+/* Light/dark toggle in the login page top-right corner (same ThemeModeProvider as the shell header) */
+.login-theme-toggle {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 400px;
+}
+
+.login-card-head {
+  margin-bottom: 20px;
+}
+
+.login-card-head h2 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.login-card-head p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-2);
+  line-height: 1.6;
+}
+
+.login-card .ant-card {
+  border-radius: 12px;
+  border-color: var(--border-soft);
+  box-shadow: 0 6px 24px rgba(16, 24, 40, 0.06);
+}
+
+/* ---------- List card: fixed height, no inner scrollbar ----------
+   Tables do not set scroll.x / scroll.y for sizing:
+   - width uses table-layout: fixed so columns shrink proportionally (no horizontal scrollbar);
+   - height is controlled by "rows per page = available height / row height", computed by
+     useRowCapacity, with the pager pinned to the bottom.
+   Both guarantee the table always fills the card instead of scrolling inside it. */
+
+.list-card {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.list-card > .ant-card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 16px 10px;
+}
+
+.list-card .ant-table-wrapper {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.list-card .ant-spin-nested-loading,
+.list-card .ant-spin-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Header fixed, body scrolls inside the card: the page itself never shows a scrollbar */
+.list-card .ant-table {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* antd has a container layer between .ant-table and the header/body; it must be a flex channel so the body receives the remaining height */
+.list-card .ant-table-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.list-card .ant-table-header {
+  flex: 0 0 auto;
+  overflow: hidden !important;
+}
+
+.list-card .ant-table-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* Override the max-height antd writes inline from scroll.y so the body fills the remaining card height */
+  max-height: none !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+  overscroll-behavior: contain;
+}
+
+.list-card .ant-table-body::-webkit-scrollbar {
+  width: 8px;
+}
+
+.list-card .ant-table-body::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+
+.list-card .ant-table-body::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+
+.list-card .ant-table-content {
+  overflow-x: hidden !important;
+}
+
+.list-card .ant-table-content > table,
+.list-card .ant-table-body > table {
+  table-layout: fixed !important;
+  width: 100% !important;
+  min-width: 0 !important;
+}
+
+.list-card .ant-table-thead > tr > th {
+  height: 42px;
+  padding: 8px 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.list-card .ant-table-tbody > tr > td {
+  height: 52px;
+  padding: 6px 12px;
+  vertical-align: middle;
+  overflow: hidden;
+}
+
+/* Single-line cells always ellipsize, so long IDs cannot raise the row or break the fixed row height */
+.list-card .cell-title,
+.list-card .cell-sub,
+.list-card .mono,
+.list-card .table-id {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-card .ant-table-cell .ant-space {
+  max-width: 100%;
+}
+
+.list-card .ant-table-tbody > tr > td > .ant-space-vertical > .ant-space-item {
+  min-width: 0;
+}
+
+/* The pager is always pinned to the card bottom; when space is short, keep the pager and crop the last row rather than let it leave the viewport */
+.list-card .ant-table-pagination.ant-pagination {
+  flex: 0 0 auto;
+  margin: auto 0 0;
+  padding-top: 10px;
+}
+
+.list-card .ant-spin-nested-loading,
+.list-card .ant-spin-container {
+  overflow: hidden;
+}
+
+/* The empty state uses the same height, so switching data does not jump */
+.list-card .ant-empty {
+  margin: 28px 0;
+}
+
+/* First-load skeleton: same padding as the table, avoiding the "empty table to data appears" jump */
+.recordings-skeleton {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  padding: 6px 4px;
+}
+
+.recordings-skeleton .ant-skeleton-title {
+  height: 14px;
+}
+
+.recordings-skeleton .ant-skeleton-paragraph > li {
+  height: 32px;
+}
+
+/* ---------- Media recording detail (Drawer) ---------- */
+
+.recording-copy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+
+.recording-copy-note {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+
+/* ---------- Plugin management: WASM runtime status cards ---------- */
+
+.wasm-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.wasm-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.wasm-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.wasm-panel-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+
+.wasm-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.wasm-stat {
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  min-width: 0;
+}
+
+.wasm-stat-label {
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wasm-stat-value {
+  margin-top: 2px;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
+}
+
+.wasm-stat-value.small {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.wasm-stat-hint {
+  font-size: 11px;
+  color: var(--text-4);
+  line-height: 1.5;
+  /* Allow wrapping: at 1280px wide with 6 cards per row, long explanations are not truncated with an ellipsis */
+  overflow-wrap: anywhere;
+}
+
+.wasm-reject-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wasm-reject-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--tone-orange-bg);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.55;
+  min-width: 0;
+}
+
+.wasm-reject-item .kind {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--tone-orange-fg);
+}
+
+.wasm-reject-item .plugin {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+
+.wasm-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.6;
+}
+
+/* ---------- Tables in detail drawers have no fixed height; the drawer itself scrolls (overlay, not content area) ---------- */
+.drawer-table .ant-table-content {
+  overflow: hidden !important;
+}
+
+.drawer-table .ant-table-content > table {
+  table-layout: fixed !important;
+  width: 100% !important;
+}
+
+/* Overlays (drawers, modals) may scroll internally, but likewise show no scrollbar */
+.ant-drawer-body,
+.ant-modal-wrap,
+.ant-modal-body {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.ant-drawer-body::-webkit-scrollbar,
+.ant-modal-wrap::-webkit-scrollbar,
+.ant-modal-body::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* ---------- Plugin hub (/hub): card grid, scrolling only inside the card ----------
+   The shell is fixed to one screen (README §4), so the grid fills the remaining height of
+   .list-card and scrolls itself; the pager stays pinned to the card bottom. Layout only:
+   all colours come from antd tokens / CSS variables. */
+
+.hub-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+  overscroll-behavior: contain;
+}
+
+.hub-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.hub-scroll::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+
+.hub-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+
+/* Responsive columns: wider windows fit more per row; cards never shrink below 300px */
+.hub-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 14px;
+  padding-bottom: 2px;
+}
+
+.hub-grid .ant-card {
+  height: 100%;
+}
+
+.hub-pager {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 12px;
+}
+
+/* ---------- Responsive ---------- */
+
+/* 1280x800 laptops: trim the padding so content width never causes horizontal scrolling */
+@media (max-width: 1366px) {
+  .app-content {
+    padding: 16px 18px 18px;
+  }
+
+  .app-header {
+    padding: 0 14px;
+  }
+}
+
+@media (max-width: 900px) {
+  .login-aside {
+    display: none;
+  }
+
+  .app-content {
+    padding: 14px 12px 16px;
+  }
+}
+
+/* Login page: prevent overflow on narrow screens / with long copy (user feedback: right-side
+   text clipped, icons and text misaligned). Flex items default to min-width:auto, so long
+   copy would break the aside; explicitly allow shrinking and wrapping here. */
+.login-aside,
+.login-main {
+  min-width: 0;
+}
+.login-point > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.6;
+}
+.login-shell {
+  overflow-x: hidden;
+}
+
+@media (max-width: 980px) {
+  .login-shell {
+    height: auto;
+    min-height: 100vh;
+    flex-direction: column;
+  }
+  .login-aside {
+    flex: none;
+    padding: 30px 24px 26px;
+    gap: 20px;
+  }
+  .login-aside h1 {
+    font-size: 27px;
+    line-height: 1.35;
+    margin-bottom: 10px;
+  }
+  .login-aside .lead {
+    max-width: none;
+    font-size: 13px;
+    line-height: 1.75;
+  }
+  .login-points {
+    margin-top: 20px;
+    gap: 12px;
+  }
+  .login-main {
+    flex: none;
+    min-height: 420px;
+    padding: 28px 18px 34px;
+    align-items: flex-start;
+  }
+  .login-card {
+    max-width: 460px;
+  }
+  .login-foot {
+    margin-top: 18px;
+  }
+}
+
+@media (max-width: 560px) {
+  .login-aside {
+    padding: 24px 18px 20px;
+  }
+  .login-aside h1 {
+    font-size: 23px;
+  }
+  .login-aside .lead {
+    font-size: 12.5px;
+    line-height: 1.7;
+  }
+  .login-point {
+    gap: 10px;
+    font-size: 12.5px;
+  }
+  .login-point .ico {
+    width: 24px;
+    height: 24px;
+    flex-basis: 24px;
+  }
+  .login-card-head h2 {
+    font-size: 20px;
+  }
+  .login-main {
+    min-height: 0;
+    padding: 22px 14px 28px;
+  }
+}
+
+/* Login points: the icon aligns exactly with the title first line; description text stays
+   in the column right of the icon, so a long sentence cannot push the row out of the left
+   panel (user feedback: the third row icon/text looked misaligned and text overflowed). */
+.login-points {
+  max-width: 560px;
+  width: 100%;
+}
+.login-point {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  column-gap: 14px;
+  align-items: start;
+  width: 100%;
+}
+.login-point > div {
+  min-width: 0;
+  max-width: 100%;
+}
+.login-point-title {
+  line-height: 26px;
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+}
+.login-point .ico {
+  margin-top: 0;
+}
+
+/* Agreed convention: the icon is vertically centred against "title + description" as a whole (not just the title first line). */
+.login-point {
+  align-items: center;
+}
+.login-point-title {
+  line-height: 1.5;
+  min-height: 0;
+}
+
+/* Login left column: move the content up so high-resolution screens do not show a large gap
+   between the logo and the title. The brand stays at the top, the hero keeps a controlled
+   distance from the logo, and the footer is pushed to the bottom. */
+.login-aside {
+  justify-content: flex-start;
+}
+.login-aside > div:nth-child(2) {
+  margin-top: clamp(32px, 6vh, 72px);
+}
+.login-foot {
+  margin-top: auto;
+}
+
+@media (max-width: 980px) {
+  .login-aside > div:nth-child(2) {
+    margin-top: 22px;
+  }
+}
+

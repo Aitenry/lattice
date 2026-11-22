@@ -1,0 +1,170 @@
+# =============================================================================
+# Lattice production Redis HA — 1 primary + 2 replicas + Sentinel ×3 (Sentinel handles election/switchover)
+# -----------------------------------------------------------------------------
+# Notes (read these first):
+#   1) This file is a **topology reference/staging drill** for 6 containers on one host; production is
+#      3 hosts (1 Sentinel each, co-located with data nodes), with redis-master.conf /
+#      redis-replica.conf / sentinel.conf as the authoritative parameters.
+#   2) At container startup sed renders ${REDIS_PASSWORD} / ${REDIS_MASTER_HOST} from the template into
+#      /data, then execs redis-server|redis-sentinel — so the repository holds only placeholders and real
+#      passwords come from environment variables/a Secret. Production renders the same templates with
+#      envsubst/Ansible; the mechanism is identical.
+#   3) **No host ports are published**: the local dev stack already uses 6379; for a drill use
+#      `docker compose exec` or temporarily add `ports:`. Production clients connect only to the
+#      VIP/HAProxy (see deploy/production/README.md §5.2).
+#   4) The node's [redis] url is a single endpoint: do not configure `redis://sentinel://...` (not
+#      supported) and do not point at the fixed IP of one Redis node — use the stable endpoint.
+#
+#   docker compose -f deploy/production/redis/docker-compose.yml config   # offline check
+# =============================================================================
+name: lattice-redis-ha
+
+networks:
+  redisnet:
+    driver: bridge
+
+volumes:
+  redis-master-data:
+  redis-replica-1-data:
+  redis-replica-2-data:
+  sentinel-0-data:
+  sentinel-1-data:
+  sentinel-2-data:
+
+x-redis-env: &redis-env
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-CHANGE_ME_REDIS_PASSWORD}
+
+services:
+  redis-master:
+    image: redis:7-alpine
+    container_name: lattice-redis-master
+    hostname: redis-master
+    networks: [redisnet]
+    restart: unless-stopped
+    environment:
+      <<: *redis-env
+    volumes:
+      - redis-master-data:/data
+      - ./redis-master.conf:/etc/redis/redis.conf.tmpl:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        sed "s#\$${REDIS_PASSWORD}#$$REDIS_PASSWORD#g" \
+          /etc/redis/redis.conf.tmpl > /data/redis.conf
+        exec redis-server /data/redis.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis-replica-1:
+    image: redis:7-alpine
+    container_name: lattice-redis-replica-1
+    hostname: redis-replica-1
+    networks: [redisnet]
+    restart: unless-stopped
+    depends_on:
+      redis-master: { condition: service_healthy }
+    environment:
+      <<: *redis-env
+      REDIS_MASTER_HOST: redis-master
+    volumes:
+      - redis-replica-1-data:/data
+      - ./redis-replica.conf:/etc/redis/redis.conf.tmpl:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        sed -e "s#\$${REDIS_PASSWORD}#$$REDIS_PASSWORD#g" \
+            -e "s#\$${REDIS_MASTER_HOST}#$$REDIS_MASTER_HOST#g" \
+          /etc/redis/redis.conf.tmpl > /data/redis.conf
+        exec redis-server /data/redis.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  redis-replica-2:
+    image: redis:7-alpine
+    container_name: lattice-redis-replica-2
+    hostname: redis-replica-2
+    networks: [redisnet]
+    restart: unless-stopped
+    depends_on:
+      redis-master: { condition: service_healthy }
+    environment:
+      <<: *redis-env
+      REDIS_MASTER_HOST: redis-master
+    volumes:
+      - redis-replica-2-data:/data
+      - ./redis-replica.conf:/etc/redis/redis.conf.tmpl:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        sed -e "s#\$${REDIS_PASSWORD}#$$REDIS_PASSWORD#g" \
+            -e "s#\$${REDIS_MASTER_HOST}#$$REDIS_MASTER_HOST#g" \
+          /etc/redis/redis.conf.tmpl > /data/redis.conf
+        exec redis-server /data/redis.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning --no-raw ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # --- Sentinel ×3: quorum=2; any 1 host down still allows switchover, 2 down loses automatic switchover ---
+  sentinel-0: &sentinel
+    image: redis:7-alpine
+    container_name: lattice-redis-sentinel-0
+    hostname: sentinel-0
+    networks: [redisnet]
+    restart: unless-stopped
+    depends_on:
+      redis-master: { condition: service_healthy }
+    environment:
+      <<: *redis-env
+      REDIS_MASTER_HOST: redis-master
+    volumes:
+      - sentinel-0-data:/data
+      - ./sentinel.conf:/etc/redis/sentinel.conf.tmpl:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        sed -e "s#\$${REDIS_PASSWORD}#$$REDIS_PASSWORD#g" \
+            -e "s#\$${REDIS_MASTER_HOST}#$$REDIS_MASTER_HOST#g" \
+          /etc/redis/sentinel.conf.tmpl > /data/sentinel.conf
+        chmod 0600 /data/sentinel.conf
+        exec redis-sentinel /data/sentinel.conf
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  sentinel-1:
+    <<: *sentinel
+    container_name: lattice-redis-sentinel-1
+    hostname: sentinel-1
+    volumes:
+      - sentinel-1-data:/data
+      - ./sentinel.conf:/etc/redis/sentinel.conf.tmpl:ro
+
+  sentinel-2:
+    <<: *sentinel
+    container_name: lattice-redis-sentinel-2
+    hostname: sentinel-2
+    volumes:
+      - sentinel-2-data:/data
+      - ./sentinel.conf:/etc/redis/sentinel.conf.tmpl:ro

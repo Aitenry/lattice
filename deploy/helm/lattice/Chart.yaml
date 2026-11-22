@@ -1,0 +1,17 @@
+apiVersion: v2
+name: lattice
+description: Lattice unified message transport platform (lattice-node cluster + web console)
+type: application
+version: 0.2.0
+appVersion: "0.5.0"
+keywords:
+  - messaging
+  - websocket
+  - mqtt
+  - plugin-hub
+home: https://github.com/
+maintainers:
+  - name: lattice-platform
+annotations:
+  # chart describes only "how to deploy"; interfaces, data model and values follow docs ⑤/⑥ and design §17 respectively
+  lattice.io/authority: "② §7.3 (Helm resource manifests), ⑥ §6.4 (reconciliation), design §14 (HA)"

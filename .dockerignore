@@ -1,0 +1,12 @@
+# Build-context exclusions (note: do not use **/target — the vendor tree contains crates' own src/target directories)
+.tooling
+/target
+web/node_modules
+web/dist
+.git
+.gitignore
+scripts/_*
+*.log
+Dockerfile
+deploy/Dockerfile.node
+deploy/Dockerfile.web

@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = ["crates/lattice-core", "crates/lattice-plugins", "crates/lattice-node"]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+lattice-core = { path = "crates/lattice-core" }
+# `default-features = false` is declared here because member crates cannot override the
+# workspace `default-features` under edition 2021: the plugin crate's default feature is
+# `wasm` (which pulls in wasmtime) and the node does not enable it by default. The node
+# opts in explicitly with `--features wasm-host` when needed.
+lattice-plugins = { path = "crates/lattice-plugins", default-features = false }
+async-nats = { version = "0.53", default-features = false, features = ["jetstream", "nuid", "ring"] }
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+prost = "0.13"
+# QUIC/WebTransport server-side proxy skeleton (PL-13 13.3; only used by the `quic`
+# feature of `lattice-node`). rustls-ring instead of aws-lc-rs: no extra C toolchain on
+# Windows-gnu or inside containers, and the repository already depends on ring.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# WebTransport (HTTP/3) browser ingress gateway (PL-13 13.3; only used by the
+# `webtransport` feature of `lattice-node`, not compiled by default). Default features
+# are off: only the ring provider is enabled (consistent with the existing quinn/rustls
+# ring choice), so Windows-gnu and the offline vendor build need no extra C toolchain;
+# `self-signed` is not enabled either (it would pull rcgen 0.14 while the repository
+# already has rcgen 0.13, so dev self-signed certificates are generated with 0.13 on the
+# node side and injected through `Identity::new`).
+wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
+# Plugin WASM host (design §4.5; only used by the `wasm` feature of `lattice-plugins`;
+# `lattice-node` depends on the plugin crate with `default-features = false`, so it is
+# not compiled by default).
+# Default features are off: no async / component-model / GC / cache / pooling; only the
+# "synchronous runtime + Cranelift JIT" pair is needed. The quota capabilities (fuel /
+# epoch / StoreLimits) all live in runtime + std; WAT-to-wasm conversion uses the
+# separate `wat` crate in dev-dependencies only.
+wasmtime = { version = "49.0.7", default-features = false, features = ["cranelift", "runtime", "std"] }
+# Plugin Ed25519 signature verification (PL-10 / design §4.5): ring is already in the
+# dependency tree (the `ring` feature of async-nats/rustls, matching ring 0.17.14 in
+# Cargo.lock), so reusing it avoids a new crate and a re-vendor (`cargo-vendor2/ring`
+# already exists); ring only verifies signatures, signing is done offline with the
+# publisher's private key.
+ring = "0.17"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+# MQTT TLS/mTLS listeners (PL-11): async rustls wrapper for tokio. The provider is ring
+# (consistent with the existing rustls/async-nats features, no extra C toolchain on
+# Windows-gnu or in the offline vendor build); tls12 keeps IoT devices that only speak
+# TLS1.2 working (the rustls/tokio-rustls versions are already in Cargo.lock and
+# cargo-vendor2).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost", "tls"] }
+tonic-build = { version = "0.12", default-features = false, features = ["transport", "prost"] }
+protoc-bin-vendored = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sha1 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OTel tracing (REMAINING E22 / PL-14 14.4): only used by the `otel` feature of
+# `lattice-node`, **not compiled by default** (when disabled these four crates stay out
+# of the build and node behaviour is unchanged).
+# This 0.27/0.28 set is chosen so the gRPC exporter rides tonic 0.12 + prost 0.13
+# (existing versions, which avoids compiling a second tonic/prost tree) and pulls in no
+# reqwest/TLS/new HTTP client tree; OTLP/gRPC is the default export protocol in the
+# design document. Versions are pinned to the minor version to avoid vendor-directory and
+# SDK trait drift.
+opentelemetry = { version = "0.27.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.27.1", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27.0", default-features = false, features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = { version = "0.28.0", default-features = false }
+ulid = "1"
+urlencoding = "2"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

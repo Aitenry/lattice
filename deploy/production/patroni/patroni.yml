@@ -1,0 +1,225 @@
+# =============================================================================
+# Lattice production PostgreSQL HA — 3-node Patroni + etcd(3) configuration template
+# -----------------------------------------------------------------------------
+# Topology: 1 primary + 2 streaming replicas; DCS = etcd v3 ×3; automatic failover is performed by Patroni.
+# Authoritative parameters: this file (deploy/production/patroni/patroni.yml). The compose file only
+# expresses the topology.
+#
+# 1. Rendering (one copy per node; Patroni does not interpolate YAML itself, "${...}" are template
+#    placeholders):
+#     export PATRONI_NAME=pg0  NODE_IP=10.20.0.11  RESTAPI_IP=10.20.0.11
+#     export ETCD0=10.20.0.11 ETCD1=10.20.0.12 ETCD2=10.20.0.13
+#     export PATRONI_RESTAPI_PASSWORD=... PG_SUPERUSER_PASSWORD=... \
+#            PG_REPLICATION_PASSWORD=... PG_REWIND_PASSWORD=... PG_APP_PASSWORD=...
+#     envsubst < patroni.yml > /etc/patroni/patroni.yml
+#     install -m 0600 /etc/patroni/patroni.yml
+#     patroni /etc/patroni/patroni.yml
+#   Password variables may only come from a secret management system (Vault/K8s Secret/systemd
+#   EnvironmentFile 0600); they must never be committed to the repository or appear in a command line
+#   visible to `ps`.
+#   The rendered file likewise contains plaintext passwords → mode 0600, and never store it in plaintext
+#   configuration management.
+#
+# 2. Relationship to node configuration in `crates/lattice-node/src/config.rs` (required reading for
+#    production):
+#   * The node accepts **one** PG endpoint (`[pg] url`, a single sqlx URL, no multi-host/automatic primary
+#     switching): it must point at a stable address for the "current primary" — VIP, DNS, or HAProxy
+#     (health-checking /primary, see deploy/production/README.md §5.1). Patroni only elects the primary;
+#     it does not route clients.
+#   * In production `[pg] url` uses `sslmode=verify-full`; this file enables `ssl=on`, with certificate
+#     paths in the three ssl_* lines under postgresql.parameters.
+#   * Connections: node `[pg] pool_size=32` (per instance) × number of nodes; this template sets
+#     max_connections=500. If PgBouncer is added in between, size the pool ceiling accordingly
+#     (500 ≥ node pools + PgBouncer server pool + headroom).
+#   * Recovery: PG must be recovered before Redis/NATS/MinIO, and traffic is restored only after
+#     reconciliation (② §7.5).
+#
+# 3. Dependency notes (cross-component, see deploy/production/README.md §2):
+#   * WAL archive target = MinIO (`deploy/production/minio/`, EC 12+4, bucket `lattice-cold`).
+#     archive_command calls `wal-gateway.sh archive`, restore_command calls `wal-gateway.sh restore`
+#     (reference implementation in wal-gateway.sh in this directory; in production switch to
+#     WAL-G/pgBackRest for encryption/compression/retention policies).
+#   * etcd must be deployed as 3 independent nodes (separate disks from PG, preferably separate hosts),
+#     never on the PG data disk; if all etcd nodes are down, Patroni enters failsafe (read-only
+#     protection) and no longer switches over automatically.
+#   * Redis/NATS/MinIO have no in-process coupling with PG, but node startup depends on all three being
+#     reachable; production recovery order is PG → reconciliation → Redis → NATS → MinIO → node (② §7.5).
+#
+# 4. Offline check: `python scripts/ha-manifest-check.py` (no cluster start, no Docker required).
+# =============================================================================
+scope: lattice-pg
+namespace: /lattice/
+name: ${PATRONI_NAME}
+
+log:
+  level: INFO
+  format: json
+  dir: /var/log/patroni
+  max_size: 50MB
+  max_files: 5
+
+# --- Patroni REST API (/primary /replica /health /switchover ...) --------------
+# HAProxy uses it to decide "who is primary"; expose it on the internal network only, never externally.
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${RESTAPI_IP}:8008
+  authentication:
+    username: patroni_api
+    password: ${PATRONI_RESTAPI_PASSWORD}
+  # [enable in production] REST API TLS (pairs with HAProxy https health checks and inter-node calls)
+  # certfile: /etc/patroni/tls/server.crt
+  # keyfile: /etc/patroni/tls/server.key
+  # cafile: /etc/patroni/tls/ca.crt
+  # verify_client: optional
+
+# --- DCS: etcd v3 ×3 ----------------------------------------------------------
+etcd3:
+  hosts:
+    - ${ETCD0}:2379
+    - ${ETCD1}:2379
+    - ${ETCD2}:2379
+  # [enable in production] etcd mTLS (the three files are mounted from a Secret)
+  # protocol: https
+  # cacert: /etc/etcd/tls/ca.crt
+  # cert: /etc/etcd/tls/client.crt
+  # key: /etc/etcd/tls/client.key
+
+# --- PostgreSQL static configuration for this node (differs per node) ----------
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: ${NODE_IP}:5432
+  data_dir: /var/lib/postgresql/data
+  # Debian/Ubuntu package path; inside the container (spilo) it is /usr/lib/postgresql/16/bin
+  bin_dir: /usr/lib/postgresql/16/bin
+  authentication:
+    superuser:
+      username: postgres
+      password: ${PG_SUPERUSER_PASSWORD}
+    replication:
+      username: replicator
+      password: ${PG_REPLICATION_PASSWORD}
+    rewind:
+      username: rewind_user
+      password: ${PG_REWIND_PASSWORD}
+  # Replica clone method: basebackup (streaming, never spills to a temporary directory)
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    max-rate: 200M
+    checkpoint: fast
+  parameters:
+    # Node-local path parameters (not written to DCS, so per-node values cannot overwrite each other)
+    # [enable in production] TLS: uncomment after certificates are issued; [pg] url uses sslmode=verify-full
+    # ssl: "on"
+    # ssl_cert_file: /etc/postgresql/tls/server.crt
+    # ssl_key_file: /etc/postgresql/tls/server.key
+    # ssl_ca_file: /etc/postgresql/tls/ca.crt
+    # Archive scripts (see wal-gateway.sh in this directory and README §3.3)
+    archive_command: /usr/local/bin/wal-gateway.sh archive %p %f
+    restore_command: /usr/local/bin/wal-gateway.sh restore %f %p
+    # Audit/application query timeouts aligned with config.rs [pg] statement_timeout_ms=5000 /
+    # admin_statement_timeout_ms=30000 (the application also SETs them; this is a passive backstop)
+    statement_timeout: 30s
+    idle_in_transaction_session_timeout: 60s
+    log_min_duration_statement: 500
+    log_checkpoints: "on"
+    log_connections: "on"
+    log_disconnections: "on"
+    log_lock_waits: "on"
+    log_line_prefix: '%m [%p] %q%u@%d/%a '
+    timezone: UTC
+
+# --- Cluster level (written to DCS, shared by all nodes; changing it here is a global pg parameter change) ---
+bootstrap:
+  dcs:
+    # Probe/failure-detection window: ttl=30s is the hard upper bound on "how long the primary may be
+    # unreachable before it can be replaced"; actual failover time ≈ ttl(30s) expiry + a few rounds of
+    # election/promotion ≈ 30–60s (design target <30s, needs measurement to calibrate)
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    # Elect only from replicas lagging ≤1MiB, so a badly lagging node is not chosen and the RPO widened
+    maximum_lag_on_failover: 1048576
+    # Synchronous replication: commits return only after landing on ≥1 synchronous replica → automatic
+    # failover RPO = 0 (committed transactions are not lost)
+    synchronous_mode: true
+    # Degrade to asynchronous when only the primary remains (availability first; the RPO then falls back
+    # to the asynchronous replication window, but the application can still write)
+    synchronous_mode_strict: false
+    synchronous_node_count: 1
+    # The primary does not self-terminate when etcd is entirely unavailable (Patroni ≥3.0; avoids
+    # split-brain/outage caused by DCS flapping)
+    failsafe_mode: true
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        # --- Replication --------------------------------------------------
+        wal_level: replica
+        hot_standby: "on"
+        # pg_rewind prerequisite: allows rolling back from the old primary when full-page writes are
+        # missing, avoiding a full replica rebuild
+        wal_log_hints: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 2GB
+        # --- WAL archiving / PITR prerequisite (the mechanism behind the ≤5min RPO) ---
+        # Archiving must be on: archive_timeout bounds the "worst-case archive lag" (60s segment switch),
+        # and even with upload time it stays far below 5min; with archive_mode off only daily
+        # logical/physical fulls remain and the RPO is unbounded.
+        archive_mode: "on"
+        archive_timeout: 60
+        # Recovery timeline follow: after PITR recovery the new primary continues archiving on the new timeline
+        recovery_target_timeline: latest
+        # --- Connections and concurrency -----------------------------------
+        max_connections: 500
+        superuser_reserved_connections: 5
+        shared_buffers: 4GB
+        effective_cache_size: 12GB
+        work_mem: 16MB
+        maintenance_work_mem: 512MB
+        max_worker_processes: 8
+        max_parallel_workers: 4
+        checkpoint_completion_target: 0.9
+        # --- Logging/auditing (PG side) ------------------------------------
+        logging_collector: "off"   # let systemd/the container collect stdout/stderr
+        log_replication_commands: "on"
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+    - locale: C
+  # Allow connections from the cluster subnet only (10.20.0.0/24 is an example private network; replace
+  # with the real subnet in production).
+  # In production change host to hostssl and enable the three TLS parameters; pg_hba takes effect at
+  # initdb time, and later changes go through Patroni DCS (patronictl edit-config or this file + restart).
+  pg_hba:
+    - local all all peer
+    - host all all 10.20.0.0/24 scram-sha-256
+    - host replication replicator 10.20.0.0/24 scram-sha-256
+  # Create the application role after the first initdb. For the `lattice` database and its owner see
+  # init-lattice-db.sh in this directory (called by bootstrap.post_bootstrap; the node creates tables via
+  # sqlx migrations at startup, it never creates databases).
+  users:
+    lattice_app:
+      password: ${PG_APP_PASSWORD}
+      options:
+        - nosuperuser
+        - nocreatedb
+        - nocreaterole
+        - noreplication
+  # Idempotent database creation script: on the new primary, createdb lattice owner lattice_app (skipped if present)
+  post_bootstrap: /usr/local/bin/init-lattice-db.sh
+
+# --- Watchdog (optional; recommended in production: hardware-level reset once the primary confirms it is
+# --- cut off, preventing split-brain)
+# watchdog:
+#   mode: required
+#   device: /dev/watchdog
+#   safety_margin: 5
+
+# --- Tags (optional): label nodes by data center/rack for affinity and manual primary selection -------
+# tags:
+#   nofailover: false
+#   noloadbalance: false
+#   clonefrom: false
+#   nosync: false

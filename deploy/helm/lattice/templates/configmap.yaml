@@ -1,0 +1,91 @@
+{{/*
+ config.toml: **non-secret** configuration. Passwords/keys are always injected from Secrets → env vars (see deployment-node.yaml),
+ so no credentials appear in TOML and the same fact is not stored in two places.
+
+ Field names follow SAMPLE_TOML in crates/lattice-node/src/config.rs; only items that must be overridden at deploy time are written here,
+ the rest take compile-time defaults (README "configuration layering").
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lattice.node.fullname" . }}-config
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+data:
+  config.toml: |
+    [node]
+    id = {{ .Values.node.id | quote }}
+    listen_http = {{ .Values.node.listenHttp | quote }}
+    metrics = {{ .Values.node.metrics | quote }}
+    log = {{ .Values.node.log | quote }}
+
+    [auth]
+    jwt_alg = "RS256"
+    jwt_ttl = {{ .Values.auth.jwtTtl }}
+    jwt_issuer = {{ .Values.auth.issuer | quote }}
+    key_dir = {{ .Values.auth.keyDir | quote }}
+    fingerprint_required = {{ .Values.auth.fingerprintRequired }}
+
+    [pg]
+    pool_size = {{ .Values.deps.pg.poolSize }}
+
+    [redis]
+    pool_size = {{ .Values.deps.redis.poolSize }}
+
+    [s3]
+    endpoint = {{ .Values.deps.s3.endpoint | quote }}
+    public_endpoint = {{ .Values.deps.s3.publicEndpoint | quote }}
+    region = {{ .Values.deps.s3.region | quote }}
+    bucket_large = {{ .Values.deps.s3.bucketLarge | quote }}
+    bucket_media = {{ .Values.deps.s3.bucketMedia | quote }}
+    bucket_cold = {{ .Values.deps.s3.bucketCold | quote }}
+    bucket_plugins = {{ .Values.deps.s3.bucketPlugins | quote }}
+
+    [bus]
+    kind = {{ .Values.deps.bus.kind | quote }}
+    nats_url = {{ .Values.deps.bus.natsUrl | quote }}
+    jetstream = {{ .Values.deps.bus.jetstream }}
+
+    [mqtt]
+    enabled = {{ .Values.mqtt.enabled }}
+    bind = {{ .Values.mqtt.bind | quote }}
+    max_connections = {{ .Values.mqtt.maxConnections }}
+{{- if and .Values.tls.enabled .Values.tls.mqtt.enabled }}
+    # TLS/mTLS: device certificates come from a Secret volume (certificate contents never enter the ConfigMap); client-certificate enforcement is on by default
+    tls_enabled = true
+    tls_bind = {{ printf "0.0.0.0:%v" .Values.tls.mqtt.port | quote }}
+    tls_cert = {{ printf "%s/mqtt/server.crt" .Values.tls.mountPath | quote }}
+    tls_key = {{ printf "%s/mqtt/server.key" .Values.tls.mountPath | quote }}
+    client_ca = {{ printf "%s/mqtt/client-ca.crt" .Values.tls.mountPath | quote }}
+    require_client_cert = {{ .Values.tls.mqtt.requireClientCert }}
+{{- end }}
+
+    [grpc]
+    enabled = {{ .Values.grpc.enabled }}
+    bind = {{ .Values.grpc.bind | quote }}
+{{- if and .Values.grpc.enabled (include "lattice.grpcTlsEnabled" .) }}
+    # mTLS: server certificate + client CA (all three present = mutual TLS); outbound reuses the same certificate
+    tls_cert = {{ printf "%s/server.crt" (include "lattice.grpcTlsMountPath" .) | quote }}
+    tls_key = {{ printf "%s/server.key" (include "lattice.grpcTlsMountPath" .) | quote }}
+    tls_client_ca = {{ printf "%s/ca.crt" (include "lattice.grpcTlsMountPath" .) | quote }}
+{{- if and .Values.tls.enabled .Values.tls.grpc.enabled }}
+    tls_domain = {{ .Values.tls.grpc.tlsDomain | quote }}
+    require_known_node_cn = {{ .Values.tls.grpc.requireKnownNodeCn }}
+    require_caller_node = {{ .Values.tls.grpc.requireCallerNode }}
+{{- end }}
+{{- end }}
+{{- if and .Values.tls.enabled .Values.tls.quic.enabled }}
+
+    [quic]
+    # QUIC requires a certificate; the UDP listen address and port must match the Service/NetworkPolicy
+    enabled = true
+    bind = {{ printf "0.0.0.0:%v" .Values.tls.quic.port | quote }}
+    cert = {{ printf "%s/quic/server.crt" .Values.tls.mountPath | quote }}
+    key = {{ printf "%s/quic/server.key" .Values.tls.mountPath | quote }}
+{{- end }}
+    [policy]
+    mode = {{ .Values.policy.mode | quote }}
+
+    [admin]
+    bootstrap_username = {{ .Values.admin.bootstrapUsername | quote }}

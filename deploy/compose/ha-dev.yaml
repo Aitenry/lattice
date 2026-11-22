@@ -1,0 +1,462 @@
+# =============================================================================
+# Lattice HA single-host drill stack (**optional**; not a production cluster, takes no real traffic)
+# -----------------------------------------------------------------------------
+# Purpose: validate each component's HA shape plus its health-check/failover feel on one machine using **non-conflicting ports**:
+#   - Redis: primary + 2 replicas + Sentinel×3 → kill the master and watch Sentinel promote a new primary
+#   - NATS: 3-node JetStream cluster (three-way cluster routes) → kill 1 node and watch the cluster survive
+#   - MinIO: 4-node distributed (1 disk per node = 4 disks, **EC 2+2 demo shape**;
+#            production is 4 nodes × 4 disks with EC 12+4, see deploy/production/minio/)
+#   - PG: primary + 2 streaming replicas (pg_basebackup), with a hand-written pg_hba that permits replication—a **demo** topology;
+#         not Patroni (Patroni needs etcd/multiple hosts; see deploy/production/patroni/ for the production template),
+#         failover is a manual promote, only to prove "replication works and a replica can be promoted".
+#
+# Isolated from the dev stack (hard requirement):
+#   * All container names are lattice-ha-dev-*; separate network/volumes; dev volumes are never shared.
+#   * All host ports avoid those used by dev: 5432/6379/4222/9000/9001/8080/8088/1883/9090/9100/8222;
+#     this stack: PG 15432-15434 / Redis 16379-16381 / Sentinel 26379-26381 /
+#           NATS 14222-14224 + monitor 18222-18224 / MinIO 19000-19003 + console 19100-19103.
+#   * Never stop/restart/exec dev containers; clean up with down -v when done.
+#
+# Redis addressing (fixed by measurement in this task):
+#   After a container stops, Docker's embedded DNS **blocks for seconds** resolving the vanished hostname (~7.6s measured here),
+#   and a Sentinel main loop stalled >2s enters TILT mode and **refuses to fail over**;
+#   so Redis primary/replica/Sentinel all use **static IP addressing** (network subnet 10.88.0.0/24,
+#   .11=master/.12-.13=replica/.14-.16=sentinel), no hostnames, no resolve/announce-hostnames.
+#
+# Start:
+#   docker compose -f deploy/compose/ha-dev.yaml up -d                  # Redis + NATS + MinIO
+#   docker compose -f deploy/compose/ha-dev.yaml --profile pg up -d     # plus the 3-node PG
+#   docker compose -f deploy/compose/ha-dev.yaml ps
+# Cleanup (mandatory):
+#   docker compose -f deploy/compose/ha-dev.yaml --profile pg down -v
+#
+# Drill steps (manual; clean up afterwards):
+#   # Redis failover
+#   docker exec lattice-ha-dev-redis-sentinel-1 redis-cli -p 26379 sentinel get-master-addr-by-name lattice
+#   docker stop lattice-ha-dev-redis-master
+#   docker exec lattice-ha-dev-redis-sentinel-1 redis-cli -p 26379 sentinel get-master-addr-by-name lattice  # already points to the new primary
+#   docker start lattice-ha-dev-redis-master   # the old primary rejoins as a replica
+#   # NATS cluster
+#   docker exec lattice-ha-dev-nats-1 wget -qO- http://127.0.0.1:8222/routez   # 3 routes
+#   docker stop lattice-ha-dev-nats-2 && docker exec lattice-ha-dev-nats-1 wget -qO- http://127.0.0.1:8222/healthz
+#   # MinIO EC shape
+#   docker exec lattice-ha-dev-minio-1 mc admin info local || echo "image has no mc; use an mc container or curl /minio/health/live"
+#   # PG replication
+#   docker exec lattice-ha-dev-pg-primary psql -U lattice_app -d lattice -c "select client_addr,state,sync_state from pg_stat_replication;"
+#
+# Offline validation (starts no containers):
+#   docker compose -f deploy/compose/ha-dev.yaml config
+# =============================================================================
+name: lattice-ha-dev
+
+networks:
+  ha-dev:
+    driver: bridge
+    ipam:
+      config:
+        # Static subnet: Redis primary/replica/Sentinel use fixed IPs (avoids Docker DNS blocking on a vanished hostname → Sentinel TILT)
+        - subnet: 10.88.0.0/24
+
+volumes:
+  ha-pgdata:
+  ha-pgstandby1:
+  ha-pgstandby2:
+  ha-redis-master:
+  ha-redis-replica1:
+  ha-redis-replica2:
+  ha-sentinel1:
+  ha-sentinel2:
+  ha-sentinel3:
+  ha-nats1:
+  ha-nats2:
+  ha-nats3:
+  ha-minio1:
+  ha-minio2:
+  ha-minio3:
+  ha-minio4:
+
+# pg_hba for the PG demo: allows ordinary connections and replication from any source (**demo only**; see patroni/pg_hba for production)
+configs:
+  pg-hba:
+    content: |
+      local   all           all                         trust
+      host    all           all            all          trust
+      local   replication   all                         trust
+      host    replication   all            all          trust
+  pg-init:
+    content: |
+      -- demo only: create the streaming replication account (production manages it via Patroni bootstrap.users + Secret)
+      CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'repl_dev_pw';
+
+services:
+  # ===========================================================================
+  # Redis: primary + 2 replicas + 3 Sentinels (quorum=2, master name lattice)
+  # Static IPs: master 10.88.0.11 / replica-1 .12 / replica-2 .13 / sentinel-1..3 .14-.16
+  # ===========================================================================
+  redis-master:
+    image: redis:7-alpine
+    container_name: lattice-ha-dev-redis-master
+    networks:
+      ha-dev:
+        ipv4_address: 10.88.0.11
+    command: ["redis-server", "--port", "6379", "--appendonly", "yes", "--save", "60", "1"]
+    ports: ["16379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis-replica-1:
+    image: redis:7-alpine
+    container_name: lattice-ha-dev-redis-replica-1
+    networks:
+      ha-dev:
+        ipv4_address: 10.88.0.12
+    depends_on:
+      redis-master: { condition: service_healthy }
+    command: ["redis-server", "--port", "6379", "--appendonly", "yes", "--replicaof", "10.88.0.11", "6379"]
+    ports: ["16380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis-replica-2:
+    image: redis:7-alpine
+    container_name: lattice-ha-dev-redis-replica-2
+    networks:
+      ha-dev:
+        ipv4_address: 10.88.0.13
+    depends_on:
+      redis-master: { condition: service_healthy }
+    command: ["redis-server", "--port", "6379", "--appendonly", "yes", "--replicaof", "10.88.0.11", "6379"]
+    ports: ["16381:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis-sentinel-1: &sentinel
+    image: redis:7-alpine
+    container_name: lattice-ha-dev-redis-sentinel-1
+    networks:
+      ha-dev:
+        ipv4_address: 10.88.0.14
+    depends_on:
+      redis-master: { condition: service_healthy }
+    # Sentinel needs a writable config (it rewrites the known sentinels/replicas and the current primary), so generate it under /data;
+    # the primary uses a static IP so a stopped container's hostname cannot fail to resolve (Docker DNS blocking triggers Sentinel TILT)
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        printf 'port 26379\ndir /data\nsentinel monitor lattice 10.88.0.11 6379 2\nsentinel down-after-milliseconds lattice 5000\nsentinel failover-timeout lattice 60000\nsentinel parallel-syncs lattice 1\n' > /data/sentinel.conf
+        exec redis-sentinel /data/sentinel.conf
+    volumes: [ha-sentinel1:/data]
+    ports: ["26379:26379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis-sentinel-2:
+    <<: *sentinel
+    container_name: lattice-ha-dev-redis-sentinel-2
+    networks:
+      ha-dev:
+        ipv4_address: 10.88.0.15
+    volumes: [ha-sentinel2:/data]
+    ports: ["26380:26379"]
+
+  redis-sentinel-3:
+    <<: *sentinel
+    container_name: lattice-ha-dev-redis-sentinel-3
+    networks:
+      ha-dev:
+        ipv4_address: 10.88.0.16
+    volumes: [ha-sentinel3:/data]
+    ports: ["26381:26379"]
+
+  # ===========================================================================
+  # NATS: 3-node JetStream cluster (three-way routes; a single node failure does not kill the cluster)
+  # ===========================================================================
+  nats-1:
+    image: nats:2.10-alpine
+    container_name: lattice-ha-dev-nats-1
+    networks: [ha-dev]
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+      - "--server_name"
+      - "nats-1"
+      - "--cluster"
+      - "nats://0.0.0.0:6222"
+      - "--cluster_name"
+      - "lattice-ha-dev"
+      - "--routes"
+      - "nats://nats-2:6222,nats://nats-3:6222"
+    volumes: [ha-nats1:/data]
+    ports: ["14222:4222", "18222:8222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  nats-2:
+    image: nats:2.10-alpine
+    container_name: lattice-ha-dev-nats-2
+    networks: [ha-dev]
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+      - "--server_name"
+      - "nats-2"
+      - "--cluster"
+      - "nats://0.0.0.0:6222"
+      - "--cluster_name"
+      - "lattice-ha-dev"
+      - "--routes"
+      - "nats://nats-1:6222,nats://nats-3:6222"
+    volumes: [ha-nats2:/data]
+    ports: ["14223:4222", "18223:8222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  nats-3:
+    image: nats:2.10-alpine
+    container_name: lattice-ha-dev-nats-3
+    networks: [ha-dev]
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+      - "--server_name"
+      - "nats-3"
+      - "--cluster"
+      - "nats://0.0.0.0:6222"
+      - "--cluster_name"
+      - "lattice-ha-dev"
+      - "--routes"
+      - "nats://nats-1:6222,nats://nats-2:6222"
+    volumes: [ha-nats3:/data]
+    ports: ["14224:4222", "18224:8222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ===========================================================================
+  # MinIO: 4 nodes × 1 disk = 4 disks (EC 2+2 demo; production 4 nodes ×4 disks EC 12+4)
+  # Note: 4 MinIO processes on one host share its CPU/disks, so this **cannot** support performance or durability conclusions.
+  # ===========================================================================
+  minio-1:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: lattice-ha-dev-minio-1
+    networks: [ha-dev]
+    environment:
+      MINIO_ROOT_USER: lattice_ha_dev
+      MINIO_ROOT_PASSWORD: lattice_ha_dev_secret
+      MINIO_ERASURE_SET_DRIVE_COUNT: "4"
+    command: ["server", "http://minio-1/data", "http://minio-2/data", "http://minio-3/data", "http://minio-4/data", "--console-address", ":9001"]
+    volumes: [ha-minio1:/data]
+    ports: ["19000:9000", "19100:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  minio-2:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: lattice-ha-dev-minio-2
+    networks: [ha-dev]
+    environment:
+      MINIO_ROOT_USER: lattice_ha_dev
+      MINIO_ROOT_PASSWORD: lattice_ha_dev_secret
+      MINIO_ERASURE_SET_DRIVE_COUNT: "4"
+    command: ["server", "http://minio-1/data", "http://minio-2/data", "http://minio-3/data", "http://minio-4/data", "--console-address", ":9001"]
+    volumes: [ha-minio2:/data]
+    ports: ["19001:9000", "19101:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  minio-3:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: lattice-ha-dev-minio-3
+    networks: [ha-dev]
+    environment:
+      MINIO_ROOT_USER: lattice_ha_dev
+      MINIO_ROOT_PASSWORD: lattice_ha_dev_secret
+      MINIO_ERASURE_SET_DRIVE_COUNT: "4"
+    command: ["server", "http://minio-1/data", "http://minio-2/data", "http://minio-3/data", "http://minio-4/data", "--console-address", ":9001"]
+    volumes: [ha-minio3:/data]
+    ports: ["19002:9000", "19102:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  minio-4:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: lattice-ha-dev-minio-4
+    networks: [ha-dev]
+    environment:
+      MINIO_ROOT_USER: lattice_ha_dev
+      MINIO_ROOT_PASSWORD: lattice_ha_dev_secret
+      MINIO_ERASURE_SET_DRIVE_COUNT: "4"
+    command: ["server", "http://minio-1/data", "http://minio-2/data", "http://minio-3/data", "http://minio-4/data", "--console-address", ":9001"]
+    volumes: [ha-minio4:/data]
+    ports: ["19003:9000", "19103:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # PG: primary + 2 streaming replicas (profile=pg, not started by default; not Patroni)
+  # Demo approach: create replicator on the primary, clone replicas with pg_basebackup -R, then keep streaming;
+  # failover = manual `select pg_promote()` (see deploy/production/patroni/ for production failover/auto-election).
+  # ===========================================================================
+  pg-primary:
+    image: postgres:16-alpine
+    profiles: ["pg"]
+    container_name: lattice-ha-dev-pg-primary
+    networks: [ha-dev]
+    environment:
+      POSTGRES_USER: lattice_app
+      POSTGRES_PASSWORD: lattice_ha_dev_pw
+      POSTGRES_DB: lattice
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - "-c"  # in list form each -c is paired with its value
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "hba_file=/etc/pg-ha/pg_hba.conf"
+    configs:
+      - source: pg-hba
+        target: /etc/pg-ha/pg_hba.conf
+      - source: pg-init
+        target: /docker-entrypoint-initdb.d/10-replication.sql
+    volumes: [ha-pgdata:/var/lib/postgresql/data]
+    ports: ["15432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lattice_app -h 127.0.0.1 -d lattice"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  pg-standby-1:
+    image: postgres:16-alpine
+    profiles: ["pg"]
+    container_name: lattice-ha-dev-pg-standby-1
+    networks: [ha-dev]
+    depends_on:
+      pg-primary: { condition: service_healthy }
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    configs:
+      - source: pg-hba
+        target: /etc/pg-ha/pg_hba.conf
+    volumes: [ha-pgstandby1:/var/lib/postgresql/data]
+    # The official image entrypoint runs initdb; a replica must instead "wait for primary → wipe PGDATA → basebackup → start"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        until pg_isready -h pg-primary -U postgres >/dev/null 2>&1; do sleep 1; done
+        if [ ! -f "$$PGDATA/PG_VERSION" ]; then
+          rm -rf "$${PGDATA:?}"/* 2>/dev/null || true
+          chown -R postgres:postgres "$$PGDATA"
+          # Named volume roots default to 0755, but postgres requires PGDATA to be 0700; skipping chmod yields FATAL: invalid permissions
+          chmod 700 "$$PGDATA"
+          gosu postgres pg_basebackup -h pg-primary -U replicator -D "$$PGDATA" -R -X stream -c fast
+        fi
+        exec gosu postgres postgres -c hba_file=/etc/pg-ha/pg_hba.conf
+    ports: ["15433:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lattice_app -h 127.0.0.1 -d lattice"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  pg-standby-2:
+    image: postgres:16-alpine
+    profiles: ["pg"]
+    container_name: lattice-ha-dev-pg-standby-2
+    networks: [ha-dev]
+    depends_on:
+      pg-primary: { condition: service_healthy }
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    configs:
+      - source: pg-hba
+        target: /etc/pg-ha/pg_hba.conf
+    volumes: [ha-pgstandby2:/var/lib/postgresql/data]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        until pg_isready -h pg-primary -U postgres >/dev/null 2>&1; do sleep 1; done
+        if [ ! -f "$$PGDATA/PG_VERSION" ]; then
+          rm -rf "$${PGDATA:?}"/* 2>/dev/null || true
+          chown -R postgres:postgres "$$PGDATA"
+          # Named volume roots default to 0755, but postgres requires PGDATA to be 0700; skipping chmod yields FATAL: invalid permissions
+          chmod 700 "$$PGDATA"
+          gosu postgres pg_basebackup -h pg-primary -U replicator -D "$$PGDATA" -R -X stream -c fast
+        fi
+        exec gosu postgres postgres -c hba_file=/etc/pg-ha/pg_hba.conf
+    ports: ["15434:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lattice_app -h 127.0.0.1 -d lattice"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped

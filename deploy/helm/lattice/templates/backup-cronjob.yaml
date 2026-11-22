@@ -1,0 +1,105 @@
+{{- if .Values.backup.enabled }}
+{{/*
+ PG logical backup (⑥ §7): two containers—pg_dump writes to a shared emptyDir, mc uploads to object storage and prunes by retention.
+ Why pg_dump instead of volume snapshots: the chart does not manage PG storage and snapshots are cloud-provider specific; a logical backup works for
+ any external PG. Note this is a **daily full baseline**, not PITR—real RPO comes from PG-side WAL archiving, which
+ operations must enable on the database side (the chart cannot replace it).
+
+ The connection string uses `pg-url` from the Secret (pg_dump accepts a conninfo URL directly); the chart does not rebuild
+ host/port/user/password here: with the same credential in two places, changing one leaves behind a backup job that connects but cannot work.
+*/}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "lattice.fullname" . }}-pg-backup
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Daily full dump: retry failures twice; timeout fallback 2h (raise for large databases by data volume)
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      # Retention: the dump's business data is pruned from object storage by keepDays; only Job/Pod are kept here for troubleshooting, TTL 7 days.
+      # Failure alerting: once the Job reaches Failed, production hooks kube_job_failed (deploy/observability covers only
+      # application metrics; Job failure alerts must be configured on the platform side); see deploy/production/backup/README.md §2/§3.
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            {{- include "lattice.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: pg-dump
+              image: {{ .Values.backup.pgImage | quote }}
+              env:
+                - name: PG_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: pg-url
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  TS=$(date -u +%Y%m%dT%H%M%SZ)   # the timestamp must be taken inside the Pod: Helm renders it once and it would overwrite historical backups
+                  # -Fc: custom format, restore with pg_restore, supports restoring selected tables
+                  pg_dump "$PG_URL" -Fc -f "/backup/lattice-${TS}.dump"
+                  echo "dump done: $(ls -l /backup)"
+              volumeMounts:
+                - name: scratch
+                  mountPath: /backup
+            - name: upload
+              image: {{ .Values.backup.mcImage | quote }}
+              env:
+                - name: S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: s3-access-key
+                - name: S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "lattice.secretName" . }}
+                      key: s3-secret-key
+                - name: S3_ENDPOINT
+                  value: {{ .Values.backup.s3Endpoint | quote }}
+                - name: BUCKET
+                  value: {{ .Values.backup.bucket | quote }}
+                - name: KEEP_DAYS
+                  value: {{ .Values.backup.keepDays | quote }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  # wait for the dump to land on disk (shared emptyDir; both containers start together, so order cannot be assumed)
+                  i=0
+                  until ls /backup/*.dump >/dev/null 2>&1; do
+                    i=$((i+1)); [ "$i" -gt 7200 ] && { echo "dump timeout"; exit 1; }
+                    sleep 2
+                  done
+                  # the dump may still be writing: wait for the file size to stabilize for two rounds
+                  prev=-1; cur=$(stat -c %s /backup/*.dump | head -1)
+                  while [ "$prev" != "$cur" ]; do prev=$cur; sleep 3; cur=$(stat -c %s /backup/*.dump | head -1); done
+                  mc alias set backup "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null
+                  mc cp /backup/*.dump "backup/$BUCKET/backup/pg/" >/dev/null
+                  echo "uploaded to $BUCKET/backup/pg/"
+                  mc rm --recursive --force --older-than "${KEEP_DAYS}d" "backup/$BUCKET/backup/pg/" || true
+              volumeMounts:
+                - name: scratch
+                  mountPath: /backup
+          volumes:
+            - name: scratch
+              emptyDir:
+                sizeLimit: {{ .Values.backup.scratchSize | default "8Gi" }}
+{{- end }}

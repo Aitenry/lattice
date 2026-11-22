@@ -1,0 +1,161 @@
+# =============================================================================
+# Lattice production configuration template (deployed as /etc/lattice/config.toml)
+# -----------------------------------------------------------------------------
+# Isomorphic with SAMPLE_TOML in `crates/lattice-node/src/config.rs`: **any key not listed here takes
+# the code default**. This file only contains items that "must change in production"; secrets are **never
+# written to the file** — they are injected as LATTICE__* environment variables from a Secret, which take
+# precedence over the TOML (config.rs::apply_env).
+#
+# Required Secret / environment variables (a node fails to start or loses functionality if any is missing):
+#   LATTICE__PG__URL                   postgres://lattice_app:<pw>@<stable-endpoint>:5432/lattice?sslmode=verify-full
+#   LATTICE__REDIS__URL                redis://:<pw>@<stable-endpoint>:6379/0
+#   LATTICE__S3__ACCESS_KEY            access key of the dedicated IAM user created by bucket-setup.sh
+#   LATTICE__S3__SECRET_KEY            secret for the same user
+#   LATTICE__ADMIN__BOOTSTRAP_PASSWORD initial password for the first administrator (rotate immediately after first start)
+#   LATTICE__MEDIA__TURN_SECRET        coturn static-auth-secret (when TURN is enabled)
+#   LATTICE__AUTH__KEY_DIR             JWT private keys mounted here are supplied by a Secret volume (jwt.key.pem / jwt.key.prev.pem)
+# K8s uses secrets.existingSecret from deploy/helm/lattice; bare metal uses a systemd EnvironmentFile (0600).
+#
+# Offline check: python scripts/ha-manifest-check.py
+# =============================================================================
+
+[node]
+# Empty = each instance generates its own ULID at startup (leave empty for multiple replicas, otherwise
+# node_id conflicts cause routing errors)
+id = ""
+listen_http = "0.0.0.0:8080"
+listen_ws = "0.0.0.0:8443"
+# Must listen on all interfaces inside the container/host so Prometheus can scrape
+metrics = "0.0.0.0:9100"
+log = "json"
+
+[auth]
+jwt_alg = "RS256"
+jwt_ttl = 900
+jwt_issuer = "lattice"
+key_dir = "/etc/lattice/keys"
+fingerprint_required = true
+key_overlap_hours = 24.0
+key_prune_interval_ms = 60000
+
+[pg]
+# The stable endpoint (VIP/HAProxy/DNS) points at the current primary; Patroni only elects the primary,
+# it does not route clients.
+# Do not put the password here: LATTICE__PG__URL injects the full URL including the password (and sslmode=verify-full).
+url = "postgres://lattice_app@pg-lattice.lattice.internal:5432/lattice?sslmode=verify-full"
+pool_size = 32
+statement_timeout_ms = 5000
+admin_statement_timeout_ms = 30000
+
+[wal]
+# When PG is not writable, small messages (≤1MB, inline payload, non-chunked) land in the local WAL and are
+# replayed periodically; the WAL is bounded, and messages over the limit are rejected and counted
+enabled = true
+dir = "/var/lib/lattice/wal"
+max_bytes = 67108864
+replay_interval_ms = 2000
+
+[redis]
+# Stable endpoint (VIP/HAProxy/DNS pointing at the current Sentinel primary); the node does not implement the
+# Sentinel protocol and accepts a single URL only.
+url = "redis://lattice-redis.lattice.internal:6379/0"
+pool_size = 64
+
+[s3]
+# The internal endpoint must be http:// (the node implementation supports http only; TLS is terminated at the LB);
+# public_endpoint is the address clients use to resolve presigned URLs (scheme+Host must be reachable).
+endpoint = "http://minio-lattice.lattice.internal:9000"
+public_endpoint = "https://s3.example.com"
+region = "us-east-1"
+access_key = ""            # -> LATTICE__S3__ACCESS_KEY
+secret_key = ""            # -> LATTICE__S3__SECRET_KEY
+bucket_large = "lattice-large"
+bucket_media = "lattice-media"
+bucket_cold = "lattice-cold"
+bucket_plugins = "lattice-plugins"
+presign_ttl = 900
+upload_parallel = 8
+
+[bus]
+# NATS is the primary path (JetStream); when NATS is unavailable the node degrades to Redis per ② §4.8 and alerts.
+# nats_url is a single URL: it must be the stable endpoint (L4 VIP/DNS/LB), never a fixed IP of one nats node.
+kind = "nats"
+nats_url = "nats://lattice-nats.lattice.internal:4222"
+jetstream = true
+
+[mqtt]
+enabled = true
+bind = "0.0.0.0:1883"
+max_connections = 10000
+# [enable in production] TLS/mTLS (certificates mounted from a Secret at /etc/lattice/tls/mqtt; see ../tls/README.md)
+# The plaintext bind is unaffected: 1883 (internal/canary only) and 8883 (device access) can coexist
+# tls_enabled = true
+# tls_bind = "0.0.0.0:8883"
+# tls_cert = "/etc/lattice/tls/mqtt/server.crt"
+# tls_key = "/etc/lattice/tls/mqtt/server.key"
+# client_ca = "/etc/lattice/tls/mqtt/client-ca.crt"
+# require_client_cert = true            # require device certificates (fail-closed); when false, fall back to PSK/JWT
+
+[grpc]
+# Internal gRPC (cross-node fallback delivery/chunk fetch-back/watermark reconciliation): internal network only,
+# mTLS is mandatory in production
+enabled = true
+bind = "0.0.0.0:9090"
+# [enable in production] mTLS (certificates mounted from a Secret at /etc/lattice/tls/grpc; all three = mutual TLS)
+# tls_cert = "/etc/lattice/tls/grpc/server.crt"
+# tls_key = "/etc/lattice/tls/grpc/server.key"
+# tls_client_ca = "/etc/lattice/tls/grpc/ca.crt"
+# client_cert = "/etc/lattice/tls/grpc/server.crt"   # outbound reuses the server certificate (default is reuse)
+# client_key = "/etc/lattice/tls/grpc/server.key"
+# tls_domain = "lattice.internal"                    # must be one of the certificate SANs
+# require_known_node_cn = true                       # client certificate CN must be a known node_id
+# require_caller_node = true                         # Route.caller_node must match the certificate CN
+fallback = true
+
+[quic]
+# QUIC/WebTransport server-side proxy skeleton: the image must be built with the quic feature
+# (deploy/Dockerfile.node already is).
+# The UDP port requires the LB to declare UDP and preserve the source IP (see deploy/quic-lb-udp.yaml);
+# certificates are mounted from a Secret.
+# Production TLS: cert/key must come from a Secret; empty certificates = dev self-signed (in-memory only, forbidden in production).
+enabled = false
+# bind = "0.0.0.0:4433"
+# cert = "/etc/lattice/tls/quic/server.crt"
+# key = "/etc/lattice/tls/quic/server.key"
+idle_timeout_secs = 30
+handshake_timeout_secs = 10
+token_ttl_secs = 120
+
+[webtransport]
+# WebTransport(HTTP/3) browser access: a separate UDP port (must differ from [quic] bind);
+# the bridge upstream trust anchor defaults to reusing the [quic] certificate.
+enabled = false
+# bind = "0.0.0.0:4434"
+# cert = "/etc/lattice/tls/quic/server.crt"
+# key = "/etc/lattice/tls/quic/server.key"
+# upstream = "127.0.0.1:4433"
+# upstream_ca = "/etc/lattice/tls/ca.crt"
+token_ttl_secs = 120
+path = "/media"
+
+[media]
+# TURN is deployed separately with coturn; the node only issues short-lived credentials. In production
+# turn_secret must come from a Secret.
+# turn_uris = ["turn:turn.lattice.internal:3478?transport=udp"]
+# turn_ttl = 600
+# max_streams = 5000
+# stream_bitrate_bps = 8388608
+# record_enabled = false          # recording is off by default; when enabled it writes to [s3] bucket_media
+
+[policy]
+mode = "zero-knowledge"
+dedup_ttl = 86400
+chunk_threshold_max = 33554432
+chunk_part = 262144
+protocol_version = 1
+protocol_min_supported = 1
+
+[admin]
+# The password is injected via LATTICE__ADMIN__BOOTSTRAP_PASSWORD (rotate immediately after the account is
+# created on first start and clear that environment variable)
+bootstrap_username = "admin"

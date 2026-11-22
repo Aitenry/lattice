@@ -1,0 +1,400 @@
+# =============================================================================
+# Lattice Prometheus alert rules (Alertmanager rule file)
+# =============================================================================
+# single source of metric names: crates/lattice-node/src/observe/metrics.rs
+# spec reference: the platform implementation document (outside this repository) §8.3 "Alerts (Alertmanager rules)" +
+#           §10 "Load tests and SLO validation"
+#
+# severity follows the doc wording: P1 (act immediately) / P2 (act during the shift) / P3 (watch).
+# each rule's summary/description states the meaning + handling direction;
+# handling details are in the "Alert meanings and handling" section of deploy/observability/README.md.
+#
+# ⚠ instrumentation/scrape status (metrics.rs and call sites checked against node v0.5.0 on 2026-11-21):
+#   - scrape endpoint: primarily the standalone /metrics endpoint from observe/metrics_server.rs (unauthenticated, read-only,
+#     bind [node] metrics, default 127.0.0.1:9100; LATTICE__NODE__METRICS=0.0.0.0:9100 in containers);
+#     the /v1/admin/metrics fallback needs an admin JWT (used only for old binaries or when the listener is disabled, see prometheus.yml option B).
+#     Note: a 9100 bind failure only warns and does not block the message plane → up=0 but the service may still be working.
+#   - actually instrumented: lattice_connections / lattice_msgs_total / lattice_pending_depth /
+#     lattice_chunk_retrans_total / lattice_ratelimit_dropped_total /
+#     lattice_backpressure_dropped_total / lattice_dedup_hit_total /
+#     lattice_protocol_version / lattice_sse_connections / lattice_wal_size_bytes; 
+#     lattice_e2e_latency_seconds only calls observe(0.0) in the keepalive watermark branch (placeholder, not real E2E).
+#   - defined but with **no call site** (rules are in place and take effect once the metrics are wired):
+#     lattice_plugin_call_duration_seconds, lattice_store_latency_seconds, 
+#     lattice_http_requests_total.
+#   - no dependency/heartbeat metrics exist: node heartbeats go to Redis (lattice:node:{id}), metrics.rs has no heartbeat metric
+#     and no dep_up metric → "node down" relies on up{job="lattice-node"} + online connections as a fallback;
+#     "dependency unavailable" uses the /v1/ready blackbox probe (probe_success, see prometheus.yml option C).
+# =============================================================================
+
+groups:
+  # ---------------------------------------------------------------------------
+  #   # 1) node liveness / dependencies / WAL
+  # ---------------------------------------------------------------------------
+  - name: lattice-node-health
+    interval: 30s
+    rules:
+      - alert: LatticeNodeScrapeDown
+        expr: up{job="lattice-node"} == 0
+        for: 1m
+        labels:
+          severity: P1
+          component: node
+          service: lattice
+        annotations:
+          summary: "Lattice node metrics scrape failed (node may be down or the process exited)"
+          description: >-
+            job="lattice-node" has been up=0 for 1 minute. Common causes: ① the lattice-node process exited/crashed;
+            ② the 9100 metrics listener did not start (an observe/metrics_server.rs bind failure only warns and does not block the message plane,
+            so the service may still be working — check node logs "metrics listener bind failed" / "prometheus metrics listening",
+            and confirm [node] metrics is not set to off); ③ scrape port/firewall/network unreachable (container maps 9100, host runs 127.0.0.1:9100);
+            ④ scrape timeout (scrape_timeout=10s); ⑤ if the /v1/admin/metrics fallback is enabled, an expired or
+            unrefreshed admin JWT causes 401 (JWT TTL=900s; check the scripts/obs-refresh-admin-jwt.ps1 scheduled task).
+            Handling: first confirm the process and port (Get-Process lattice-node / Get-NetTCPConnection -LocalPort 9100),
+            then curl http://<target>:9100/metrics and /v1/ready, and finally read the error on the Prometheus target page.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeNodeOnlineConnectionsCollapsed
+        expr: >-
+          (sum(lattice_connections{state="open"}) < 0.1 * sum(lattice_connections{state="open"} offset 10m))
+          and (sum(lattice_connections{state="open"} offset 10m) >= 10)
+        for: 5m
+        labels:
+          severity: P2
+          component: node
+          service: lattice
+        annotations:
+          summary: "Lattice online WebSocket connections dropped more than 90% within 10 minutes"
+          description: >-
+            online connections (lattice_connections{protocol="ws",state="open"}) dropped more than 90% versus 10 minutes ago
+            with a baseline ≥10. Meaning: node restart, LB/network failure, mass client disconnect, or an anomaly in the connection register/unregister path.
+            Note: metrics.rs has no heartbeat metric of its own (node heartbeats are written to Redis lattice:node:{id});
+            this rule works with up as the fallback "node lost" signal; an idle single-node dev deployment naturally has 0 connections, so
+            a baseline <10 never fires. Handling: check node logs (ws closed / shutdown), the Redis online index, and
+            whether up is also 0; if caused by a release change, roll back or scale out.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeDependencyUnavailable
+        expr: probe_success{job="lattice-ready"} == 0
+        for: 2m
+        labels:
+          severity: P1
+          component: dependency
+          service: lattice
+        annotations:
+          summary: "Lattice dependency unavailable (/v1/ready probe failed)"
+          description: >-
+            blackbox_exporter has failed to probe /v1/ready for 2 minutes. Meaning: both PG and Redis are unavailable
+            (the ready handler returns 503 only when both fail; single-dependency degradation still returns 200),
+            or the node process/network is unreachable.
+            ⚠ Precondition: blackbox_exporter must be deployed and prometheus.yml option C enabled
+            (the lattice-ready job); metrics.rs has no dep_up metric, so this is the only official way to cover
+            "dependency unavailable". Without it this rule has no data and does not fire (intentional degradation).
+            Handling: locate via details.dep returned by /v1/ready (pg/redis/bus) and check the docker compose
+            services and connection strings; after recovery, reconcile pending/dedup consistency with the reconciliation script first (doc §7.4 recovery order).
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeWalSizeHigh
+        expr: lattice_wal_size_bytes > 1073741824
+        for: 5m
+        labels:
+          severity: P2
+          component: storage
+          service: lattice
+        annotations:
+          summary: "Lattice WAL size exceeds 1GiB"
+          description: >-
+            lattice_wal_size_bytes > 1GiB for 5 minutes (doc §8.3 P2: WAL > 1GB).
+            Meaning: local WAL backlog (disk cannot keep up/downstream persistence failing/WAL cleanup job not running);
+            continued growth fills the disk and affects the degradation path.
+            Handling: check disk space and store/wal write error logs, and whether the jobs snapshot/cleanup task reports errors;
+            scale the disk or drain the node if necessary.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+  # ---------------------------------------------------------------------------
+  #   # 2) offline queue backlog / downstream backpressure
+  # ---------------------------------------------------------------------------
+  - name: lattice-queue-backpressure
+    interval: 30s
+    rules:
+      - alert: LatticePendingDepthCritical
+        expr: sum(lattice_pending_depth) > 100000
+        for: 5m
+        labels:
+          severity: P1
+          component: queue
+          service: lattice
+        annotations:
+          summary: "Lattice offline queue pending depth exceeds 100k (P1)"
+          description: >-
+            sum(lattice_pending_depth) > 100000 for 5 minutes (doc §8.3 P1 threshold).
+            Meaning: many users are offline with a backlog, or the redelivery/ack path is blocked so the queue only grows.
+            ⚠ Instrumentation status: lattice_pending_depth{scope="user"} is currently only
+            set() on the ack_remove path, not refreshed by every enqueue path, so depth may lag the real value; the threshold is judged over 5 minutes.
+            Handling: GET /v1/admin/queue?user=... to spot-check the oldest messages and queue length, and check whether redelivery
+            (upstream drain) and acks work; rate-limit the sender, scale out, or run reconciliation if needed.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticePendingDepthWarning
+        expr: sum(lattice_pending_depth) > 10000
+        for: 10m
+        labels:
+          severity: P2
+          component: queue
+          service: lattice
+        annotations:
+          summary: "Lattice offline queue pending depth exceeds 10k (for 10 minutes)"
+          description: >-
+            the offline queue has kept a backlog above 10k, below the P1 threshold. Meaning: a higher offline rate,
+            slower delivery consumption or insufficient redelivery throughput. Handling: watch the growth trend and delivery latency; check Redis
+            pending ZSET growth and the node redelivery task; scale out/rate-limit early to avoid escalating to P1.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeBackpressureDropWarning
+        expr: sum by (priority) (rate(lattice_backpressure_dropped_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: P2
+          component: transport
+          service: lattice
+        annotations:
+          summary: "Lattice downstream backpressure keeps dropping frames (priority={{ $labels.priority }}, >1 frame/s)"
+          description: >-
+            the bounded downstream queue (256 frames per connection, lattice_core::protocol::BACKPRESSURE_QUEUE_FRAMES)
+            drops by priority when full and counts it: lattice_backpressure_dropped_total{priority=<cmd>},
+            where priority is the command name/source (envelope / route / stream-data / keepalive etc.,
+            determined by the Frame cmd name). >1 frame/s for 5 minutes means the consumer is consistently slower than the sender.
+            Meaning: clients not reading/poor network cause message loss (normal envelopes are dropped; the stream-sig/ack/receipt/byef protected set is not).
+            Handling: locate the link for that priority; check slow clients (weak network/no consumer), rate-limit the sender,
+            evaluate scaling out or client SDK consumption capacity; the dev load test (perf/reports/backpressure-*.md) reproduces this metric.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeBackpressureDropCritical
+        expr: sum(rate(lattice_backpressure_dropped_total[5m])) > 50
+        for: 5m
+        labels:
+          severity: P1
+          component: transport
+          service: lattice
+        annotations:
+          summary: "Lattice downstream backpressure drops exceed 50 frames/s (mass message loss)"
+          description: >-
+            the all-node backpressure drop rate stays >50 frames/s: downstream queues of many connections fill at once,
+            usually meaning node-level egress congestion (network/bandwidth/collective client anomaly) or the message plane is saturated.
+            Handling: locate first by priority and user dimension (see /v1/admin/online and slow connections),
+            rate-limit the sender (policy.msg_per_s), evaluate scaling out nodes or adding bandwidth;
+            confirm whether a load test/abnormal client is flooding; degrade and replay the DLQ if needed.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+  # ---------------------------------------------------------------------------
+  #   # 3) console SSE connection cap (lattice_core::protocol::SSE_MAX_CONNECTIONS = 100)
+  # ---------------------------------------------------------------------------
+  - name: lattice-console-sse
+    interval: 30s
+    rules:
+      - alert: LatticeSseConnectionsNearLimit
+        expr: lattice_sse_connections >= 80
+        for: 5m
+        labels:
+          severity: P2
+          component: admin
+          service: lattice
+        annotations:
+          summary: "Console SSE connections reached 80% of the cap (>=80/100)"
+          description: >-
+            lattice_sse_connections is the current number of SSE connections to /v1/admin/stream;
+            the server hard cap is SSE_MAX_CONNECTIONS=100, after which new connections return 429 (reason=sse_limit).
+            Meaning: many console tabs/client long connections were not released, or a connection leak (a regression where SseGuard is not dropped).
+            Handling: check the sources of /v1/admin/stream access and the number of console pages; have clients close extra tabs;
+            confirm the counter falls back after connections end (inc/dec paired); restart the console frontend or rate-limit if needed.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeSseConnectionsExhausted
+        expr: lattice_sse_connections >= 100
+        for: 1m
+        labels:
+          severity: P1
+          component: admin
+          service: lattice
+        annotations:
+          summary: "Console SSE connections are exhausted (100/100, new connections rejected with 429)"
+          description: >-
+            SSE connections reached the hard cap of 100; new /v1/admin/stream connections get 429 (sse_limit) directly and
+            console real-time data becomes unavailable. Meaning: a connection leak or abnormal clients filling the cap, excluding the normal
+            "many people, many tabs" scenario. Handling: locate the consumers (audit logs/gateway logs) and disconnect abnormal connections;
+            check whether SseGuard inc/dec are paired; temporarily restart the node or raise
+            admin.sse_max_connections (config item).
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+  # ---------------------------------------------------------------------------
+  #   # 4) plugin call latency / failure rate
+  # ---------------------------------------------------------------------------
+  - name: lattice-plugin
+    interval: 30s
+    rules:
+      - alert: LatticePluginCallLatencyHigh
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(lattice_plugin_call_duration_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: P2
+          component: plugin
+          service: lattice
+        annotations:
+          summary: "Lattice plugin call P99 latency exceeds 500ms"
+          description: >-
+            plugin call duration P99 > 500ms for 5 minutes. The threshold comes from doc §3.1: PluginSidecar.Process
+            timeout 500ms / circuit breaker 30s; a timeout means the caller takes the circuit-breaker or failure path.
+            Handling: check plugin process/wasmtime resources, sidecar queueing and the canary ratio; degrade/roll back the plugin version if needed.
+            ⚠ Instrumentation status: lattice_plugin_call_duration_seconds is registered in metrics.rs,
+            but the current code has no observe() call site (plugin call instrumentation is not wired) → the rule is in place,
+            takes effect once instrumentation lands, and has no data/no false positives before that.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticePluginCallFailureRateHigh
+        expr: >-
+          sum(rate(lattice_http_requests_total{path=~"/v1/hub/.*",status=~"5.."}[5m]))
+          / clamp_min(sum(rate(lattice_http_requests_total{path=~"/v1/hub/.*"}[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: P2
+          component: plugin
+          service: lattice
+        annotations:
+          summary: "Lattice plugin hub HTTP 5xx failure rate exceeds 5%"
+          description: >-
+            plugin hub (/v1/hub/*) HTTP 5xx share of requests >5% for 5 minutes (doc §8.3 P2: plugin error rate >5%).
+            Meaning: plugin publish/download/install API failures (object storage, PG, signature verification failures, etc.).
+            Handling: locate the error code by API (/v1/admin/audit and node logs), check MinIO/PG health and the
+            hub-object-gc/hub-draft-clean tasks; roll back the most recent plugin version if needed.
+            ⚠ Instrumentation status: metrics.rs registers lattice_http_requests_total{path,status}, but there is currently
+            no inc() call site (HTTP middleware instrumentation is not wired); and metrics.rs has no plugin call failure counter,
+            so this rule uses plugin hub HTTP 5xx as a proxy for the failure rate. It takes effect once instrumentation lands and has no data before that.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+  # ---------------------------------------------------------------------------
+  #   # 5) error rate / latency SLO (doc §8.3 P2 + §10 SLOs)
+  # ---------------------------------------------------------------------------
+  - name: lattice-slo
+    interval: 30s
+    rules:
+      - alert: LatticeE2eLatencySloBreach
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(lattice_e2e_latency_seconds_bucket[5m]))) > 0.1
+        for: 5m
+        labels:
+          severity: P2
+          component: latency
+          service: lattice
+        annotations:
+          summary: "Lattice end-to-end latency P99 exceeds 100ms (SLO breach)"
+          description: >-
+            end-to-end latency P99 > 100ms for 5 minutes (doc §8.3 P2 / §10: online P2P P99 < 50ms,
+            alert line 100ms). Meaning: the message-plane path (ingest→persist→route→deliver) got slower.
+            Handling: check store latency and PG/Redis metrics first, then node CPU/queues; compare E2E percentile changes
+            with the perf load-test baseline; rate-limit or scale out if needed.
+            ⚠ Instrumentation status: lattice_e2e_latency_seconds is registered, but the code currently only calls observe(0.0)
+            in the keepalive seq-watermark branch (placeholder semantics, not real end-to-end latency) → the rule is in place,
+            takes effect once real E2E instrumentation lands; until then the series is always 0 and never fires spuriously.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeE2eLatencyCritical
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(lattice_e2e_latency_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: P1
+          component: latency
+          service: lattice
+        annotations:
+          summary: "Lattice end-to-end latency P99 exceeds 500ms (severe SLO breach)"
+          description: >-
+            E2E P99 > 500ms for 5 minutes: severe, user-visible latency, usually accompanied by dependency jitter or node overload.
+            Handling: immediately check PG/Redis connection pools and slow queries, node CPU/memory/network and cross-node forwarding;
+            drain/scale out/roll back recent changes if needed, and assess drop and DLQ risk.
+            ⚠ Same as LatticeE2eLatencySloBreach: real E2E instrumentation is not wired yet, so the series is always 0.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeStoreLatencyHigh
+        expr: >-
+          histogram_quantile(0.99,
+            sum by (le) (rate(lattice_store_latency_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: P2
+          component: storage
+          service: lattice
+        annotations:
+          summary: "Lattice storage access P99 latency exceeds 500ms"
+          description: >-
+            storage access duration P99 > 500ms for 5 minutes. Meaning: one backend (PG/Redis/NATS/S3) got slower,
+            directly raising E2E latency and causing pending backlog. Handling: locate the slow backend (PG slow query/lock,
+            Redis primary/replica failover, S3 throttling) and check connection-pool and statement_timeout logs.
+            ⚠ Instrumentation status: lattice_store_latency_seconds is registered, but record_store() has no call site yet
+            (store instrumentation is not wired) → the rule is in place, takes effect once wired, and has no data before that.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeMessageErrorRateHigh
+        expr: >-
+          sum(rate(lattice_msgs_total{state=~"dropped|expired|dlq"}[5m]))
+          / clamp_min(sum(rate(lattice_msgs_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: P2
+          component: messaging
+          service: lattice
+        annotations:
+          summary: "Lattice message error rate (dropped/expired/dlq) exceeds 5%"
+          description: >-
+            lattice_msgs_total{state∈dropped,expired,dlq} share of all messages >5% for 10 minutes.
+            state values come from DeliveryState (sent/persisted/routed/delivered/acked/dropped/
+            expired/dlq). Meaning: the share of failed/expired/dead-lettered deliveries rose abnormally and messages may be lost.
+            Handling: break it down by state (dropped → backpressure/routing failure; expired → TTL/consumption stall;
+            dlq → delivery retries exhausted), and check delivery state via /v1/admin/dlq and /v1/admin/messages;
+            after fixing, follow the DLQ replay process.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeChunkRetransRateHigh
+        expr: >-
+          sum(rate(lattice_chunk_retrans_total[5m]))
+          / clamp_min(sum(rate(lattice_msgs_total[5m])), 0.001) > 0.01
+        for: 5m
+        labels:
+          severity: P2
+          component: messaging
+          service: lattice
+        annotations:
+          summary: "Lattice chunk retransmission rate exceeds 1%"
+          description: >-
+            lattice_chunk_retrans_total rate / message rate >1% for 5 minutes (doc §8.3 P2).
+            reason values per the implementation: chunk_in / request / seq_regression.
+            Meaning: frequent chunk redelivery (packet loss/timeout) or seq rollbacks being corrected (cross-node clock/watermark anomalies).
+            Handling: locate by reason; for request (client RequestChunks redelivery) check weak-network and chunk-timeout settings;
+            for chunk_in check the upload/reassembly path; for seq_regression check seq-watermark reconciliation and cross-node consistency.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+  # ---------------------------------------------------------------------------
+  #   # 6) rate limiting (observational aid; not listed in doc §8.3, but rate-limit drops mask backpressure/error-rate signals)
+  # ---------------------------------------------------------------------------
+  - name: lattice-ratelimit
+    interval: 30s
+    rules:
+      - alert: LatticeRateLimitDropSpike
+        expr: sum(rate(lattice_ratelimit_dropped_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: P3
+          component: messaging
+          service: lattice
+        annotations:
+          summary: "Lattice per-user rate-limit drops exceed 10/s"
+          description: >-
+            lattice_ratelimit_dropped_total{user_hash} rate >10/s for 5 minutes
+            (policy.msg_per_s defaults to 100 msg/s). Meaning: the sender is over quota, an abnormal client is flooding,
+            or a load test is running; sustained rate limiting shows up as upstream 429s and as a leading signal of backpressure/error-rate changes.
+            Handling: locate the account and source IP for user_hash and check the quota field via /v1/admin/users;
+            route abnormal flooding to risk control (lattice:risk); for organic growth, review quotas or scale out.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"

@@ -1,0 +1,51 @@
+# =============================================================================
+# Patroni DCS asynchronous replication downgrade fragment (NOT a complete configuration!)
+# -----------------------------------------------------------------------------
+# The default production configuration is synchronous_mode=true (RPO=0, see patroni.yml). Downgrade to
+# asynchronous only temporarily, in these cases:
+#   * Cross-data-center/cross-AZ deployments where the synchronous replication network RTT makes write
+#     latency unacceptable;
+#   * Only the primary remains available (the synchronous replica is missing): Patroni already degrades
+#     automatically under synchronous_mode_strict=false, so no manual change is needed; manual changes are
+#     only for a change window where "explicitly accept RPO>0 in exchange for write availability";
+#
+# How to apply (this changes the cluster-level configuration in DCS, not the bootstrap section of this file):
+#   patronictl -c /etc/patroni/patroni.yml edit-config \
+#     --set synchronous_mode=false --set synchronous_mode_strict=false
+#   patronictl -c /etc/patroni/patroni.yml list      # confirm the Sync Standby column disappears/changes
+#
+# Cost: under asynchronous replication, committed transactions may not have reached a replica, so the RPO
+#       of a primary failure = replication lag (potentially seconds to minutes); after a switchover the
+#       "new primary is missing the last few transactions" — reconciliation must run after recovery
+#       (scripts/reconcile.py).
+# Failback: set synchronous_mode back to true (requires at least 1 healthy replica to catch up), then
+#       confirm Sync Standby reappears in patronictl list with Lag near 0.
+#
+# Below is the complete equivalent bootstrap.dcs fragment (use it to pick the asynchronous form when
+# initializing a new cluster; for an already-initialized cluster use the patronictl edit-config above and
+# do not re-bootstrap).
+# =============================================================================
+ttl: 30
+loop_wait: 10
+retry_timeout: 10
+maximum_lag_on_failover: 1048576
+synchronous_mode: false
+synchronous_mode_strict: false
+# synchronous_node_count stays at 1 in asynchronous mode (with no synchronous replica Patroni warns
+# instead of blocking writes)
+synchronous_node_count: 1
+failsafe_mode: true
+postgresql:
+  use_pg_rewind: true
+  use_slots: true
+  parameters:
+    wal_level: replica
+    hot_standby: "on"
+    wal_log_hints: "on"
+    max_wal_senders: 10
+    max_replication_slots: 10
+    max_connections: 500
+    archive_mode: "on"
+    archive_timeout: 60
+    restore_command: /usr/local/bin/wal-gateway.sh restore %f %p
+    recovery_target_timeline: latest

@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lattice.node.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # do not spread WS/SSE long connections across all Pods: session stickiness is handled by the LB's consistent hash or by client reconnects;
+  # ClusterIP round-robins per connection by default and cross-node delivery is carried by Redis/NATS (② §4.1), so sessionAffinity is unnecessary.
+  selector:
+    {{- include "lattice.node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+    {{- if .Values.grpc.enabled }}
+    - name: grpc
+      port: {{ .Values.grpc.port }}
+      targetPort: grpc
+      protocol: TCP
+    {{- end }}
+---
+{{- if and .Values.mqtt.enabled .Values.mqtt.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lattice.node.fullname" . }}-mqtt
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mqtt
+spec:
+  type: {{ .Values.mqtt.service.type }}
+  selector:
+    {{- include "lattice.node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: mqtt
+      port: {{ .Values.mqtt.service.port }}
+      targetPort: mqtt
+      protocol: TCP
+    {{- if and .Values.tls.enabled .Values.tls.mqtt.enabled }}
+    - name: mqtt-tls
+      port: {{ .Values.tls.mqtt.port }}
+      targetPort: mqtt-tls
+      protocol: TCP
+    {{- end }}
+{{- end }}
+{{- if and .Values.tls.enabled .Values.tls.quic.enabled .Values.tls.quic.service.enabled }}
+---
+# QUIC/WebTransport is UDP: the Service can only expose a UDP port, and the client-side LB must declare UDP and preserve source IPs
+# (see deploy/quic-lb-udp.yaml for the full shape). The Service is off by default so a bare ClusterIP UDP is not mistaken for internet-reachable.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lattice.node.fullname" . }}-quic
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: quic
+spec:
+  type: {{ .Values.tls.quic.service.type }}
+  selector:
+    {{- include "lattice.node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: quic
+      port: {{ .Values.tls.quic.port }}
+      targetPort: quic
+      protocol: UDP
+{{- end }}

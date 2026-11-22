@@ -1,0 +1,115 @@
+# =============================================================================
+# Lattice production MinIO — 4 nodes × 4 drives = 16 drives, erasure coding EC 12+4
+# -----------------------------------------------------------------------------
+# Topology (the single authority is design §17.13): 4 nodes × 4 drives = 16 drives, one erasure set
+# (16 drives)
+#   → data 12 + parity 4 = EC 12+4: tolerates any 4 drive failures (equivalent to 1 entire node offline),
+#     usable capacity = 12/16 = 75%, and healing is performed automatically by MinIO.
+#   `MINIO_ERASURE_SET_DRIVE_COUNT=16` explicitly pins "16 drives in a single set" so that an upgrade
+#   or scale-out cannot silently change MinIO's set algorithm and drop fault tolerance below 4 drives.
+#
+# Notes (read these first):
+#   1) This file is a **topology reference / staging drill** for 4 containers on one host (each mounting
+#      4 directories); production is 4 hosts with 4 independent data drives each (XFS, no RAID — MinIO is
+#      itself the redundancy layer).
+#   2) No host ports are published: the dev stack already uses 9000/9001; production exposes a stable
+#      endpoint through an L4/L7 LB (TLS termination).
+#   3) **The node-side [s3] endpoint supports http:// only** (`store/s3.rs::endpoint_host_port()` rejects
+#      https outright; TLS is terminated by the fronting proxy). Therefore: internal
+#      endpoint=http://minio-lb:9000, while clients use [s3] public_endpoint=https://s3.example.com
+#      (the Host of presigned URLs).
+#   4) Do not rely on the node creating buckets: its `ensure_buckets()` only does HEAD → PUT on **plain
+#      buckets** (no versioning/no object lock). The versioning/object lock production needs must be
+#      pre-created with bucket-setup.sh before the node first starts (the node skips buckets that answer HEAD).
+#   5) Pin the image version; MinIO upgrades have storage-format compatibility requirements, so upgrade
+#      one version at a time per the official release notes.
+#
+# Deployment order: bring up all 4 hosts → create buckets/versioning/IAM with mc → then start lattice-node (see README §1)
+#
+#   docker compose -f deploy/production/minio/docker-compose.yml config   # offline check
+# =============================================================================
+name: lattice-minio-ha
+
+networks:
+  minionet:
+    driver: bridge
+
+volumes:
+  # 4 nodes × 4 drives = 16 independent volumes; in production replace with the 4 raw-disk mount points on each of the 4 hosts
+  minio1-data1: {}
+  minio1-data2: {}
+  minio1-data3: {}
+  minio1-data4: {}
+  minio2-data1: {}
+  minio2-data2: {}
+  minio2-data3: {}
+  minio2-data4: {}
+  minio3-data1: {}
+  minio3-data2: {}
+  minio3-data3: {}
+  minio3-data4: {}
+  minio4-data1: {}
+  minio4-data2: {}
+  minio4-data3: {}
+  minio4-data4: {}
+
+x-minio-common: &minio-common
+  image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+  networks: [minionet]
+  restart: unless-stopped
+  environment:
+    # Production: the root account is for ops only; the node uses a dedicated IAM user (see bucket-setup.sh)
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-lattice-root}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-CHANGE_ME_MINIO_ROOT_PASSWORD}
+    # Single erasure set of 16 drives → EC 12+4 (do not delete this line)
+    MINIO_ERASURE_SET_DRIVE_COUNT: "16"
+    # Production (LB/TLS scenario):
+    # MINIO_SERVER_URL: "https://s3.example.com"
+    # MINIO_BROWSER_REDIRECT_URL: "https://console.s3.example.com"
+    # [enable in production] Native TLS (if not terminating at an external LB; the node side still cannot
+    # get an https endpoint, so LB termination with MinIO kept on http internally is preferred)
+    # MINIO_NOTIFY_WEBHOOK_ENABLE: "off"
+  command: ["server", "http://minio{1...4}/data{1...4}", "--console-address", ":9001"]
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 20s
+
+services:
+  minio1:
+    <<: *minio-common
+    container_name: lattice-minio-1
+    volumes:
+      - minio1-data1:/data1
+      - minio1-data2:/data2
+      - minio1-data3:/data3
+      - minio1-data4:/data4
+
+  minio2:
+    <<: *minio-common
+    container_name: lattice-minio-2
+    volumes:
+      - minio2-data1:/data1
+      - minio2-data2:/data2
+      - minio2-data3:/data3
+      - minio2-data4:/data4
+
+  minio3:
+    <<: *minio-common
+    container_name: lattice-minio-3
+    volumes:
+      - minio3-data1:/data1
+      - minio3-data2:/data2
+      - minio3-data3:/data3
+      - minio3-data4:/data4
+
+  minio4:
+    <<: *minio-common
+    container_name: lattice-minio-4
+    volumes:
+      - minio4-data1:/data1
+      - minio4-data2:/data2
+      - minio4-data3:/data3
+      - minio4-data4:/data4

@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: rust / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+      - name: cargo test (workspace)
+        run: cargo test --workspace
+      # Formatting/static checks are advisory until the first green CI run.
+      - name: cargo fmt --check (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  web:
+    name: web / build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  helm:
+    name: helm / lint + render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: lint (all feature switches on)
+        run: |
+          helm lint deploy/helm/lattice \
+            --set backup.enabled=true --set ingress.enabled=true --set mqtt.enabled=true \
+            --set autoscaling.enabled=true --set networkPolicy.enabled=true
+      - name: render + offline consistency validation
+        run: |
+          helm template lattice deploy/helm/lattice -n lattice \
+            --set backup.enabled=true --set ingress.enabled=true --set mqtt.enabled=true \
+            --set autoscaling.enabled=true --set networkPolicy.enabled=true \
+            > /tmp/helm-rendered.yaml
+          python .tooling/helm-validate.py /tmp/helm-rendered.yaml
+
+  observability:
+    name: observability / rules + dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: validate alert rules and dashboard JSON
+        run: |
+          python - <<'PY'
+          import json, pathlib, yaml
+          rules = yaml.safe_load(pathlib.Path('deploy/observability/prometheus/lattice-alerts.yml').read_text(encoding='utf-8'))
+          assert rules['groups'], 'alerts.yml is missing groups'
+          alert_count = sum(len(g.get('rules', [])) for g in rules['groups'])
+          assert alert_count >= 10, f'too few alert rules: {alert_count}'
+          dash = json.loads(pathlib.Path('deploy/observability/grafana/lattice-overview.json').read_text(encoding='utf-8'))
+          assert len(dash.get('panels', [])) >= 10, 'dashboard has too few panels'
+          print(f'ok: {alert_count} alerts, {len(dash["panels"])} panels')
+          PY

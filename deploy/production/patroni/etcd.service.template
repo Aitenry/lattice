@@ -1,0 +1,47 @@
+# =============================================================================
+# etcd systemd unit template (one copy per machine; only change the EnvironmentFile and user/group)
+# -----------------------------------------------------------------------------
+# Install:
+#   install -m 0644 etcd.service.template /etc/systemd/system/etcd.service
+#   systemctl daemon-reload && systemctl enable --now etcd
+#
+# Design points:
+#   * Run as non-root (dedicated etcd user) with write access only to the data directory;
+#   * ProtectSystem=strict + ReadWritePaths limits the writable surface (configuration/certificates read-only);
+#   * Raise LimitNOFILE: etcd is fd-sensitive; LimitNPROC guards against fork bombs;
+#   * Do not use a per-second Restart=always flap: preserve the crash scene for etcd, use on-failure with
+#     backoff restarts.
+# =============================================================================
+[Unit]
+Description=Lattice etcd (Patroni DCS)
+Documentation=file:///etc/etcd/README.md
+After=network-online.target
+Wants=network-online.target
+# No conflict needed when deployed on separate hosts from PG; for a same-host temporary drill add Conflicts=patroni.service
+
+[Service]
+Type=notify
+User=etcd
+Group=etcd
+EnvironmentFile=/etc/etcd/etcd.env      # ETCD_NAME/NODE_IP/ETCD_INITIAL_CLUSTER (0600, from a Secret/configuration management)
+ExecStart=/usr/local/bin/etcd --config-file /etc/etcd/etcd.conf.yml
+WorkingDirectory=/var/lib/etcd
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=90
+
+# Filesystem/kernel hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/etcd /var/log/etcd
+ReadOnlyPaths=/etc/etcd
+LimitNOFILE=65536
+LimitNPROC=8192
+
+# Resources and logging
+OOMScoreAdjust=-500
+[Install]
+WantedBy=multi-user.target

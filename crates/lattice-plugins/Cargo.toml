@@ -1,0 +1,65 @@
+[package]
+name = "lattice-plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lattice plugin host: registry, canary rollout, signature verification, sidecar calls (design §6.7, doc ② §4.5)"
+
+[features]
+# Enable the WASM host by default: `cargo test -p lattice-plugins` runs all wasm unit tests.
+# `lattice-node` depends on this crate with `default-features = false`, so a default node build
+# (`cargo build -p lattice-node`) does **not** compile wasmtime/ring/base64 and existing builds are unaffected;
+# enable it on the node side with `cargo build -p lattice-node --features wasm-host`.
+default = ["wasm"]
+wasm = ["dep:wasmtime", "dep:ring", "dep:base64"]
+
+[dependencies]
+lattice-core.workspace = true
+async-trait.workspace = true
+# Decoding the `signature` (base64) in the plugin package manifest and Ed25519 verification compile only under the `wasm` feature
+# (ring is already in the workspace dependency tree/vendor, so no new crate is added).
+base64 = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# gRPC sidecar client (⑤ §10 `PluginSidecar.Process`): tonic client + TLS (mTLS).
+# Same version/vendor entry (0.12.3) as the tonic already enabled in `lattice-node`, so **no new crate** is added;
+# the generated code lands only in this crate's OUT_DIR (`lattice.internal.v1`) and does not affect the node-side NodeInternal.
+prost.workspace = true
+tonic.workspace = true
+# Plugin WASM execution engine (limits: fuel/epoch/StoreLimits), see src/wasm/mod.rs.
+wasmtime = { workspace = true, optional = true }
+# Ed25519 signature verification (design §4.5): only `ring::signature::ED25519` is used; signing happens offline at the publisher.
+ring = { workspace = true, optional = true }
+
+[build-dependencies]
+# proto → tonic/prost stubs (same vendored protoc as lattice-node/build.rs; host machine/CI need no protobuf install).
+tonic-build.workspace = true
+protoc-bin-vendored.workspace = true
+
+[dev-dependencies]
+# Unit tests/examples build test modules from WAT text (compiled to wasm bytes, then handed to the host; the host accepts binaries only).
+wasmtime = { workspace = true }
+wat = "1"
+# Sidecar integration tests: a real local tonic mock server + rcgen issuing CA/server/client certificates on the spot (mTLS).
+# All these crates are already in the workspace dependency tree/vendor (the node's quic feature / dependency chain uses them); no new versions.
+rcgen.workspace = true
+tokio-stream.workspace = true
+# Assert that "logs never print input/output": capture tracing output and check the inverse.
+tracing-subscriber.workspace = true
+
+[[example]]
+# WASM host end-to-end probe: scripts/wasm-host-e2e.mjs builds and runs it and emits a JSON report.
+name = "wasm-host-e2e"
+path = "examples/wasm-host-e2e.rs"
+required-features = ["wasm"]
+
+[[example]]
+# Plugin package fixture tool: generates WAT→wasm bytes, the canonical manifest,
+# and the digest to sign (sha256(wasm || canonical_manifest_json)) for scripts/wasm-plugin-e2e.mjs. Reads local files only; no network.
+name = "wasm-plugin-fixture"
+path = "examples/wasm-plugin-fixture.rs"
+required-features = ["wasm"]

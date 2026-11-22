@@ -1,0 +1,238 @@
+# =============================================================================
+# Lattice production PG HA — single-host shape reference / 3×Patroni + 3×etcd topology for staging drills
+# -----------------------------------------------------------------------------
+# Notes (read these first):
+#   1) The production shape is **3 independent hosts** (or 3 K8s nodes), each running 1 Patroni + 1 etcd;
+#      this file puts all 6 processes into one compose purely to express the "3 replicas + 3 DCS" topology
+#      and the dependency/probe/volume relationships. It is **not a production deployment unit**, and it
+#      has not been brought up on this machine for validation (see the unvalidated boundaries in README).
+#      Production approach: copy the pg0/etcd0 blocks to the 3 machines (dropping the ports/healthcheck
+#      container-network details, or use systemd + patroni.yml directly) and replace the etcd/Patroni
+#      addresses with real private IPs/DNS.
+#   2) The authoritative parameters are `deploy/production/patroni/patroni.yml`. This file expresses the
+#      same key parameters (synchronous replication/DCS probes) through the spilo image's
+#      `SPILO_CONFIGURATION` environment interface; patroni.yml governs the complete parameter set —
+#      avoiding two copies that drift over time.
+#   3) No host ports are published: the local dev stack already uses 5432/8080; for single-host drills use
+#      `docker compose exec` or temporarily add `ports:` (production uses HAProxy/direct internal
+#      connections, see README §5.1).
+#   4) Pin the image version (never :latest); upgrade = change the tag + roll (upgrade replicas first,
+#      then switch over, then upgrade the original primary).
+#
+# Dependencies on other components (README §2 deployment order):
+#   etcd ×3 → Patroni ×3 (this file) → create database/migrate → MinIO(EC 12+4) → Redis Sentinel → NATS ×3 → node ×N
+#
+#   docker compose -f deploy/production/patroni/docker-compose.yml config   # offline check
+# =============================================================================
+name: lattice-pg-ha
+
+networks:
+  pgnet:
+    driver: bridge
+
+volumes:
+  etcd0-data:
+  etcd1-data:
+  etcd2-data:
+  pg0-data:
+  pg1-data:
+  pg2-data:
+
+services:
+  # --- DCS: etcd v3 ×3 (quorum=2; 1 host down does not affect election, 2 down stops automatic switchover) ---
+  etcd0: &etcd
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    container_name: lattice-pg-etcd0
+    hostname: etcd0
+    networks: [pgnet]
+    restart: unless-stopped
+    volumes:
+      - etcd0-data:/etcd-data
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd0
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd0:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-token=lattice-pg-dcs
+      - --initial-cluster-state=new
+      # [enable in production] etcd mutual TLS: --cert-file/--key-file/--trusted-ca-file/--client-cert-auth
+      # plus peer-side --peer-cert-file etc.; certificates are mounted from a Secret, never baked into the image/repo
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/etcdctl", "endpoint", "health", "--endpoints=http://127.0.0.1:2379"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  etcd1:
+    <<: *etcd
+    container_name: lattice-pg-etcd1
+    hostname: etcd1
+    volumes:
+      - etcd1-data:/etcd-data
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd1
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-token=lattice-pg-dcs
+      - --initial-cluster-state=new
+
+  etcd2:
+    <<: *etcd
+    container_name: lattice-pg-etcd2
+    hostname: etcd2
+    volumes:
+      - etcd2-data:/etcd-data
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd2
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-token=lattice-pg-dcs
+      - --initial-cluster-state=new
+
+  # --- Patroni + PostgreSQL 16 ×3 (spilo image; 1 primary + 2 replicas elected by Patroni) ---
+  pg0: &pg
+    image: ghcr.io/zalando/spilo-16:3.3-p3
+    container_name: lattice-pg-pg0
+    hostname: pg0
+    networks: [pgnet]
+    restart: unless-stopped
+    depends_on:
+      etcd0: { condition: service_healthy }
+      etcd1: { condition: service_healthy }
+      etcd2: { condition: service_healthy }
+    volumes:
+      - pg0-data:/home/postgres/pgdata
+      # Production mounts: WAL archive gateway, database creation script, TLS certificates, pg config overrides
+      # - ./wal-gateway.sh:/usr/local/bin/wal-gateway.sh:ro
+      # - ./init-lattice-db.sh:/usr/local/bin/init-lattice-db.sh:ro
+      # - ./tls:/etc/postgresql/tls:ro
+    environment:
+      # Node identity (differs per host in production)
+      SCOPE: lattice-pg
+      PGVERSION: "16"
+      PATRONI_NAME: pg0
+      ETCD3_HOST: etcd0:2379
+      ETCD3_HOSTS: "'etcd0:2379','etcd1:2379','etcd2:2379'"
+      # All passwords are placeholders: production injects them from a Secret → environment variables; never commit real values
+      PGPASSWORD_SUPERUSER: ${PG_SUPERUSER_PASSWORD:-CHANGE_ME_PG_SUPERUSER_PASSWORD}
+      PGPASSWORD_STANDBY: ${PG_REPLICATION_PASSWORD:-CHANGE_ME_PG_REPLICATION_PASSWORD}
+      PATRONI_RESTAPI_USERNAME: patroni_api
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD:-CHANGE_ME_PATRONI_RESTAPI_PASSWORD}
+      # Key cluster parameters aligned with patroni.yml (patroni.yml governs the complete set)
+      SPILO_CONFIGURATION: |
+        bootstrap:
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            synchronous_mode: true
+            synchronous_mode_strict: false
+            synchronous_node_count: 1
+            failsafe_mode: true
+            postgresql:
+              use_pg_rewind: true
+              use_slots: true
+        postgresql:
+          parameters:
+            archive_mode: "on"
+            archive_timeout: 60
+            wal_level: replica
+            hot_standby: "on"
+            wal_log_hints: "on"
+            max_connections: 500
+    healthcheck:
+      # Probe definition: the process being alive and accepting connections is enough; "who is primary" is
+      # decided by Patroni /primary — never use pg_isready as a primary check (replicas are equally ready)
+      test: ["CMD-SHELL", "pg_isready -U postgres -h 127.0.0.1 -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  pg1:
+    <<: *pg
+    container_name: lattice-pg-pg1
+    hostname: pg1
+    volumes:
+      - pg1-data:/home/postgres/pgdata
+    environment:
+      SCOPE: lattice-pg
+      PGVERSION: "16"
+      PATRONI_NAME: pg1
+      ETCD3_HOST: etcd1:2379
+      ETCD3_HOSTS: "'etcd0:2379','etcd1:2379','etcd2:2379'"
+      PGPASSWORD_SUPERUSER: ${PG_SUPERUSER_PASSWORD:-CHANGE_ME_PG_SUPERUSER_PASSWORD}
+      PGPASSWORD_STANDBY: ${PG_REPLICATION_PASSWORD:-CHANGE_ME_PG_REPLICATION_PASSWORD}
+      PATRONI_RESTAPI_USERNAME: patroni_api
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD:-CHANGE_ME_PATRONI_RESTAPI_PASSWORD}
+      SPILO_CONFIGURATION: |
+        bootstrap:
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            synchronous_mode: true
+            synchronous_mode_strict: false
+            synchronous_node_count: 1
+            failsafe_mode: true
+        postgresql:
+          parameters:
+            archive_mode: "on"
+            archive_timeout: 60
+            wal_level: replica
+            hot_standby: "on"
+            wal_log_hints: "on"
+            max_connections: 500
+
+  pg2:
+    <<: *pg
+    container_name: lattice-pg-pg2
+    hostname: pg2
+    volumes:
+      - pg2-data:/home/postgres/pgdata
+    environment:
+      SCOPE: lattice-pg
+      PGVERSION: "16"
+      PATRONI_NAME: pg2
+      ETCD3_HOST: etcd2:2379
+      ETCD3_HOSTS: "'etcd0:2379','etcd1:2379','etcd2:2379'"
+      PGPASSWORD_SUPERUSER: ${PG_SUPERUSER_PASSWORD:-CHANGE_ME_PG_SUPERUSER_PASSWORD}
+      PGPASSWORD_STANDBY: ${PG_REPLICATION_PASSWORD:-CHANGE_ME_PG_REPLICATION_PASSWORD}
+      PATRONI_RESTAPI_USERNAME: patroni_api
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD:-CHANGE_ME_PATRONI_RESTAPI_PASSWORD}
+      SPILO_CONFIGURATION: |
+        bootstrap:
+          dcs:
+            ttl: 30
+            loop_wait: 10
+            retry_timeout: 10
+            maximum_lag_on_failover: 1048576
+            synchronous_mode: true
+            synchronous_mode_strict: false
+            synchronous_node_count: 1
+            failsafe_mode: true
+        postgresql:
+          parameters:
+            archive_mode: "on"
+            archive_timeout: 60
+            wal_level: replica
+            hot_standby: "on"
+            wal_log_hints: "on"
+            max_connections: 500

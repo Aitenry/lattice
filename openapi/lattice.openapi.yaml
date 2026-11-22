@@ -1,0 +1,4190 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Lattice Platform API (Unified Messaging Platform)
+  version: 0.5.0
+  summary: Machine-readable contract for all REST/SSE/probe routes in Doc ⑤ (with WS/MQTT/gRPC boundary registrations)
+  description: |-
+    The **machine-readable authoritative artifact** for the Lattice platform API contract, mapping one-to-one to
+    the platform API design document (Doc ⑤, v0.18; maintained outside this repository).
+
+    ## Authority boundary
+
+    - Doc ⑤ remains the sole authority for the human-readable contract; this file is its equivalent machine-readable form, used for client SDK
+      generation, CI contract comparison (`python scripts/openapi-diff.py`), and gateway validation.
+    - If the two differ: **Doc ⑤ wins**, and this file must be backfilled (changing only this file is not allowed).
+    - This file is **not** generated from Rust route macros/utoipa: the axum route macros stay unchanged and no heavyweight
+      generation dependency was introduced; when routes change, this file must be edited by hand in the same commit, otherwise `scripts/openapi-diff.py` reports
+      missing/extra.
+    - Value conventions (key names/enums/thresholds/command sets/parameter tables) follow design doc §17; this file only references them.
+
+    ## Coverage (93 HTTP operations + non-HTTP protocol boundaries)
+
+    - REST message API: §1 auth, §2 users and devices, §3 conversations, §4 messages, §5 uploads, §7 topics, §9.7 media helpers;
+    - REST admin API: §8.1–§8.6 (online/nodes/queues/SSE/metrics/users/devices/search/plugins/formats/config/keys/audit);
+    - User-facing plugin hub: §12 (`/v1/hub/*`, 13 operations);
+    - Probes: §6 (`/v1/health`, `/v1/ready`);
+    - WebSocket: `GET /v1/ws` (upgrade plus frame protocol registered in the `x-ws` extension, 13 commands total);
+    - The MQTT gateway and internal gRPC **are not HTTP interfaces**; they are registered as top-level `x-mqtt-gateway` / `x-grpc-services`
+      extensions so the contract inventory stays complete without being disguised as REST operations.
+
+    ## General rules (Doc ⑤ §0)
+
+    - **Authentication**: the message and admin APIs both use `Authorization: Bearer <access_jwt>` (RS256, TTL 900s);
+      the admin API enforces RBAC on the JWT claim `role ∈ {admin, ops, user}`; probes require no authentication.
+    - **Idempotency**: all write endpoints accept an optional `Idempotency-Key: <ULID>`; a replay with the same key returns the first result
+      (the original `200/201/204` status) plus the `Idempotent-Replay: true` response header; the same key with a different request body
+      returns `409 CONFLICT`; scope is caller + method + path + key; TTL 24h.
+    - **Pagination**: cursor-based `?before_seq=<u64>&limit=<1..200>` (default 50); offset-based
+      `?page=<1..>&page_size=<1..200>` (default 1/50); responses are wrapped as
+      `{items: [...], next_cursor?, total?}`. Pagination parameters are transmitted as decimal integers.
+    - **Error responses** (§0.5): `{code, message, envelope_id?, details?, trace_id}`;
+      the HTTP status ↔ code mapping is in §0.6. Clients must tolerate unknown codes (treat them as `INTERNAL` semantics).
+    - **Rate-limit response headers** (§0.7): `X-RateLimit-Limit/-Remaining/-Reset`, `X-Quota-Storage-Used/-Limit`,
+      and `429/503` responses carry `Retry-After`.
+    - **Version negotiation** (§0.8): REST uses the path version `/v1`; breaking changes must run `/v2` in parallel for ≥ 1 release cycle.
+  license:
+    name: Apache-2.0
+  contact:
+    name: Lattice
+    url: https://github.com/ryten-bench/lattice
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local dev node (docker compose / native; paths already include the `/v1` prefix)
+  - url: https://{host}
+    description: Production (LB terminates TLS 1.3; path prefix `/v1`)
+    variables:
+      host:
+        default: api.lattice.example.com
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: probes
+    description: Probes (no authentication) · ⑤ §6
+  - name: auth
+    description: 'Authentication: login / refresh / logout · ⑤ §1'
+  - name: users
+    description: Users, devices, and self-service profile · ⑤ §2
+  - name: conversations
+    description: Conversations and members · ⑤ §3
+  - name: messages
+    description: Message metadata / downloads / chunk inventory · ⑤ §4
+  - name: uploads
+    description: Large-object multipart upload (MinIO Multipart) · ⑤ §5
+  - name: topics
+    description: Topic subscriptions and broadcasts · ⑤ §7
+  - name: admin
+    description: 'Admin API (RBAC: user read-only / ops remediation / admin changes) · ⑤ §8'
+  - name: media
+    description: Media helpers (TURN short-lived credentials, recording search) · ⑤ §9.7
+  - name: hub
+    description: User-facing plugin hub (catalog / publishing / uploads / install records / stats) · ⑤ §12
+  - name: ws
+    description: WebSocket main-channel upgrade endpoint (frame protocol in x-ws) · ⑤ §9
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |-
+        Access JWT (RS256, TTL 900s). Claims include `sub` (user ULID), `dev` (device ID),
+        `role` (admin|ops|user), and `exp`. Refresh via `POST /v1/auth/refresh` to obtain a new refresh+access pair;
+        role changes take effect within one TTL at most.
+
+  headers:
+    XTraceId:
+      description: Trace ID (generated or passed through by the gateway; combined with the WS envelope_id, the unified lookup key across the three streams).
+      schema:
+        type: string
+    XRateLimitLimit:
+      description: Limit of the current rate-limit window (1s).
+      schema:
+        type: integer
+    XRateLimitRemaining:
+      description: Remaining calls in the current rate-limit window.
+      schema:
+        type: integer
+    XRateLimitReset:
+      description: Reset time of the current rate-limit window (seconds).
+      schema:
+        type: integer
+    XQuotaStorageUsed:
+      description: Used storage quota (bytes).
+      schema:
+        type: integer
+        format: int64
+    XQuotaStorageLimit:
+      description: Storage quota limit (bytes).
+      schema:
+        type: integer
+        format: int64
+    RetryAfter:
+      description: Suggested backoff in seconds (429/503).
+      schema:
+        type: integer
+    IdempotentReplay:
+      description: '`true` when an idempotency cache hit replays the first response.'
+      schema:
+        type: string
+        enum: ["true"]
+    Location:
+      description: Presigned download URL (302 redirect target).
+      schema:
+        type: string
+        format: uri
+    XContentSha256:
+      description: Object content SHA-256 (lowercase hex, 64 characters).
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+    XContentLength:
+      description: Object size in bytes.
+      schema:
+        type: integer
+        format: int64
+    XAccelBuffering:
+      description: SSE reverse-proxy hint; must be `no`.
+      schema:
+        type: string
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |-
+        Optional idempotency key (ULID, 26-character Crockford Base32). The first request executes and caches the response (TTL 24h);
+        a replay with the same key returns the first result plus `Idempotent-Replay: true`; the same key with a different request body returns
+        `409 CONFLICT` (`details.reason = idempotency_conflict`). Scope is caller + method +
+        path + key, and keys are never reused across users. Omitting this header behaves exactly as before the idempotency middleware existed.
+      schema:
+        type: string
+        pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+        example: 01J7Q3Z8Y2K4M6N8P0R2T4V6X8
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Offset-based page number (1-based, default 1).
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      description: Offset-based page size (1..200, default 50; hub catalog defaults to 20 and caps at 100).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Cursor-based page size (1..200, default 50).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    BeforeSeq:
+      name: before_seq
+      in: query
+      required: false
+      description: 'Cursor: history with seq **strictly less than** this value (half-open interval, boundary excluded).'
+      schema:
+        type: integer
+        format: int64
+    AfterSeq:
+      name: after_seq
+      in: query
+      required: false
+      description: 'Cursor: history with seq **strictly greater than** this value (offline redelivery reconciliation / resumable reads).'
+      schema:
+        type: integer
+        format: int64
+    TraceId:
+      name: X-Trace-Id
+      in: header
+      required: false
+      description: Caller-supplied trace ID (generated by the gateway when omitted).
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: '400 `PROTOCOL`: malformed request structure / missing required field / JSON parse failure.'
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: '401 `AUTH_FAIL`: missing / expired / badly signed token, or device fingerprint mismatch (re-login required).'
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: '403 `FORBIDDEN`: RBAC violation, or a non-member accessing conversation messages (`details.reason = not_member`).'
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: '404 `NOT_FOUND`: resource does not exist (user / message / conversation / upload / recording segment / plugin).'
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |-
+        409 `CONFLICT`: idempotency key conflict (`details.reason = idempotency_conflict` / `idempotency_in_progress`),
+        refresh token already rotated, subscription conflict, version already published (`version_published`), plugin data version conflict (`data_conflict`), and so on.
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooLarge:
+      description: |-
+        413 `TOO_LARGE`: request body too large (`/messages` > 1MB, admin JSON > 4MB, plugin package > 20MiB,
+        source package > 50MiB). `details.hint = use_ws_or_chunk` (message API) or `details.reason` + `details.max_bytes`.
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Format:
+      description: |-
+        422 `FORMAT`: semantic validation failed (invalid `kind`, out-of-range `limit`, `sha256` mismatch, invalid query parameter,
+        audit query too broad `too_broad`, and so on).
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: '429 `RATE`: rate limit or quota exceeded; carries `Retry-After` (seconds) and `X-RateLimit-*` headers.'
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Internal:
+      description: '500 `INTERNAL`: unexpected error (`trace_id` always included).'
+      headers:
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: |-
+        503 `INTERNAL`: dependency unavailable / node not ready / draining. `details.dep ∈ {pg, redis, bus}`,
+        and health probes additionally carry `ready`/`draining`/`deps`/`node_id`/`version`.
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+        X-Trace-Id: { $ref: '#/components/headers/XTraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ------------------------------------------------------------------ Common
+    Error:
+      type: object
+      required: [code, message]
+      description: Unified error response (Doc ⑤ §0.5).
+      properties:
+        code: { $ref: '#/components/schemas/ErrorCode' }
+        message:
+          type: string
+          description: Short human-readable English message (safe to localize for display).
+        envelope_id:
+          type: string
+          description: Present when a specific message is involved (chunk IDs look like `<id>.c<i>`).
+        details:
+          type: object
+          additionalProperties: true
+          description: Structured details (`reason`/`field`/`dep`/`hint`/`max_bytes`, and so on).
+        trace_id:
+          type: string
+          description: Trace ID (matches the X-Trace-Id response header).
+    ErrorCode:
+      type: string
+      description: |-
+        Unified code namespace. `FORBIDDEN`/`CONFLICT`/`TOO_LARGE` are REST-side extension codes and never appear in WS frames;
+        clients must tolerate unknown values (treat them as `INTERNAL` semantics).
+      enum: [AUTH_FAIL, FORBIDDEN, NOT_FOUND, CONFLICT, PROTOCOL, TOO_LARGE, FORMAT, RATE, QUOTA, PLUGIN, INTERNAL]
+    Ulid:
+      type: string
+      pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+      description: ULID (26-character uppercase Crockford Base32).
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339 UTC with millisecond precision (`2025-07-01T08:30:00.000Z`).
+    NullableString:
+      type: [string, 'null']
+      description: Nullable string (field-specific default semantics are defined in each field description).
+    PageEnvelope:
+      type: object
+      description: Offset-based pagination response wrapper.
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {}
+        total:
+          type: integer
+          format: int64
+          description: Total item count (admin API lists).
+    OkOk:
+      type: object
+      description: Simple success response.
+      properties:
+        ok: { type: boolean }
+    TaskAccepted:
+      type: object
+      description: Async task accepted (202).
+      required: [task_id]
+      properties:
+        task_id: { $ref: '#/components/schemas/Ulid' }
+        accepted: { type: boolean }
+        state:
+          type: string
+          description: 'Task state (for example `running`).'
+
+    # ------------------------------------------------------------------ Auth / users
+    Capabilities:
+      type: object
+      description: Device / user capability declarations (authoritative values come from WS `hello.caps`; these are declarations, not guarantees).
+      properties:
+        formats: { type: array, items: { type: string }, example: [text, json, proto] }
+        compression: { type: array, items: { type: string }, example: [zstd, lz4] }
+        e2e: { type: boolean }
+        quic: { type: boolean }
+        webrtc: { type: boolean }
+    Quota:
+      type: object
+      description: User quota (design §17.13).
+      properties:
+        msg_per_s: { type: integer, example: 100 }
+        bytes_per_s: { type: integer, format: int64, example: 26214400 }
+        topics: { type: integer, example: 100 }
+        storage_bytes: { type: integer, format: int64, example: 10737418240 }
+    DeviceInfo:
+      type: object
+      required: [id, fingerprint]
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        fingerprint:
+          type: string
+          description: 'Authoritative device fingerprint (`sha256:...`); the client reports it verbatim in WS `hello.device_fp`.'
+        device_name: { type: string }
+        revoked_at: { $ref: '#/components/schemas/Timestamp' }
+        last_seen: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+    UserPublic:
+      type: object
+      required: [id, username]
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        username: { type: string }
+        display_name: { $ref: '#/components/schemas/NullableString' }
+        avatar: { $ref: '#/components/schemas/NullableString' }
+        status:
+          type: string
+          enum: [active, suspended, deleted]
+        role:
+          type: string
+          enum: [admin, ops, user]
+          description: 'Authoritative values come from `users.role`; the legacy `viewer` value degrades to `user` on read paths.'
+        capabilities: { $ref: '#/components/schemas/Capabilities' }
+        quota: { $ref: '#/components/schemas/Quota' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string, format: password }
+        device_name:
+          type: string
+          description: Device display name (for example `Alienware-m16`).
+        device_fp:
+          type: string
+          description: |-
+            Device fingerprint (`sha256:...`), optional; when omitted, the server generates `<sha256>:<ulid>` and returns it in the response
+            `device.fingerprint`; the client must report it verbatim in the WS `hello`.
+    AuthResponse:
+      type: object
+      required: [access_jwt, refresh_token, expires_in, device, user]
+      description: Login / refresh success response.
+      properties:
+        access_jwt:
+          type: string
+          description: RS256 JWT, TTL 900s.
+        refresh_token:
+          type: string
+          description: '`b64:...` random 256-bit value; the server stores only `devices.token_hash`.'
+        expires_in: { type: integer, example: 900 }
+        device: { $ref: '#/components/schemas/DeviceInfo' }
+        user:
+          type: object
+          required: [id, username]
+          properties:
+            id: { $ref: '#/components/schemas/Ulid' }
+            username: { type: string }
+            display_name: { $ref: '#/components/schemas/NullableString' }
+            capabilities: { $ref: '#/components/schemas/Capabilities' }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          description: "May also be passed via `Authorization: Bearer <refresh_token>`."
+    UserPatchRequest:
+      type: object
+      description: |-
+        Partial update. Self: only `display_name`/`avatar` (`avatar` accepts an https URL or
+        `data:image/(png|jpeg|webp|gif);base64`, ≤256KiB; an empty string clears it). Admins changing another user's profile use
+        `PATCH /v1/admin/users/{id}`. Omitted fields stay unchanged.
+      properties:
+        display_name: { type: string, maxLength: 128 }
+        avatar: { $ref: '#/components/schemas/NullableString' }
+    PasswordChangeRequest:
+      type: object
+      required: [old_password, new_password]
+      properties:
+        old_password: { type: string, format: password }
+        new_password: { type: string, format: password, minLength: 8 }
+    MeResponse:
+      type: object
+      description: '`GET /v1/me`: current identity + online devices + queue depth (client startup snapshot).'
+      properties:
+        user_id: { $ref: '#/components/schemas/Ulid' }
+        username: { type: string }
+        display_name: { $ref: '#/components/schemas/NullableString' }
+        role: { type: string, enum: [admin, ops, user] }
+        device_id: { $ref: '#/components/schemas/Ulid' }
+        node_id: { $ref: '#/components/schemas/Ulid' }
+        online_devices:
+          type: object
+          additionalProperties: { type: string }
+          description: '`{device_id: node_id}` online device mapping.'
+        pending:
+          type: object
+          properties:
+            depth: { type: integer, format: int64 }
+            oldest_seq: { type: integer, format: int64 }
+        server_ts: { $ref: '#/components/schemas/Timestamp' }
+
+    # ------------------------------------------------------------------ Conversations
+    ConversationCreateRequest:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [dm, group, topic]
+          description: 'With `dm`, `member_ids` must contain exactly one user; re-creating the same dm returns the existing conversation (idempotent 200).'
+        name: { type: string, maxLength: 128 }
+        member_ids:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/Ulid' }
+    ConversationMember:
+      type: object
+      required: [user_id, role]
+      properties:
+        user_id: { $ref: '#/components/schemas/Ulid' }
+        role: { type: string, enum: [owner, admin, member] }
+        joined_at: { $ref: '#/components/schemas/Timestamp' }
+    Conversation:
+      type: object
+      required: [id, kind]
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        kind: { type: string, enum: [dm, group, topic] }
+        name: { $ref: '#/components/schemas/NullableString' }
+        owner_id: { $ref: '#/components/schemas/Ulid' }
+        last_seq: { type: integer, format: int64 }
+        last_msg_at: { $ref: '#/components/schemas/Timestamp' }
+        unread:
+          type: integer
+          description: Derived from `read_watermark` and `last_seq`.
+        members: { type: integer, description: Member count. }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    ConversationDetail:
+      type: object
+      description: '`GET /v1/conversations/{id}`: details + member list.'
+      properties:
+        conversation: { $ref: '#/components/schemas/Conversation' }
+        id: { $ref: '#/components/schemas/Ulid' }
+        kind: { type: string, enum: [dm, group, topic] }
+        name: { $ref: '#/components/schemas/NullableString' }
+        members:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationMember' }
+        member_ids:
+          type: array
+          items: { $ref: '#/components/schemas/Ulid' }
+    ConversationPatchRequest:
+      type: object
+      description: Rename (owner/admin member role; `topic` conversations use the topic channel and produce no messages rows).
+      properties:
+        name: { type: string, maxLength: 128 }
+    ConversationReadRequest:
+      type: object
+      required: [seq]
+      description: 'Report the read watermark (idempotent: monotonic max, regressions ignored).'
+      properties:
+        seq: { type: integer, format: int64 }
+    ConversationMembersRequest:
+      type: object
+      required: [user_ids]
+      properties:
+        user_ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: { $ref: '#/components/schemas/Ulid' }
+    ConversationList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Conversation' }
+    ConversationHistory:
+      type: object
+      required: [items]
+      description: Conversation message history (by `seq desc`; `next_cursor.before_seq` is the next-page cursor).
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/MessageMeta' }
+        next_cursor:
+          type: object
+          properties:
+            before_seq: { type: integer, format: int64 }
+
+    # ------------------------------------------------------------------ Messages
+    MessageCreateRequest:
+      type: object
+      required: [conv_id]
+      description: Equivalent to a WS `envelope` frame; the server injects `sender` (any client value is ignored). Request body ≤ 1MB.
+      properties:
+        id:
+          type: string
+          description: Generated by the server (ULID) when omitted; if the body `id` conflicts with `Idempotency-Key`, `id` wins.
+        type:
+          type: string
+          example: json
+          description: The type namespace from design §5.
+        conv_id: { $ref: '#/components/schemas/Ulid' }
+        to_user: { $ref: '#/components/schemas/Ulid' }
+        to_topic: { type: string }
+        to_devices:
+          type: array
+          items: { type: string }
+          description: Targeted delivery (design §17.4-5).
+        encoding: { type: string, enum: [utf8, raw], default: utf8 }
+        ttl_seconds:
+          type: integer
+          description: 0 = never expires (affects the dedup retention period, design §17.5).
+        checksum_sha256: { type: string }
+        content_type: { type: string }
+        payload:
+          type: string
+          description: '`b64:...` inline payload (≤1MB); large objects go through `/v1/uploads`.'
+    RecipientState:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/Ulid' }
+        device: { type: string }
+        state:
+          type: string
+          enum: [persisted, routed, delivered, acked, dropped, expired, dlq]
+    MessageCreated:
+      type: object
+      description: Message acceptance result (201). `seq` is assigned by the server (design §17.2).
+      required: [id, seq, state]
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        conv_id: { $ref: '#/components/schemas/Ulid' }
+        seq: { type: integer, format: int64 }
+        state:
+          type: string
+          enum: [persisted, routed]
+        recipients:
+          type: array
+          items: { $ref: '#/components/schemas/RecipientState' }
+        payload_ref:
+          type: string
+          description: MinIO object key for large-object messages (may be returned by `/v1/uploads/{id}/complete`).
+    DeliveryDevice:
+      type: object
+      properties:
+        device: { type: string }
+        state:
+          type: string
+          enum: [persisted, routed, delivered, acked, dropped, expired, dlq]
+        attempts: { type: integer }
+        last_at: { $ref: '#/components/schemas/Timestamp' }
+        acked_at: { $ref: '#/components/schemas/Timestamp' }
+    DeliverySummary:
+      type: object
+      description: '`delivery_log` summary aggregated per device.'
+      properties:
+        to_user: { $ref: '#/components/schemas/Ulid' }
+        devices:
+          type: array
+          items: { $ref: '#/components/schemas/DeliveryDevice' }
+    MessageMeta:
+      type: object
+      description: Message metadata (GET /v1/messages/{id}; session history uses the same shape).
+      required: [id, seq]
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        conv_id: { $ref: '#/components/schemas/Ulid' }
+        sender: { $ref: '#/components/schemas/Ulid' }
+        env_type: { type: string }
+        content_type: { type: string }
+        size: { type: integer, format: int64 }
+        chunk_total: { type: integer }
+        seq: { type: integer, format: int64 }
+        status:
+          type: string
+          enum: [persisted, routed, delivered, acked, dropped, expired, dlq]
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+        payload_ref: { $ref: '#/components/schemas/NullableString' }
+        has_inline_payload: { type: boolean }
+        delivery_summary: { $ref: '#/components/schemas/DeliverySummary' }
+    ChunkInfo:
+      type: object
+      properties:
+        idx: { type: integer }
+        size: { type: integer, format: int64 }
+        checksum: { type: string, description: Per-chunk xxhash64. }
+        presigned_url: { $ref: '#/components/schemas/NullableString' }
+    ChunksResponse:
+      type: object
+      required: [items]
+      properties:
+        msg_id: { $ref: '#/components/schemas/Ulid' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ChunkInfo' }
+
+    # ------------------------------------------------------------------ Uploads
+    UploadCreateRequest:
+      type: object
+      required: [size, sha256, name]
+      properties:
+        size: { type: integer, format: int64 }
+        sha256:
+          type: string
+          description: '`b64:...` or lowercase hex; the overall value is verified on complete.'
+        name: { type: string, maxLength: 256 }
+        conv_id: { $ref: '#/components/schemas/Ulid' }
+        part_size:
+          type: integer
+          description: Fixed at 8MB (8388608, design §17.6); any other value → 422 FORMAT.
+          example: 8388608
+    UploadPartUrl:
+      type: object
+      properties:
+        part: { type: integer, minimum: 1 }
+        url: { type: string, format: uri }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+    UploadCreated:
+      type: object
+      description: Upload session created (201). Presigned URLs have a 900s TTL; unfinished parts can be reissued via `POST /v1/uploads/{id}/parts`.
+      required: [upload_id, part_size, part_count]
+      properties:
+        upload_id: { $ref: '#/components/schemas/Ulid' }
+        part_size: { type: integer }
+        part_count: { type: integer }
+        part_urls:
+          type: array
+          items: { $ref: '#/components/schemas/UploadPartUrl' }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+    UploadProgress:
+      type: object
+      properties:
+        upload_id: { $ref: '#/components/schemas/Ulid' }
+        size: { type: integer, format: int64 }
+        part_size: { type: integer }
+        part_count: { type: integer }
+        completed_parts:
+          type: array
+          items: { type: integer }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+    UploadCompletedPart:
+      type: object
+      required: [part, etag]
+      properties:
+        part: { type: integer, minimum: 1 }
+        etag: { type: string }
+    UploadCompleteRequest:
+      type: object
+      required: [parts]
+      properties:
+        parts:
+          type: array
+          items: { $ref: '#/components/schemas/UploadCompletedPart' }
+    UploadCompleted:
+      description: Creates a `file` type Envelope and delivers it through the normal path (201).
+      allOf:
+        - $ref: '#/components/schemas/MessageCreated'
+        - type: object
+          properties:
+            payload_ref: { type: string }
+
+    # ------------------------------------------------------------------ Topics / probes
+    TopicSubscription:
+      type: object
+      properties:
+        topic: { type: string }
+        subscribed_at: { $ref: '#/components/schemas/Timestamp' }
+        subscribers: { type: integer, description: Current subscriber count. }
+    TopicUnsubscribeResponse:
+      type: object
+      properties:
+        topic: { type: string }
+        subscribed: { type: boolean, enum: [false] }
+    TopicList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              topic: { type: string }
+              last_offset: { type: integer, format: int64 }
+              unread: { type: integer }
+    TopicHistory:
+      type: object
+      required: [topic, items]
+      properties:
+        topic: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/MessageMeta' }
+    TopicPublishRequest:
+      type: object
+      description: Operational broadcast (role ∈ {admin, ops} only; applications should prefer WS `envelope{to_topic}`).
+      required: [payload]
+      properties:
+        type: { type: string, example: json }
+        payload: { type: string, description: '`b64:...` inline payload.' }
+        content_type: { type: string }
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+    ReadyResponse:
+      type: object
+      required: [ready, deps]
+      properties:
+        ready: { type: boolean }
+        deps:
+          type: object
+          description: Dependency state; `degraded` does not return 503 — only total dependency unavailability does.
+          properties:
+            pg: { type: string, enum: [ok, degraded, down] }
+            redis: { type: string, enum: [ok, degraded, down] }
+            bus: { type: string, enum: [ok, degraded, down] }
+        draining: { type: boolean }
+        node_id: { $ref: '#/components/schemas/Ulid' }
+        version: { type: string, example: 0.5.0 }
+
+    # ------------------------------------------------------------------ Media
+    TurnCredentials:
+      type: object
+      description: |-
+        Short-lived coturn REST API credentials; `enabled=false` (TURN not configured) is not an error — the client falls back to a direct connection/tunnel.
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+        uris:
+          type: array
+          items: { type: string }
+          example: ['turn:turn.example.com:3478?transport=udp']
+        username:
+          type: string
+          description: '`<expiry_unix>:<user_id>` (the authoritative expiry checked by coturn).'
+        credential: { type: string, description: base64(HMAC-SHA1(secret, username)) }
+        ttl: { type: integer, description: Seconds (max 600). }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+    Recording:
+      type: object
+      description: Recording segment metadata (no payload/URL).
+      required: [id]
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        stream_id: { type: string }
+        node_id: { type: string }
+        object_key: { type: string }
+        manifest_key: { $ref: '#/components/schemas/NullableString' }
+        bucket: { type: string }
+        first_seq: { type: integer, format: int64 }
+        last_seq: { type: integer, format: int64 }
+        frames: { type: integer }
+        size_bytes: { type: integer, format: int64 }
+        codec: { $ref: '#/components/schemas/NullableString' }
+        format: { type: string }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        started_at: { $ref: '#/components/schemas/Timestamp' }
+        ended_at: { $ref: '#/components/schemas/Timestamp' }
+    RecordingDetail:
+      description: Recording segment metadata + presigned URL (TTL 300s).
+      allOf:
+        - $ref: '#/components/schemas/Recording'
+        - type: object
+          properties:
+            presigned_url: { type: string, format: uri }
+            download_url: { type: string }
+            manifest_url: { $ref: '#/components/schemas/NullableString' }
+    RecordingList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Recording' }
+        limit: { type: integer }
+        next_before: { $ref: '#/components/schemas/NullableString' }
+    RecordingManifest:
+      type: object
+      description: |-
+        Recording segment frame-index manifest (`format=raw-frames`, `playable=false`): returns only the frame-index JSON,
+        does not return object bytes, and is not directly playable.
+      properties:
+        recording_id: { $ref: '#/components/schemas/Ulid' }
+        format: { type: string, enum: [raw-frames] }
+        playable: { type: boolean, enum: [false] }
+        frames:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    # ------------------------------------------------------------------ Admin API: request bodies
+    AdminUserCreateRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, pattern: '^[A-Za-z0-9_.-]{3,64}$' }
+        password: { type: string, format: password, minLength: 8 }
+        display_name: { type: string, maxLength: 128 }
+        role:
+          type: string
+          enum: [admin, ops, user]
+          default: user
+          description: Defaults to `user` (the legacy `viewer` only degrades to `user` on read paths; writes reject it).
+    AdminUserPatchRequest:
+      type: object
+      required: [reason]
+      description: Update a user profile (display_name/avatar); audit `user.update` (the raw avatar is not recorded).
+      properties:
+        display_name: { type: string, maxLength: 128 }
+        avatar: { $ref: '#/components/schemas/NullableString' }
+        reason: { type: string, minLength: 1, maxLength: 500 }
+    AdminUserPasswordRequest:
+      type: object
+      required: [new_password, reason]
+      description: |-
+        Reset a password (admin only): argon2id rehash + revoke all devices of the user / disconnect WS;
+        returns `{ok, sessions_revoked}` and never echoes the password.
+      properties:
+        new_password: { type: string, format: password, minLength: 8 }
+        reason: { type: string, minLength: 1 }
+    AdminQuotaRequest:
+      type: object
+      properties:
+        msg_per_s: { type: integer, minimum: 1 }
+        bytes_per_s: { type: integer, format: int64, minimum: 1 }
+        topics: { type: integer, minimum: 1 }
+        storage_bytes: { type: integer, format: int64, minimum: 1 }
+        reason: { type: string }
+    AdminRoleChangeRequest:
+      type: object
+      required: [role, reason]
+      description: Change an admin-API role (admin only); writes audit `role.change`; takes effect within one TTL (900s) at most.
+      properties:
+        role: { type: string, enum: [admin, ops, user] }
+        reason: { type: string, minLength: 1 }
+    AdminReasonRequest:
+      type: object
+      description: Minimal request body for admin operations (suspend/resume/revoke, and so on).
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 500 }
+    AdminPurgeRequest:
+      type: object
+      required: [reason, confirm_username]
+      description: Compliance cascade delete; `confirm_username` must match the target username, otherwise 422.
+      properties:
+        reason: { type: string, minLength: 1 }
+        confirm_username: { type: string }
+    AdminDrainRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1 }
+        wait_seconds:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 30
+    AdminQueuePurgeRequest:
+      type: object
+      required: [user, scope, reason]
+      properties:
+        user: { $ref: '#/components/schemas/Ulid' }
+        scope: { type: string, enum: [user, device, topic] }
+        before_ts:
+          type: string
+          format: date-time
+          description: Omitted = purge all pending deliveries in the scope (pure ZREM, no lookup).
+        reason: { type: string, minLength: 1 }
+    AdminReplayRequest:
+      type: object
+      required: [msg_ids, reason]
+      properties:
+        msg_ids:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/Ulid' }
+        reason: { type: string, minLength: 1 }
+    AdminPluginActionRequest:
+      type: object
+      required: [ns, version, action, reason]
+      properties:
+        ns: { type: string }
+        version: { type: string }
+        action: { type: string, enum: [publish, rollback, canary] }
+        ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 'Canary ratio when `action=canary`.'
+        reason: { type: string, minLength: 1 }
+    AdminWasmReloadRequest:
+      type: object
+      properties:
+        source:
+          type: string
+          enum: [all, dir, pg]
+          default: all
+    AdminFormatUpsertRequest:
+      type: object
+      required: [name, reason]
+      properties:
+        name: { type: string }
+        mime: { type: string }
+        detect_rules:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        parser: { type: string }
+        signed: { type: boolean }
+        reason: { type: string, minLength: 1 }
+    AdminConfigPatchRequest:
+      type: object
+      required: [reason]
+      properties:
+        ratelimit:
+          type: object
+          additionalProperties: true
+        plugins_enabled: { type: boolean }
+        canary:
+          type: object
+          additionalProperties: true
+        reason: { type: string, minLength: 1 }
+    AdminKeyRotateRequest:
+      type: object
+      required: [target, reason]
+      description: |-
+        Key rotation (dual-key overlap window `[auth] key_overlap_hours`, 24h by default). `target=jwt` really generates
+        2048-bit RSA, writes to disk atomically, and hot-swaps; `kek`/`internal_ca` are currently `implemented=false`.
+      properties:
+        target: { type: string, enum: [jwt, kek, internal_ca] }
+        reason: { type: string, minLength: 1 }
+
+    # ------------------------------------------------------------------ Admin API: response bodies
+    AdminUser:
+      description: Admin-API user view (includes quota and online device count; excludes password_hash).
+      allOf:
+        - $ref: '#/components/schemas/UserPublic'
+        - type: object
+          properties:
+            devices: { type: integer }
+            online_devices: { type: integer }
+    AdminUserPage:
+      description: User search (offset-based pagination, §8.2).
+      allOf:
+        - $ref: '#/components/schemas/PageEnvelope'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/AdminUser' }
+    AdminDevice:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        user_id: { $ref: '#/components/schemas/Ulid' }
+        name: { $ref: '#/components/schemas/NullableString' }
+        platform: { $ref: '#/components/schemas/NullableString' }
+        fingerprint: { type: string }
+        last_seen: { $ref: '#/components/schemas/Timestamp' }
+        revoked_at: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminDevicePage:
+      allOf:
+        - $ref: '#/components/schemas/PageEnvelope'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/AdminDevice' }
+    AdminUserPasswordResponse:
+      type: object
+      properties:
+        ok: { type: boolean }
+        sessions_revoked: { type: integer }
+    AdminPurgeProgress:
+      type: object
+      description: Compliance deletion task progress (per-store counts for PG/MinIO/Redis).
+      properties:
+        task_id: { $ref: '#/components/schemas/Ulid' }
+        state: { type: string, enum: [running, done, failed] }
+        user_id: { $ref: '#/components/schemas/Ulid' }
+        pg_deleted: { type: integer, format: int64 }
+        minio_deleted: { type: integer, format: int64 }
+        redis_deleted: { type: integer, format: int64 }
+        started_at: { $ref: '#/components/schemas/Timestamp' }
+        finished_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminDrainStatus:
+      type: object
+      description: Drain progress (including the byef count sent).
+      properties:
+        draining: { type: boolean }
+        node_id: { type: string }
+        remaining_connections: { type: integer }
+        byef_sent: { type: integer }
+        wait_seconds: { type: integer }
+        started_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminQueuePurgeResponse:
+      type: object
+      properties:
+        removed: { type: integer, format: int64 }
+        scanned: { type: integer, format: int64 }
+    AdminReplayResponse:
+      type: object
+      properties:
+        accepted:
+          type: array
+          items: { $ref: '#/components/schemas/Ulid' }
+        rejected:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { $ref: '#/components/schemas/Ulid' }
+              reason: { type: string }
+    AdminNode:
+      type: object
+      properties:
+        node_id: { type: string }
+        version: { type: string }
+        connections: { type: integer }
+        health: { type: string, enum: [ok, degraded, down] }
+        heartbeat_at: { $ref: '#/components/schemas/Timestamp' }
+        local: { type: boolean }
+    AdminNodeList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminNode' }
+        total: { type: integer }
+    AdminOnlineDevice:
+      type: object
+      properties:
+        device: { type: string }
+        node: { type: string }
+        protocol: { type: string, example: ws }
+        connected_at: { $ref: '#/components/schemas/Timestamp' }
+        duration_s: { type: integer }
+        remote_ip: { type: string }
+        caps: { $ref: '#/components/schemas/Capabilities' }
+    AdminOnlineResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/Ulid' }
+        devices:
+          type: array
+          items: { $ref: '#/components/schemas/AdminOnlineDevice' }
+    AdminOnlineStats:
+      type: object
+      description: 'Aggregated online statistics; same figures as the SSE `online` event (computing them separately is forbidden).'
+      properties:
+        online_users: { type: integer }
+        online_devices: { type: integer }
+        by_protocol:
+          type: object
+          additionalProperties: { type: integer }
+        by_node:
+          type: object
+          additionalProperties: { type: integer }
+        node_id: { type: string }
+        uptime_s: { type: integer, format: int64 }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminQueueInfo:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/Ulid' }
+        scope: { type: string, enum: [user, device, topic] }
+        depth: { type: integer, format: int64 }
+        oldest_seq: { type: integer, format: int64 }
+        oldest_ts: { $ref: '#/components/schemas/Timestamp' }
+    AdminConversation:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        kind: { type: string, enum: [dm, group, topic] }
+        name: { $ref: '#/components/schemas/NullableString' }
+        owner_id: { $ref: '#/components/schemas/Ulid' }
+        members: { type: integer }
+        messages: { type: integer, format: int64 }
+        last_msg_at: { $ref: '#/components/schemas/Timestamp' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminConversationPage:
+      allOf:
+        - $ref: '#/components/schemas/PageEnvelope'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/AdminConversation' }
+    AdminMessagePage:
+      allOf:
+        - $ref: '#/components/schemas/PageEnvelope'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/MessageMeta' }
+    AdminDeliveryDetail:
+      type: object
+      description: Delivery detail (`delivery_log` all-device view).
+      properties:
+        message_id: { $ref: '#/components/schemas/Ulid' }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              user: { $ref: '#/components/schemas/Ulid' }
+              device: { type: string }
+              state: { type: string }
+              attempts: { type: integer }
+              last_at: { $ref: '#/components/schemas/Timestamp' }
+              acked_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminDlqPage:
+      allOf:
+        - $ref: '#/components/schemas/PageEnvelope'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                type: object
+                additionalProperties: true
+    AdminPluginInfo:
+      type: object
+      properties:
+        ns: { type: string }
+        version: { type: string }
+        status: { type: string, enum: [published, canary, rolled_back, disabled] }
+        canary_ratio: { type: number }
+        invocations: { type: integer, format: int64 }
+        failures: { type: integer, format: int64 }
+        avg_latency_ms: { type: number }
+    AdminPluginList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminPluginInfo' }
+        wasm:
+          type: object
+          description: 'WASM host state (added in v0.18; the original items fields are unchanged).'
+          additionalProperties: true
+    AdminPluginStats:
+      type: object
+      properties:
+        ns: { type: string }
+        window: { type: string, example: 1h }
+        invocations: { type: integer, format: int64 }
+        failures: { type: integer, format: int64 }
+        failure_rate: { type: number }
+        latency_ms:
+          type: object
+          properties:
+            p50: { type: number }
+            p95: { type: number }
+            p99: { type: number }
+        memory_peak_bytes: { type: integer, format: int64 }
+    AdminWasmReloadResponse:
+      type: object
+      description: WASM plugin hot-reload result (atomic rebuild + one swap; the old snapshot is kept on failure).
+      properties:
+        loaded: { type: integer }
+        from_dir: { type: integer }
+        from_pg: { type: integer }
+        rejected: { type: integer }
+        conflicts: { type: integer }
+        generation: { type: integer, format: int64 }
+        elapsed_ms: { type: integer, format: int64 }
+    AdminWasmInvokeRequest:
+      type: object
+      required: [input_b64]
+      properties:
+        input_b64: { type: string, description: Base64-encoded input. }
+        entry: { type: string }
+    AdminWasmInvokeResponse:
+      type: object
+      properties:
+        output_b64: { type: string }
+        output_bytes: { type: integer, format: int64 }
+        elapsed_ms: { type: integer, format: int64 }
+        plugin: { type: string }
+        version: { type: string }
+        entry: { type: string }
+        fuel_used: { type: integer, format: int64 }
+    AdminFormatList:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    AdminConfigSnapshot:
+      type: object
+      description: Dynamic config snapshot (read-only with source markers).
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              value: {}
+              source: { type: string, enum: [pg, toml, env] }
+        config:
+          type: object
+          additionalProperties: true
+    AdminKeyRotateResponse:
+      type: object
+      description: |-
+        `target=jwt` returns a real rotation result; `kek`/`internal_ca` are currently `implemented=false,
+        status=not_implemented`. A read-only key directory → 500 INTERNAL + `details.reason=key_dir_readonly`.
+      properties:
+        implemented: { type: boolean }
+        status: { type: string, enum: [rotated, not_implemented] }
+        algorithm: { type: string, enum: [RS256] }
+        key_bits: { type: integer }
+        rotated_at: { $ref: '#/components/schemas/Timestamp' }
+        previous_until: { $ref: '#/components/schemas/Timestamp' }
+        overlap_hours: { type: integer }
+        current_fingerprint: { type: string }
+        previous_fingerprint: { $ref: '#/components/schemas/NullableString' }
+    AdminKeyInfo:
+      type: object
+      properties:
+        fingerprint: { type: string }
+        role: { type: string, enum: [current, previous] }
+        rotated_at: { $ref: '#/components/schemas/Timestamp' }
+        until: { $ref: '#/components/schemas/Timestamp' }
+        active: { type: boolean }
+    AdminKeysResponse:
+      type: object
+      description: Key fingerprints and validity windows (**private keys are not returned**).
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminKeyInfo' }
+        overlap_hours: { type: integer }
+        rotated_at: { $ref: '#/components/schemas/Timestamp' }
+        previous_until: { $ref: '#/components/schemas/Timestamp' }
+        current: { type: string }
+        previous: { $ref: '#/components/schemas/NullableString' }
+    AdminAuditItem:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        actor: { type: string }
+        action: { type: string }
+        target: { type: string }
+        detail: {}
+        ip: { type: string }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+    AdminAuditPage:
+      allOf:
+        - $ref: '#/components/schemas/PageEnvelope'
+        - type: object
+          properties:
+            items:
+              type: array
+              items: { $ref: '#/components/schemas/AdminAuditItem' }
+
+    # ------------------------------------------------------------------ Plugin hub (user-facing)
+    HubOwner:
+      type: object
+      properties:
+        id: { $ref: '#/components/schemas/Ulid' }
+        username: { type: string }
+        display_name: { $ref: '#/components/schemas/NullableString' }
+    HubPluginSummary:
+      type: object
+      required: [plugin_id, name]
+      properties:
+        plugin_id: { type: string, pattern: '^[a-z0-9][a-z0-9._-]{1,63}$' }
+        name: { type: string }
+        description: { type: string }
+        icon: { type: string }
+        category: { type: string }
+        tags:
+          type: array
+          maxItems: 8
+          items: { type: string, maxLength: 24 }
+        owner: { $ref: '#/components/schemas/HubOwner' }
+        latest_version: { type: string }
+        size: { type: integer, format: int64 }
+        downloads: { type: integer, format: int64 }
+        versions_count: { type: integer }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+        installed: { type: boolean }
+        installed_version: { $ref: '#/components/schemas/NullableString' }
+        update_available: { type: boolean }
+        has_source:
+          type: boolean
+          description: Whether the latest version has a source package (per-version truth is in the detail versions[]).
+        install_enabled: { type: boolean, description: Null when not installed. }
+    HubVersion:
+      type: object
+      required: [version]
+      properties:
+        version: { type: string }
+        asset_name: { type: string }
+        size: { type: integer, format: int64 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        changelog: { type: string }
+        manifest:
+          type: object
+          additionalProperties: true
+          description: Manifest snapshot submitted by the publisher (consistency with the plugin.json inside the package is verified by the installer as a fallback).
+        downloads: { type: integer, format: int64 }
+        published_at: { $ref: '#/components/schemas/Timestamp' }
+        has_source: { type: boolean }
+        source_asset_name: { $ref: '#/components/schemas/NullableString' }
+        source_size: { type: integer, format: int64 }
+        source_sha256: { $ref: '#/components/schemas/NullableString' }
+    HubInstallRef:
+      type: object
+      description: '`my_install` is always present and is null when not installed.'
+      properties:
+        version: { type: string }
+        enabled: { type: boolean }
+        data_rev: { type: integer, format: int64 }
+        data_updated_at: { $ref: '#/components/schemas/Timestamp' }
+    HubPluginDetail:
+      description: Plugin details (`versions` contains published versions only, ordered by published_at desc).
+      allOf:
+        - $ref: '#/components/schemas/HubPluginSummary'
+        - type: object
+          properties:
+            readme: { type: string }
+            created_at: { $ref: '#/components/schemas/Timestamp' }
+            versions:
+              type: array
+              items: { $ref: '#/components/schemas/HubVersion' }
+            my_install:
+              oneOf:
+                - $ref: '#/components/schemas/HubInstallRef'
+                - type: 'null'
+    HubPluginPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HubPluginSummary' }
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+    HubSourceDeclaration:
+      type: object
+      required: [asset_name, size, sha256]
+      description: Source package declaration for this version (omitted = no source; once declared it cannot change during the lifecycle).
+      properties:
+        asset_name: { type: string, maxLength: 128, description: '`.zip` file name; path separators are forbidden.' }
+        size: { type: integer, format: int64, minimum: 1, maximum: 52428800 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    HubPublishRequest:
+      type: object
+      required: [plugin_id, version, name, asset_name, size, sha256, manifest]
+      description: 'Publish (create plugin / add version). Two-step: metadata first (201 draft), then upload the package body with `PUT .../blob`.'
+      properties:
+        plugin_id: { type: string, pattern: '^[a-z0-9][a-z0-9._-]{1,63}$' }
+        version: { type: string, description: Semver (design §17.16). }
+        name: { type: string, maxLength: 64 }
+        description: { type: string, maxLength: 500 }
+        readme: { type: string, description: '≤16KiB; omitting it in later versions keeps the existing readme.' }
+        icon: { type: string, maxLength: 512 }
+        category: { type: string, default: other }
+        tags:
+          type: array
+          maxItems: 8
+          items: { type: string, maxLength: 24 }
+        changelog: { type: string, maxLength: 2000 }
+        asset_name: { type: string, description: Installation package file name (path separators forbidden). }
+        size: { type: integer, format: int64, minimum: 1, maximum: 20971520 }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        manifest:
+          type: object
+          additionalProperties: true
+          description: '`manifest.id` must equal `plugin_id`, and `manifest.version` must equal `version`.'
+        source: { $ref: '#/components/schemas/HubSourceDeclaration' }
+    HubUploadTarget:
+      type: object
+      properties:
+        method: { type: string, enum: [PUT] }
+        path: { type: string }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        max_bytes: { type: integer, format: int64 }
+        expires_at: { $ref: '#/components/schemas/Timestamp' }
+    HubVersionDraft:
+      type: object
+      properties:
+        version: { type: string }
+        status: { type: string, enum: [pending, published, removed] }
+        size: { type: integer, format: int64 }
+        sha256: { type: string }
+        has_source: { type: boolean }
+        source_asset_name: { $ref: '#/components/schemas/NullableString' }
+        source_size: { type: integer, format: int64 }
+        source_sha256: { $ref: '#/components/schemas/NullableString' }
+    HubPublishResponse:
+      type: object
+      description: |-
+        Publish draft (201) / idempotent retry (200). `idempotent_reused=true` (retry when the same version and sha were not uploaded)
+        or `idempotent=true` (the same version and sha are already published, `upload:null`).
+      properties:
+        plugin: { $ref: '#/components/schemas/HubPluginSummary' }
+        version: { $ref: '#/components/schemas/HubVersionDraft' }
+        upload:
+          oneOf:
+            - $ref: '#/components/schemas/HubUploadTarget'
+            - type: 'null'
+        source_upload:
+          oneOf:
+            - $ref: '#/components/schemas/HubUploadTarget'
+            - type: 'null'
+        idempotent_reused: { type: boolean }
+        idempotent: { type: boolean }
+    HubBlobUploadResponse:
+      type: object
+      properties:
+        plugin_id: { type: string }
+        version: { type: string }
+        status: { type: string, enum: [published] }
+        sha256: { type: string }
+        size: { type: integer, format: int64 }
+        published_at: { $ref: '#/components/schemas/Timestamp' }
+        download_path: { type: string }
+    HubSourceUploadResponse:
+      type: object
+      properties:
+        plugin_id: { type: string }
+        version: { type: string }
+        status: { type: string, enum: [published] }
+        source_asset_name: { type: string }
+        source_size: { type: integer, format: int64 }
+        source_sha256: { type: string }
+        download_path: { type: string }
+        idempotent: { type: boolean }
+    HubInstall:
+      type: object
+      required: [plugin_id]
+      properties:
+        plugin_id: { type: string }
+        version: { type: string }
+        enabled: { type: boolean }
+        data_rev: { type: integer, format: int64 }
+        data_updated_at: { $ref: '#/components/schemas/Timestamp' }
+        last_device: { $ref: '#/components/schemas/NullableString' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+        plugin:
+          oneOf:
+            - type: object
+              properties:
+                name: { type: string }
+                icon: { type: string }
+                latest_version: { type: string }
+            - type: 'null'
+        data:
+          type: object
+          additionalProperties: true
+          description: Returned only with `?include_data=1`.
+    HubInstallPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HubInstall' }
+    HubInstallUpsertRequest:
+      type: object
+      description: |-
+        Install record upsert (idempotent, per user). With `data` omitted, only version/enabled are updated; when `data` is present,
+        `data_rev` is required (0 for new records), and a mismatch with the server → 409 `data_conflict`; `?force=1` overrides explicitly.
+      properties:
+        version: { type: string }
+        enabled: { type: boolean }
+        data:
+          type: object
+          additionalProperties: true
+          description: Plugin data snapshot (JSON, ≤256KiB).
+        data_rev: { type: integer, format: int64 }
+        device_id: { type: string }
+    HubStats:
+      type: object
+      properties:
+        plugins: { type: integer }
+        versions: { type: integer }
+        installs: { type: integer }
+        downloads_total: { type: integer, format: int64 }
+        storage_bytes:
+          type: integer
+          format: int64
+          description: Sum of `hub_plugin_versions.size` (display value; may briefly diverge from actual bucket usage).
+        top:
+          type: array
+          items:
+            type: object
+            properties:
+              plugin_id: { type: string }
+              name: { type: string }
+              downloads: { type: integer, format: int64 }
+        recent:
+          type: array
+          items:
+            type: object
+            properties:
+              plugin_id: { type: string }
+              version: { type: string }
+              published_at: { $ref: '#/components/schemas/Timestamp' }
+
+paths:
+  # ==========================================================================
+  # §6 Probes (no authentication)
+  # ==========================================================================
+  /v1/health:
+    get:
+      tags: [probes]
+      operationId: health
+      summary: Liveness probe (200 while the process responds; dependencies not probed)
+      description: ⑤ §6. Does not check PG/Redis/bus; returns 200 as long as the process is alive.
+      security: []
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+      x-doc-ref: '⑤ §6'
+
+  /v1/ready:
+    get:
+      tags: [probes]
+      operationId: ready
+      summary: Readiness probe (PG/Redis/bus health checks)
+      description: |-
+        ⑤ §6. Any unavailable dependency returns 503 with `details.dep`; `degraded` (for example Redis degradation) does not return 503.
+        Draining (SIGTERM / drain) returns 503 immediately (`details.reason=draining`), so the LB removes the node from rotation.
+      security: []
+      responses:
+        '200':
+          description: Ready (dependencies available or degraded).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadyResponse' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+      x-doc-ref: '⑤ §6'
+
+  # ==========================================================================
+  # §1 Auth
+  # ==========================================================================
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: authLogin
+      summary: Username/password login (issues access JWT + refresh token)
+      description: |-
+        ⑤ §1.1. Rate limiting: 10/min per IP and 5/min per account (failed attempts counted, exponential lockout up to 15min).
+        A device fingerprint mismatch creates a new device record; when `device_fp` is omitted, the server generates one and returns it in
+        `device.fingerprint` (the client must report it verbatim in the WS `hello`). Writes audit `login`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Login succeeded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §1.1'
+      x-idempotency: supported
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: authRefresh
+      summary: Refresh access JWT + rotate refresh token
+      description: |-
+        ⑤ §1.2. **Rotation semantics**: reusing the same refresh token returns 409 `CONFLICT` and revokes the entire
+        refresh chain (a sign of theft); a device fingerprint mismatch → 401 (forced re-login). The refresh token may be passed in the body
+        or in `Authorization: Bearer`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: Refresh succeeded (new refresh + access tokens).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §1.2'
+      x-idempotency: rotation_not_supported
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: authLogout
+      summary: Logout (revokes the current refresh token)
+      description: ⑤ §1.3. Revokes the current device refresh (`devices.revoked_at`); repeat calls on a revoked token still return 204.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Logged out (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §1.3'
+      x-idempotency: supported
+
+  # ==========================================================================
+  # §2 Users and devices
+  # ==========================================================================
+  /v1/me:
+    get:
+      tags: [users]
+      operationId: me
+      summary: Current identity snapshot (user / device / online devices / queue depth)
+      description: ⑤ §2. Client startup snapshot; v0.14 added `username`/`display_name`.
+      responses:
+        '200':
+          description: Current identity.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §2'
+
+  /v1/users/me:
+    get:
+      tags: [users]
+      operationId: getUsersMe
+      summary: My profile (role / display_name / updated_at)
+      description: ⑤ §2. Does not return `password_hash`.
+      responses:
+        '200':
+          description: My profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPublic' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §2'
+    patch:
+      tags: [users]
+      operationId: patchUsersMe
+      summary: Update my display_name / avatar
+      description: |-
+        ⑤ §2. An empty string clears a field; avatar accepts an https URL or `data:image/(png|jpeg|webp|gif);base64`
+        (≤256KiB). Writes audit `self.update` (the raw avatar is not recorded).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserPatchRequest' }
+      responses:
+        '200':
+          description: Updated profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPublic' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §2'
+      x-idempotency: supported
+
+  /v1/users/me/password:
+    post:
+      tags: [users]
+      operationId: changeOwnPassword
+      summary: Change my password
+      description: |-
+        ⑤ §2. Verifies the old password, rehashes with argon2id, and **keeps the current device while revoking all others**; a wrong old password returns
+        422 (`details.reason=old_password`; not 401, to avoid false session-expiry signals). Writes audit `self.password_change`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordChangeRequest' }
+      responses:
+        '200':
+          description: Changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkOk' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §2'
+      x-idempotency: supported
+
+  /v1/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: User ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [users]
+      operationId: getUser
+      summary: User profile + capability declarations + quota (self / admin)
+      description: ⑤ §2. `capabilities` are declarations, not guarantees (authoritative device capabilities come from `hello.caps`).
+      responses:
+        '200':
+          description: User profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPublic' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §2'
+    patch:
+      tags: [users]
+      operationId: patchUser
+      summary: 'Partially update a user (self: display_name / capabilities only)'
+      description: ⑤ §2. Admin changes to other users' profiles go through `PATCH /v1/admin/users/{id}` (reason required).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserPatchRequest' }
+      responses:
+        '200':
+          description: Updated profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPublic' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §2'
+      x-idempotency: supported
+
+  /v1/users/{id}/devices:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: User ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [users]
+      operationId: listUserDevices
+      summary: Device list (revoked_at null means active)
+      description: ⑤ §2. Readable by the owner / admin.
+      responses:
+        '200':
+          description: Device list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeviceInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §2'
+
+  /v1/devices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Device ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    delete:
+      tags: [users]
+      operationId: revokeOwnDevice
+      summary: Revoke a device token (remote logout)
+      description: ⑤ §2. Returns 204 on success; repeat revocations are treated as idempotent.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Revoked (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §2'
+      x-idempotency: supported
+
+  # ==========================================================================
+  # §3 Conversations
+  # ==========================================================================
+  /v1/conversations:
+    post:
+      tags: [conversations]
+      operationId: createConversation
+      summary: Create a conversation / group (repeated dm creation idempotently returns the existing conversation)
+      description: ⑤ §3. With `kind=dm`, `member_ids` must contain exactly one user; repeat calls return the existing conversation (200).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationCreateRequest' }
+      responses:
+        '200':
+          description: Already exists (dm idempotent path only).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §3'
+      x-idempotency: supported
+    get:
+      tags: [conversations]
+      operationId: listConversations
+      summary: Conversations I belong to (with last_seq / unread)
+      description: ⑤ §3. `unread` is derived from `read_watermark` and `last_seq`.
+      responses:
+        '200':
+          description: Conversation list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §3'
+
+  /v1/conversations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Conversation ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [conversations]
+      operationId: getConversation
+      summary: Conversation details + members
+      description: ⑤ §3. Non-members → 403 with `details.reason=not_member`.
+      responses:
+        '200':
+          description: Conversation details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §3'
+    patch:
+      tags: [conversations]
+      operationId: renameConversation
+      summary: Rename (owner / admin member role)
+      description: ⑤ §3.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationPatchRequest' }
+      responses:
+        '200':
+          description: Updated conversation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Conversation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §3'
+      x-idempotency: supported
+
+  /v1/conversations/{id}/read:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Conversation ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [conversations]
+      operationId: markConversationRead
+      summary: 'Report the read watermark (idempotent: monotonic max, regressions ignored)'
+      description: ⑤ §3.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationReadRequest' }
+      responses:
+        '200':
+          description: Reported.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkOk' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §3'
+      x-idempotency: supported
+
+  /v1/conversations/{id}/members:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Conversation ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [conversations]
+      operationId: addConversationMembers
+      summary: Add a member (owner)
+      description: ⑤ §3.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConversationMembersRequest' }
+      responses:
+        '200':
+          description: Added.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationDetail' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §3'
+      x-idempotency: supported
+
+  /v1/conversations/{id}/members/{uid}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Conversation ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+      - name: uid
+        in: path
+        required: true
+        description: ULID of the user being removed.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    delete:
+      tags: [conversations]
+      operationId: removeConversationMember
+      summary: Remove a member (owner, or self leaving)
+      description: ⑤ §3.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Removed (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §3'
+      x-idempotency: supported
+
+  /v1/conversations/{id}/messages:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Conversation ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [conversations]
+      operationId: conversationHistory
+      summary: Paged conversation history (seq desc, half-open interval)
+      description: '⑤ §3 / §0.4. `before_seq`/`after_seq` exclude the boundary; `limit` is 1..200, default 50.'
+      parameters:
+        - $ref: '#/components/parameters/BeforeSeq'
+        - $ref: '#/components/parameters/AfterSeq'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: History page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationHistory' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §3'
+
+  # ==========================================================================
+  # §4 Messages
+  # ==========================================================================
+  /v1/messages:
+    post:
+      tags: [messages]
+      operationId: sendMessage
+      summary: HTTP upstream for small messages (≤1MB, semantically equivalent to a WS envelope)
+      description: |-
+        ⑤ §4.1. The server injects `sender` (any client-supplied `sender` is ignored and audited); `seq` is assigned by the server
+        and a request body >1MB returns 413 `TOO_LARGE` + `details.hint=use_ws_or_chunk`.
+        Supports `Idempotency-Key` or a body `id` (when both conflict, `id` wins).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MessageCreateRequest' }
+      responses:
+        '201':
+          description: Message accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §4.1'
+      x-idempotency: supported
+
+  /v1/messages/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [messages]
+      operationId: getMessageMeta
+      summary: Message metadata + delivery summary
+      description: ⑤ §4.2. `delivery_summary` is a `delivery_log` summary aggregated per device.
+      responses:
+        '200':
+          description: Message metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageMeta' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §4.2'
+
+  /v1/messages/{id}/download:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Message ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [messages]
+      operationId: downloadMessagePayload
+      summary: Download a message payload (200 for small messages, 302 presigned for large objects)
+      description: |-
+        ⑤ §4.3. Small messages (≤1MB) return the payload directly with 200 (`Content-Type` matches the envelope,
+        `Content-Disposition: attachment`); large objects return 302 → MinIO presigned URL (TTL 900s);
+        `inspectable` mode is denied by default (requires an explicit admin action plus an audit trail).
+      responses:
+        '200':
+          description: Inline payload bytes.
+          headers:
+            Content-Disposition:
+              description: '`attachment`'
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '302':
+          description: Redirect to a MinIO presigned URL (TTL 900s).
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §4.3'
+
+  /v1/chunks/{msg_id}:
+    parameters:
+      - name: msg_id
+        in: path
+        required: true
+        description: Message ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [messages]
+      operationId: fetchMissingChunks
+      summary: Server-side chunk recovery (retransmission list for missing chunks)
+      description: |-
+        ⑤ §4.4. `?missing=3,7` selects missing chunk indexes (omitted = all); returns a chunk inventory
+        of `{idx, size, checksum, presigned_url?}`, or reuses the WS `chunk` downstream.
+        Chunk envelopes are not stored in `messages` and are not assigned a `seq`.
+      parameters:
+        - name: missing
+          in: query
+          required: false
+          description: Missing chunk index list (comma-separated).
+          schema:
+            type: array
+            items: { type: integer, minimum: 0 }
+          style: form
+          explode: false
+      responses:
+        '200':
+          description: Chunk inventory.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChunksResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §4.4'
+
+  # ==========================================================================
+  # §5 Uploads (large objects / MinIO Multipart)
+  # ==========================================================================
+  /v1/uploads:
+    post:
+      tags: [uploads]
+      operationId: createUpload
+      summary: Request an upload session (issues presigned part URLs)
+      description: |-
+        ⑤ §5.1. `part_size` is fixed at 8MB (any other value → 422); presigned URLs have a 900s TTL and after expiry can be
+        reissued for unfinished parts via `POST /v1/uploads/{id}/parts` (idempotent).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UploadCreateRequest' }
+      responses:
+        '201':
+          description: Upload session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §5.1'
+      x-idempotency: supported
+
+  /v1/uploads/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Upload session ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [uploads]
+      operationId: getUploadProgress
+      summary: Query upload progress (completed parts) → resumable upload
+      description: ⑤ §5.3. Readable only by the session creator and admin.
+      responses:
+        '200':
+          description: Upload progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadProgress' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §5.3'
+    delete:
+      tags: [uploads]
+      operationId: abortUpload
+      summary: Abort an upload (cleans up uploaded parts)
+      description: ⑤ §5.3.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Aborted (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §5.3'
+      x-idempotency: supported
+
+  /v1/uploads/{id}/complete:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Upload session ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [uploads]
+      operationId: completeUpload
+      summary: Complete an upload (merge parts, create a file Envelope, and deliver it)
+      description: |-
+        ⑤ §5.2. Completion verifies the overall `sha256`; a mismatch → 422 FORMAT and the object is deleted;
+        success returns 201 and creates a `file` type Envelope (`payload_ref`) delivered through the normal path.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UploadCompleteRequest' }
+      responses:
+        '201':
+          description: Upload completed and delivered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadCompleted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §5.2'
+      x-idempotency: supported
+
+  /v1/uploads/{id}/parts:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Upload session ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [uploads]
+      operationId: reissueUploadParts
+      summary: Reissue presigned URLs for unfinished parts (idempotent)
+      description: ⑤ §5.3. Refreshes the upload session TTL and issues URLs only for unfinished parts.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: New part URLs.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadCreated' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §5.3'
+      x-idempotency: supported
+
+  # ==========================================================================
+  # §7 Topic subscriptions and broadcasts
+  # ==========================================================================
+  /v1/topics:
+    get:
+      tags: [topics]
+      operationId: listTopics
+      summary: My subscriptions + unread offset deltas
+      description: ⑤ §7. Subscriptions are `conversation_members` rows for `conversations(kind='topic')`.
+      responses:
+        '200':
+          description: Subscription list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TopicList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §7'
+
+  /v1/topics/{t}/subscribe:
+    parameters:
+      - name: t
+        in: path
+        required: true
+        description: Topic name.
+        schema: { type: string }
+    post:
+      tags: [topics]
+      operationId: subscribeTopic
+      summary: Subscribe to a topic (idempotent, 200)
+      description: ⑤ §7. Subscription cap is 100 per user (429 `details.reason=topic_quota`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Subscribed (repeat calls return the current state).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TopicSubscription' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §7'
+      x-idempotency: supported
+
+  /v1/topics/{t}/unsubscribe:
+    parameters:
+      - name: t
+        in: path
+        required: true
+        description: Topic name.
+        schema: { type: string }
+    post:
+      tags: [topics]
+      operationId: unsubscribeTopic
+      summary: Unsubscribe from a topic (idempotent)
+      description: ⑤ §7.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Unsubscribed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TopicUnsubscribeResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §7'
+      x-idempotency: supported
+
+  /v1/topics/{t}/history:
+    parameters:
+      - name: t
+        in: path
+        required: true
+        description: Topic name.
+        schema: { type: string }
+    get:
+      tags: [topics]
+      operationId: topicHistory
+      summary: Broadcast history replay (by (user, topic) watermark)
+      description: '⑤ §7. `?after_offset=&limit=` (design §18 D6: watermark per user per topic by default).'
+      parameters:
+        - name: after_offset
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: History page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TopicHistory' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §7'
+
+  /v1/topics/{t}/publish:
+    parameters:
+      - name: t
+        in: path
+        required: true
+        description: Topic name.
+        schema: { type: string }
+    post:
+      tags: [topics]
+      operationId: publishTopic
+      summary: Operational broadcast (admin / ops only)
+      description: ⑤ §7. Applications should prefer WS `envelope{to_topic}`; this endpoint is for operational broadcasts (such as maintenance notices).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TopicPublishRequest' }
+      responses:
+        '200':
+          description: Published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { $ref: '#/components/schemas/Ulid' }
+                  topic: { type: string }
+                  seq: { type: integer, format: int64 }
+                  state:
+                    type: string
+                    enum: [persisted, routed]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §7'
+      x-idempotency: supported
+
+  # ==========================================================================
+  # §8 Admin API (RBAC required throughout; dangerous operations must carry a reason field and write audit_log)
+  # ==========================================================================
+  # ---- §8.1 Online status and nodes -------------------------------------------
+  /v1/admin/online:
+    get:
+      tags: [admin]
+      operationId: adminOnline
+      summary: Online status (device → node, connection age, protocol, remote IP summary)
+      description: '⑤ §8.1. Role: user (read-only).'
+      parameters:
+        - name: user
+          in: query
+          required: false
+          description: Filter by user ULID.
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: device
+          in: query
+          required: false
+          description: Filter by device ID.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Online status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminOnlineResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.1'
+
+  /v1/admin/online/stats:
+    get:
+      tags: [admin]
+      operationId: adminOnlineStats
+      summary: Online aggregates (users / devices / by protocol / by node)
+      description: '⑤ §8.1. Same figures as the SSE `online` event (shared constructor).'
+      responses:
+        '200':
+          description: Aggregate statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminOnlineStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.1'
+
+  /v1/admin/nodes:
+    get:
+      tags: [admin]
+      operationId: adminNodes
+      summary: Node list (version / connections / heartbeat / health)
+      description: '⑤ §8.1. Role: user (read-only).'
+      responses:
+        '200':
+          description: Node list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminNodeList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.1'
+
+  /v1/admin/nodes/{id}/drain:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Node ID (`state.node_id`).
+        schema: { type: string }
+    post:
+      tags: [admin]
+      operationId: adminNodeDrainStart
+      summary: Drain a node from rotation (returns task id / 202)
+      description: |-
+        ⑤ §8.1. Role: ops. Setting draining → this node sends `byef{reason=shutdown}` to all online connections,
+        `/v1/ready` turns 503, and `/v1/ws` rejects new connections (503 + `details.reason=draining`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminDrainRequest' }
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDrainStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.1'
+      x-idempotency: supported
+    get:
+      tags: [admin]
+      operationId: adminNodeDrainProgress
+      summary: Drain progress (remaining connections / byef count)
+      description: '⑤ §8.1. Role: user (read-only).'
+      responses:
+        '200':
+          description: Drain progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDrainStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §8.1'
+
+  /v1/admin/queue:
+    get:
+      tags: [admin]
+      operationId: adminQueue
+      summary: Offline queue depth / age of the oldest message
+      description: '⑤ §8.1. Role: user (read-only).'
+      parameters:
+        - name: user
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, enum: [user, device, topic] }
+      responses:
+        '200':
+          description: Queue information.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminQueueInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.1'
+
+  /v1/admin/queue/purge:
+    post:
+      tags: [admin]
+      operationId: adminQueuePurge
+      summary: Purge the offline queue (bounded batch processing)
+      description: |-
+        ⑤ §8.1. Role: ops. `pending:*` scores are `seq`, not timestamps, so `before_ts` requires a lookup in
+        `messages.created_at`; this is therefore bounded batch processing (async task). Omitting `before_ts` = clear the entire scope.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminQueuePurgeRequest' }
+      responses:
+        '200':
+          description: Purge result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminQueuePurgeResponse' }
+        '202':
+          description: Accepted asynchronously when the backlog is large.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminQueuePurgeResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.1'
+      x-idempotency: supported
+
+  /v1/admin/stream:
+    get:
+      tags: [admin]
+      operationId: adminStream
+      summary: 'SSE live stream (event: online / node / deps / ping)'
+      description: |-
+        ⑤ §8.5. Role: user (read-only). `?topics=online,queue`; event types `online` (1s),
+        `node` (2s), `deps` (5s), and `ping` comment lines (30s). The first frame is pushed immediately. Limit: 100 concurrent connections per cluster
+        (over the limit → 429 `details.reason=sse_limit`). The reverse proxy must set `proxy_buffering off` and the server returns
+        `X-Accel-Buffering: no`.
+      responses:
+        '200':
+          description: SSE event stream.
+          headers:
+            X-Accel-Buffering: { $ref: '#/components/headers/XAccelBuffering' }
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: '`event: <type>\ndata: <json>\n\n` (the `id:` on the same connection increases monotonically).'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §8.5'
+
+  /v1/admin/metrics:
+    get:
+      tags: [admin]
+      operationId: adminMetrics
+      summary: Prometheus text metrics (internal network only)
+      description: ⑤ §8.1. Body is Prometheus text exposition (metric names in Doc ② §8.1).
+      security: []
+      responses:
+        '200':
+          description: Prometheus text.
+          content:
+            text/plain:
+              schema: { type: string }
+      x-doc-ref: '⑤ §8.1'
+
+  # ---- §8.2 Users, devices, quotas, compliance deletion ----------------------
+  /v1/admin/users:
+    get:
+      tags: [admin]
+      operationId: adminListUsers
+      summary: User search (offset-based pagination)
+      description: '⑤ §8.2. Role: user (read-only).'
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Keyword (username/display_name).
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          schema: { type: string, enum: [active, suspended, deleted] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: User page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUserPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+    post:
+      tags: [admin]
+      operationId: adminCreateUser
+      summary: Create an account (admin only; the platform has no self-service registration)
+      description: ⑤ §8.2. `role` defaults to `user`; writes audit `user.create`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminUserCreateRequest' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: User ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    patch:
+      tags: [admin]
+      operationId: adminPatchUser
+      summary: Update a user profile (display_name / avatar; reason required)
+      description: '⑤ §8.2. Role: admin/ops (ops may only run remediation operations; changes require admin). Writes audit `user.update`.'
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminUserPatchRequest' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}/password:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [admin]
+      operationId: adminResetUserPassword
+      summary: Reset a password (admin only)
+      description: |-
+        ⑤ §8.2. Rehashes with argon2id, revokes all devices of the user, and disconnects WS; returns
+        `{ok, sessions_revoked}` and never echoes the password.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminUserPasswordRequest' }
+      responses:
+        '200':
+          description: Reset.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUserPasswordResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}/quota:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [admin]
+      operationId: adminUpdateUserQuota
+      summary: Adjust a user quota (admin only)
+      description: ⑤ §8.2.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminQuotaRequest' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}/role:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [admin]
+      operationId: adminChangeUserRole
+      summary: Change an admin-API role (admin only; audit role.change)
+      description: |-
+        ⑤ §8.2 / §0.2 role source. The authoritative `role` lives in `users.role`; the value inside a token is only a snapshot,
+        and takes effect within one TTL (900s) at most. Online sessions are not forcibly disconnected.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminRoleChangeRequest' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}/suspend:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [admin]
+      operationId: adminSuspendUser
+      summary: Suspend a user (ops; status transition, in-flight connections closed per policy)
+      description: ⑤ §8.2. Writes audit `user.suspend`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminReasonRequest' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}/resume:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [admin]
+      operationId: adminResumeUser
+      summary: Resume a user (ops)
+      description: ⑤ §8.2. Writes audit `user.resume`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminReasonRequest' }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  /v1/admin/users/{id}/purge:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    post:
+      tags: [admin]
+      operationId: adminPurgeUserStart
+      summary: Compliance cascade delete (admin only; 202 + task id)
+      description: |-
+        ⑤ §8.2. PG soft delete → hard-delete window (7 days by default) → MinIO batch delete → Redis `conn:*`/`pending:*`/
+        `dedup:*` cleanup → audit trail. `confirm_username` must match the target username, otherwise 422.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminPurgeRequest' }
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminPurgeProgress' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+    get:
+      tags: [admin]
+      operationId: adminPurgeUserProgress
+      summary: Deletion task progress (per-store counts for PG/MinIO/Redis)
+      description: '⑤ §8.2. Role: user (read-only).'
+      responses:
+        '200':
+          description: Task progress.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminPurgeProgress' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §8.2'
+
+  /v1/admin/devices:
+    get:
+      tags: [admin]
+      operationId: adminListDevices
+      summary: Device search (offset-based pagination)
+      description: '⑤ §8.2. Role: user (read-only).'
+      parameters:
+        - name: user
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: revoked
+          in: query
+          required: false
+          description: Whether to return revoked devices only.
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Device page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDevicePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.2'
+
+  /v1/admin/devices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Device ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    delete:
+      tags: [admin]
+      operationId: adminRevokeDevice
+      summary: Force-revoke a device (ops)
+      description: ⑤ §8.2. Writes audit `device.revoke`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Revoked (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §8.2'
+      x-idempotency: supported
+
+  # ---- §8.3 Conversation and message search ----------------------------------
+  /v1/admin/conversations:
+    get:
+      tags: [admin]
+      operationId: adminListConversations
+      summary: Conversation search (member count / message count / last message time)
+      description: '⑤ §8.3. Role: user (read-only).'
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+        - name: kind
+          in: query
+          required: false
+          schema: { type: string, enum: [dm, group, topic] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Conversation page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminConversationPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.3'
+
+  /v1/admin/conversations/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [admin]
+      operationId: adminConversationDetail
+      summary: Conversation details (payload not returned)
+      description: ⑤ §8.3.
+      responses:
+        '200':
+          description: Conversation details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminConversation' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §8.3'
+
+  /v1/admin/messages:
+    get:
+      tags: [admin]
+      operationId: adminSearchMessages
+      summary: Message metadata search (includes delivery state; payload not returned)
+      description: |-
+        ⑤ §8.3 / §14 I2. With massive message volumes, **at least one** high-selectivity filter (`id`/`conv` + time window) is required;
+        otherwise 422 `FORMAT`.
+      parameters:
+        - name: id
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: conv
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: user
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [persisted, routed, delivered, acked, dropped, expired, dlq]
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Message page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminMessagePage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.3'
+
+  /v1/admin/messages/{id}/delivery:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [admin]
+      operationId: adminMessageDelivery
+      summary: Delivery detail (delivery_log all-device view)
+      description: '⑤ §8.3. Role: user (read-only).'
+      responses:
+        '200':
+          description: Delivery detail.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDeliveryDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §8.3'
+
+  /v1/admin/replay:
+    post:
+      tags: [admin]
+      operationId: adminReplayDeadLetters
+      summary: Dead-letter replay (ops; 202 + accepted / rejected[])
+      description: ⑤ §8.3. Writes audit `dlq.replay`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminReplayRequest' }
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminReplayResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.3'
+      x-idempotency: supported
+
+  /v1/admin/dlq:
+    get:
+      tags: [admin]
+      operationId: adminListDlq
+      summary: Dead-letter list (delivery_log.state=dlq)
+      description: '⑤ §8.3. Role: user (read-only).'
+      parameters:
+        - name: conv
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - name: user
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/Ulid' }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Dead-letter page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDlqPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.3'
+
+  # ---- §8.6 Audit query ------------------------------------------------------
+  /v1/admin/audit:
+    get:
+      tags: [admin]
+      operationId: adminAudit
+      summary: Audit query (offset-based pagination; high-selectivity filter or ≤7-day window required)
+      description: |-
+        ⑤ §8.6. `from`/`to` are RFC 3339; defaults are `from = now-24h` and `to = now`. At least one of
+        `actor`/`action`/`target` or an explicit time window ≤ 7 days is required; otherwise 422 `FORMAT`
+        (`details.reason=too_broad`). Results are ordered by `created_at desc`.
+      parameters:
+        - name: actor
+          in: query
+          required: false
+          schema: { type: string }
+        - name: action
+          in: query
+          required: false
+          schema: { type: string }
+        - name: target
+          in: query
+          required: false
+          schema: { type: string }
+        - name: from
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Audit page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminAuditPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.6'
+
+  # ---- §8.4 Plugins, formats, config, keys -----------------------------------
+  /v1/admin/plugins:
+    get:
+      tags: [admin]
+      operationId: adminListPlugins
+      summary: Server-side format plugin list (version / state / canary / call statistics)
+      description: |-
+        ⑤ §8.4. Role: user (read-only). v0.18 adds `wasm:{enabled,compiled,loaded[],rejected[],
+        trusted_keys,...}` (the original `items` fields are unchanged).
+      responses:
+        '200':
+          description: Plugin list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminPluginList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.4'
+    post:
+      tags: [admin]
+      operationId: adminPluginAction
+      summary: Publish / roll back / canary (admin only)
+      description: ⑤ §8.4. Writes audit `plugin.publish` / `plugin.rollback` / `plugin.canary`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminPluginActionRequest' }
+      responses:
+        '202':
+          description: Accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ns: { type: string }
+                  version: { type: string }
+                  action: { type: string, enum: [publish, rollback, canary] }
+                  ratio: { type: number }
+                  status: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.4'
+      x-idempotency: supported
+
+  /v1/admin/plugins/{ns}/stats:
+    parameters:
+      - name: ns
+        in: path
+        required: true
+        description: Plugin namespace.
+        schema: { type: string }
+    get:
+      tags: [admin]
+      operationId: adminPluginStats
+      summary: Plugin call statistics (latency / failure rate / peak memory)
+      description: '⑤ §8.4. Role: user (read-only).'
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: Statistics window (for example `1h`).
+          schema: { type: string, default: 1h }
+      responses:
+        '200':
+          description: Statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminPluginStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §8.4'
+
+  /v1/admin/plugins/{ns}/invoke:
+    parameters:
+      - name: ns
+        in: path
+        required: true
+        description: Plugin namespace.
+        schema: { type: string }
+    post:
+      tags: [admin]
+      operationId: adminPluginInvoke
+      summary: Minimal WASM plugin invocation (admin only; wasm-host feature)
+      description: |-
+        ⑤ §8.4. 422 `details.reason ∈ {not_found, not_verified, bad_abi, missing_export,
+        manifest}`; 500 `details.reason ∈ {circuit_open, timeout, trap, memory, fuel, busy}`;
+        Audit `plugin.wasm.invoke` (raw input/output are not included).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminWasmInvokeRequest' }
+      responses:
+        '200':
+          description: Invocation result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminWasmInvokeResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+        '500': { $ref: '#/components/responses/Internal' }
+      x-doc-ref: '⑤ §8.4'
+      x-idempotency: supported
+
+  /v1/admin/plugins/wasm/reload:
+    post:
+      tags: [admin]
+      operationId: adminWasmReload
+      summary: WASM plugin hot reload (atomic rebuild + swap; the old snapshot is kept on failure)
+      description: |-
+        ⑤ §8.4. The body optionally takes `{source:"all|dir|pg"}`; 200 returns
+        `loaded/from_dir/from_pg/rejected/conflicts/generation/elapsed_ms`;
+        409 `in_progress`, 429 `rate_limited`, 422 `source`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminWasmReloadRequest' }
+      responses:
+        '200':
+          description: Reload result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminWasmReloadResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §8.4'
+      x-idempotency: supported
+
+  /v1/admin/formats:
+    get:
+      tags: [admin]
+      operationId: adminListFormats
+      summary: Formats registry
+      description: '⑤ §8.4. Role: user (read-only).'
+      responses:
+        '200':
+          description: Format list.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminFormatList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.4'
+    post:
+      tags: [admin]
+      operationId: adminUpsertFormat
+      summary: Register / update a format (admin only)
+      description: ⑤ §8.4. Includes `detect_rules`; signature checks run when a plugin signature is required.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminFormatUpsertRequest' }
+      responses:
+        '200':
+          description: Updated format.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.4'
+      x-idempotency: supported
+
+  /v1/admin/config:
+    get:
+      tags: [admin]
+      operationId: adminGetConfig
+      summary: Dynamic config snapshot (read-only with source markers)
+      description: '⑤ §8.4. Role: user (read-only).'
+      responses:
+        '200':
+          description: Config snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminConfigSnapshot' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.4'
+    patch:
+      tags: [admin]
+      operationId: adminPatchConfig
+      summary: Dynamic config hot update (admin only)
+      description: ⑤ §8.4. Writes audit `config.update`; changes are broadcast to all nodes over the bus.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminConfigPatchRequest' }
+      responses:
+        '200':
+          description: Updated config snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminConfigSnapshot' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §8.4'
+      x-idempotency: supported
+
+  /v1/admin/keys/rotate:
+    post:
+      tags: [admin]
+      operationId: adminRotateKeys
+      summary: Key rotation (dual-key overlap window; target=jwt really generates RSA 2048)
+      description: |-
+        ⑤ §8.4. `target=jwt` really generates 2048-bit RSA, writes to disk atomically, and hot-swaps, returning
+        `{implemented:true,status:"rotated",...}`; `kek`/`internal_ca` still return
+        `implemented:false,status:"not_implemented"`; a read-only key directory → 500 + `details.reason=key_dir_readonly`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminKeyRotateRequest' }
+      responses:
+        '202':
+          description: Rotation accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminKeyRotateResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+        '500': { $ref: '#/components/responses/Internal' }
+      x-doc-ref: '⑤ §8.4'
+      x-idempotency: supported
+
+  /v1/admin/keys:
+    get:
+      tags: [admin]
+      operationId: adminListKeys
+      summary: Key fingerprints and validity windows (admin only; private keys not returned)
+      description: ⑤ §8.4.
+      responses:
+        '200':
+          description: Key information.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminKeysResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.4'
+
+  # ==========================================================================
+  # §9.7 / §8.4 Media helpers (TURN short-lived credentials, recording search)
+  # ==========================================================================
+  /v1/media/turn-credentials:
+    get:
+      tags: [media]
+      operationId: mediaTurnCredentials
+      summary: Issue short-lived coturn REST API credentials (any signed-in role)
+      description: |-
+        ⑤ §9.7. When `enabled=false` (no `[media] turn_uris/turn_secret` configured), returns
+        `{enabled:false, uris:[], ttl:0}` — **not an error** (the client falls back to a direct connection/tunnel).
+        Credential TTL defaults to 600s and the server truncates it to ≤600s; does not write `delivery_log`, does not count against message quota, and does not write audit.
+      responses:
+        '200':
+          description: Credentials (or disabled).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TurnCredentials' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §9.7'
+
+  /v1/media/recordings:
+    get:
+      tags: [media]
+      operationId: mediaRecordings
+      summary: Recording segment index (filter by stream, reverse cursor pagination)
+      description: |-
+        ⑤ §9.7. Role: admin/ops (user → 403, anonymous → 401). The list contains no payload/URL;
+        `before` is the previous page `next_before` (recording id); an unknown cursor → 422.
+      parameters:
+        - name: stream_id
+          in: query
+          required: false
+          description: Filter by stream (exact match; omitted = all recent recordings).
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: Page size (default 50, max 200; out-of-range values are clamped).
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: before
+          in: query
+          required: false
+          description: Cursor (previous page `next_before`, a recording id).
+          schema: { $ref: '#/components/schemas/Ulid' }
+      responses:
+        '200':
+          description: Recording segment page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §9.7'
+
+  /v1/media/recordings/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Recording segment ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [media]
+      operationId: mediaRecordingDetail
+      summary: Recording segment metadata + presigned URL (TTL 300s) + download_url
+      description: '⑤ §9.7. Role: admin/ops.'
+      responses:
+        '200':
+          description: Recording segment details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §9.7'
+
+  /v1/media/recordings/{id}/download:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Recording segment ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [media]
+      operationId: mediaRecordingDownload
+      summary: Download a recording segment (302 → MinIO presigned; audit media.recording.download)
+      description: '⑤ §9.7. Role: admin/ops; unknown id → 404, user → 403.'
+      responses:
+        '302':
+          description: Redirect to a MinIO presigned URL.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §9.7'
+
+  /v1/media/recordings/{id}/manifest:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Recording segment ULID.
+        schema: { $ref: '#/components/schemas/Ulid' }
+    get:
+      tags: [media]
+      operationId: mediaRecordingManifest
+      summary: Recording segment frame-index manifest (raw-frames; no payload, not directly playable)
+      description: '⑤ §8.4/§9.7. Role: admin/ops; legacy rows (no manifest object) → 404.'
+      responses:
+        '200':
+          description: manifest JSON.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordingManifest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §9.7'
+
+  # ==========================================================================
+  # §12 Plugin hub (user-facing /v1/hub)
+  # ==========================================================================
+  /v1/hub/plugins:
+    get:
+      tags: [hub]
+      operationId: hubListPlugins
+      summary: Plugin catalog (published only, with at least one published version)
+      description: |-
+        ⑤ §12.1. Any signed-in user. `installed`/`installed_version`/`update_available` are caller-scoped
+        view fields (from `hub_plugin_installs`, not global plugin attributes). `q` matches
+        name/description/plugin_id/tags (case-insensitive).
+      parameters:
+        - name: q
+          in: query
+          required: false
+          schema: { type: string }
+        - name: category
+          in: query
+          required: false
+          schema: { type: string }
+        - name: sort
+          in: query
+          required: false
+          schema: { type: string, enum: [recent, popular, name], default: recent }
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: page_size
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Catalog page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubPluginPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §12.1'
+    post:
+      tags: [hub]
+      operationId: hubPublishPlugin
+      summary: 'Publish (create plugin / add version): 201 draft + upload target'
+      description: |-
+        ⑤ §12.3. Any signed-in user; for an existing `plugin_id`, only the owner or admin can add versions,
+        otherwise 403 (`details.reason=not_owner`). Rate limit: 10 per hour (429 `details.reason=hub_publish`).
+        A retry with the same `(plugin_id, version)` and sha256 returns 200 (`idempotent_reused=true`);
+        an already-published version with the same sha returns 200 (`idempotent=true`, `upload:null`).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HubPublishRequest' }
+      responses:
+        '200':
+          description: Idempotent retry (same version, same sha).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubPublishResponse' }
+        '201':
+          description: New draft created (the package has not been uploaded yet).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubPublishResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §12.3'
+      x-idempotency: supported
+
+  /v1/hub/plugins/{plugin_id}:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        description: Plugin ID (`^[a-z0-9][a-z0-9._-]{1,63}$`).
+        schema: { type: string, pattern: '^[a-z0-9][a-z0-9._-]{1,63}$' }
+    get:
+      tags: [hub]
+      operationId: hubPluginDetail
+      summary: Plugin details (versions contains published versions only)
+      description: |-
+        ⑤ §12.2. Not found (or `status=removed` and not owner/admin) → 404; `my_install` is always present
+        (null when not installed); `versions` are ordered by `published_at desc`.
+      responses:
+        '200':
+          description: Plugin details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubPluginDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §12.2'
+    delete:
+      tags: [hub]
+      operationId: hubDeletePlugin
+      summary: Mark a plugin as removed (owner / admin)
+      description: |-
+        ⑤ §12.6. The plugin moves to `removed` together with all of its versions; install records are kept; 204;
+        writes audit `hub.plugin.remove`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Deleted (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §12.6'
+      x-idempotency: supported
+
+  /v1/hub/plugins/{plugin_id}/versions/{version}:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        description: semver.
+        schema: { type: string }
+    delete:
+      tags: [hub]
+      operationId: hubDeleteVersion
+      summary: Mark a version as removed (owner / admin)
+      description: |-
+        ⑤ §12.6. The object is kept for 30 days for rollback; deleting the latest version moves `latest_version` back to the highest remaining version;
+        with no versions left → the plugin is hidden from the catalog. 204; writes audit `hub.version.remove`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Deleted (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §12.6'
+      x-idempotency: supported
+
+  /v1/hub/plugins/{plugin_id}/versions/{version}/blob:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      tags: [hub]
+      operationId: hubUploadBlob
+      summary: Upload the installation package body (raw bytes ≤20MiB, SHA-256 computed on the fly)
+      description: |-
+        ⑤ §12.4. Required headers: `X-Content-SHA256` (must match the `sha256` sent in POST) and `Content-Length`.
+        Validation failure → 422 (`details.reason ∈ {checksum, package}`); for a published version, the same sha → 200,
+        a different sha → 409 `version_published`. Writes to the `lattice-plugins` bucket.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: X-Content-SHA256
+          in: header
+          required: true
+          description: Package content SHA-256 (lowercase hex).
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Published.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubBlobUploadResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §12.4'
+      x-idempotency: supported
+
+  /v1/hub/plugins/{plugin_id}/versions/{version}/download:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [hub]
+      operationId: hubDownloadVersion
+      summary: Download the installation package (302 → MinIO presigned, TTL 900s)
+      description: |-
+        ⑤ §12.5. The presigned host comes from `[s3] public_endpoint` (falls back to `[s3] endpoint` when empty);
+        response headers include `X-Content-SHA256`/`X-Content-Length`; a missing or removed version → 404;
+        the `downloads` counter is best-effort.
+      responses:
+        '302':
+          description: Redirect to a MinIO presigned GET.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            X-Content-SHA256: { $ref: '#/components/headers/XContentSha256' }
+            X-Content-Length: { $ref: '#/components/headers/XContentLength' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §12.5'
+
+  /v1/hub/plugins/{plugin_id}/versions/{version}/source:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [hub]
+      operationId: hubDownloadSource
+      summary: Download the source package (302 → MinIO presigned; no source → 404 source_missing)
+      description: |-
+        ⑤ §12.4.2. Visibility follows the same rule as package downloads (the plugin is visible to the caller and the version is published);
+        source downloads do **not** count toward `downloads`.
+      responses:
+        '302':
+          description: Redirect to a MinIO presigned GET.
+          headers:
+            Location: { $ref: '#/components/headers/Location' }
+            X-Content-SHA256: { $ref: '#/components/headers/XContentSha256' }
+            X-Content-Length: { $ref: '#/components/headers/XContentLength' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §12.4.2'
+    put:
+      tags: [hub]
+      operationId: hubUploadSource
+      summary: Upload the source package (raw zip ≤50MiB, owner/admin)
+      description: |-
+        ⑤ §12.4.1. Required header `X-Content-SHA256` (must equal `source.sha256` from POST); if no
+        `source{}` was declared → 422 `source_not_declared`; validation failure → 422 (`size`/`checksum`/`package`);
+        with existing source: the same sha → 200 (`idempotent=true`), a different sha → 409 `source_published`.
+        May be called before or after the package upload; uploading source does not affect version visibility.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: X-Content-SHA256
+          in: header
+          required: true
+          description: Source package SHA-256 (lowercase hex).
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+      requestBody:
+        required: true
+        content:
+          application/zip:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Object stored (or idempotent hit).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubSourceUploadResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '422': { $ref: '#/components/responses/Format' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-doc-ref: '⑤ §12.4.1'
+      x-idempotency: supported
+
+  /v1/hub/installs:
+    get:
+      tags: [hub]
+      operationId: hubListInstalls
+      summary: Install record list (per user; data snapshots included when include_data=1)
+      description: ⑤ §12.7. The `plugin` field is null when the plugin is removed or does not exist.
+      parameters:
+        - name: include_data
+          in: query
+          required: false
+          description: 1 = also return the plugin data snapshot (≤256KiB JSON).
+          schema: { type: integer, enum: [0, 1], default: 0 }
+      responses:
+        '200':
+          description: Install record page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubInstallPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §12.7'
+
+  /v1/hub/installs/{plugin_id}:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      tags: [hub]
+      operationId: hubUpsertInstall
+      summary: Upsert an install record (idempotent, per user)
+      description: |-
+        ⑤ §12.7. No record → 201 (`data_rev` starts at 1); `data` omitted → 200, updating only
+        version/enabled; `data` present with a matching `data_rev` → 200 (the server does `data_rev += 1`); a mismatch →
+        409 `data_conflict`; `?force=1` overrides explicitly (must be confirmed by the user).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: force
+          in: query
+          required: false
+          description: 1 = force-overwrite conflicts (after explicit user confirmation).
+          schema: { type: integer, enum: [0, 1], default: 0 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HubInstallUpsertRequest' }
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubInstall' }
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubInstall' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §12.7'
+      x-idempotency: supported
+    delete:
+      tags: [hub]
+      operationId: hubDeleteInstall
+      summary: Delete a cloud install record (user-initiated removal; 204)
+      description: ⑤ §12.7. Writes audit `hub.install.remove`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204': { description: Deleted (empty body). }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+      x-doc-ref: '⑤ §12.7'
+      x-idempotency: supported
+
+  /v1/hub/stats:
+    get:
+      tags: [hub]
+      operationId: hubStats
+      summary: Console statistics (catalog / installs / downloads / storage overview)
+      description: |-
+        ⑤ §12.8. Role: user (read-only). `storage_bytes` sums `hub_plugin_versions.size`
+        (a display value; may briefly diverge from actual bucket usage).
+      responses:
+        '200':
+          description: Statistics.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubStats' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §12.8'
+
+  # ==========================================================================
+  # §9 WebSocket main channel (HTTP upgrade entry; frame protocol in the x-ws extension)
+  # ==========================================================================
+  /v1/ws:
+    get:
+      tags: [ws]
+      operationId: wsUpgrade
+      summary: WebSocket upgrade endpoint (frame protocol in x-ws, 13 commands total)
+      description: |-
+        ⑤ §9. After TLS + WS Upgrade, the first frame must be `hello{protocol, device_fp, profile, caps}`
+        (a JSON frame), otherwise `error{code=PROTOCOL}` + close. In the hello response the server returns the authoritative
+        `chunk.threshold_max`, `quota`, and `node_id`. While draining/not ready it returns 503
+        (`details.reason=draining`).
+      security: []
+      responses:
+        '101':
+          description: Protocol upgrade succeeded (Lattice WS frame protocol follows).
+          headers:
+            Upgrade:
+              description: '`websocket`'
+              schema: { type: string }
+            Connection:
+              description: '`Upgrade`'
+              schema: { type: string }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+      x-doc-ref: '⑤ §9'
+
+# ==========================================================================
+# Non-HTTP protocol boundary registry (not REST operations; kept in top-level extensions so the contract inventory is complete)
+# ==========================================================================
+x-ws:
+  path: /v1/ws
+  frame-format: '[1B ver=1][1B cmd][4B len BE][body]'
+  transport: WebSocket over TLS (LB terminates)
+  frame-limits:
+    envelope: 524288
+    chunk: 524288
+    stream-data: 65536
+  commands:
+    - { name: hello, direction: 'C→S / S→C', body: 'JSON {protocol:{min,max}, device_fp, profile, caps, chunk_limit?}' }
+    - { name: byef, direction: 'S→C / C→S', body: 'JSON {reason: logout|rotate|shutdown}' }
+    - { name: envelope, direction: 'bidirectional', body: 'Envelope(protobuf)' }
+    - { name: chunk, direction: 'bidirectional', body: 'Envelope(protobuf) + chunks{total,index,size,checksum}' }
+    - { name: ack, direction: 'bidirectional', body: 'JSON {id, state, conv_id?} (device-level acknowledgment)' }
+    - { name: receipt, direction: 'bidirectional', body: 'JSON {id, state, conv_id?} (lifecycle receipt)' }
+    - { name: ping, direction: 'bidirectional', body: 'empty (30s period; replies with pong on receipt)' }
+    - { name: pong, direction: 'bidirectional', body: 'empty' }
+    - { name: keepalive, direction: 'bidirectional', body: 'JSON {seq_watermark:{conv_id:seq}} (25s period)' }
+    - { name: stream-sig, direction: 'bidirectional', body: 'Envelope(type=stream-sig), payload JSON {stream_id, action, to_user, to_devices?, ...}' }
+    - { name: stream-data, direction: 'bidirectional', body: '[1B ver=1][1B flags][2B stream_id_len][stream_id][payload] (≤64KB)' }
+    - { name: request-chunks, direction: 'bidirectional', body: 'JSON {id, missing_index[]}' }
+    - { name: error, direction: 'bidirectional', body: 'JSON {code, message, envelope_id?}' }
+  error-codes: [AUTH_FAIL, PROTOCOL, QUOTA, NOT_FOUND, FORMAT, PLUGIN, RATE, INTERNAL]
+  heartbeat:
+    ws-ping: '30s (the server replies with pong on receipt)'
+    keepalive: '25s (carries the seq watermark)'
+    server-dead: '90s without frames → disconnect and clean up conn:*'
+
+x-mqtt-gateway:
+  note: >-
+    MQTT is not an HTTP interface and has no OpenAPI operations; only topic mapping and boundaries are registered (⑤ §11).
+  listener:
+    prod: '8883 (TLS, terminated by the fronting proxy)'
+    dev: '1883 (plaintext)'
+  topic-mapping: 'lattice/{topic}/{device} ↔ Lattice Topic; $share is not supported; the device segment must equal the connected device'
+  payload: 'defaults to type=custom:iot and encoding=raw; when the MQTT5 Content-Type property is present, mapping follows the MIME type'
+  qos: 'QoS1 targets at-least-once, but the current implementation only guarantees the online round trip; QoS2 is not supported (DISCONNECT 0x9B)'
+  auth: 'CONNECT password = the device refresh token (matched against devices.token_hash); X.509 is not implemented'
+  rate-limit: '10 msg/s per device; MQTT5 QoS1 over-limit replies with PUBACK 0x97, QoS0/3.1.1 connections are disconnected'
+  known-limits: 'the pending queue is not replayed (MQTT-only subscribers get queued messages with no consumer); inbound traffic is not stored in messages'
+
+x-grpc-services:
+  note: >-
+    Internal gRPC (mTLS) is not an HTTP interface and has no OpenAPI operations; only services and implementation status are registered (⑤ §10).
+  services:
+    - name: lattice.internal.v1.NodeInternal
+      methods:
+        - { name: Route, timeout: 2s, failure: 'retry twice → message moves to pending and an alert fires' }
+        - { name: FetchChunks, timeout: 10s, failure: 'returns error{FORMAT}; the message is marked expired' }
+        - { name: Heartbeat, timeout: 1s, failure: '3 consecutive failures → the node is marked unhealthy' }
+        - { name: WatermarkSync, timeout: 3s, failure: 'keeps the local watermark and retries next cycle' }
+    - name: lattice.internal.v1.PluginSidecar
+      methods:
+        - { name: Process, timeout: 500ms, failure: 'the plugin circuit opens for 30s; messages pass through as if no converter existed' }
+        - { name: Health, timeout: 1s, failure: 'same as above' }
+
+x-openapi-provenance:
+  artifact: openapi/lattice.openapi.yaml
+  authority: 'platform API design document (Doc ⑤ v0.18; maintained outside this repository)'
+  generated: false
+  note: |-
+    This file is a **hand-written authoritative artifact**, not generated from Rust route macros/utoipa (no heavyweight generation dependency was introduced).
+    When REST routes change, this file must be edited by hand in the same commit; CI uses `python scripts/openapi-diff.py` to verify
+    missing/extra between the Doc ⑤ route list and this file. The historical §13 count table (v0.6 basis) has a known gap against the actual §1–§12
+    list; the diff script emits count differences as WARN instead of failing.
+  coverage:
+    http_operations: 93
+    http_paths: 78
+    domains:
+      probes: 2
+      auth: 3
+      users: 8
+      conversations: 8
+      messages: 4
+      uploads: 5
+      topics: 5
+      admin: 39
+      media: 5
+      hub: 13
+      ws: 1
+    non_http: ['WS 13 commands (x-ws)', 'MQTT topic mapping (x-mqtt-gateway)', 'internal gRPC 6 methods (x-grpc-services)']

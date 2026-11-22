@@ -1,0 +1,70 @@
+# UDP ingress skeleton for QUIC / WebTransport / TURN (K8s)
+#
+# Authority: design §17.9 (direct by default; QUIC/WebTransport proxy on demand; TURN deployed separately),
+#       PL-13 13.3/13.2, PL-15 (UDP pass-through).
+#
+# Usage:
+#   kubectl apply -f deploy/quic-lb-udp.yaml
+# Notes:
+#   - This file defines the **UDP ingress shape** only; the QUIC proxy skeleton has landed (feature `quic`, 39/39, PL-13 13.3), but this file still does not wire LB→node real UDP 443 mapping or multiple nodes;
+#   - TURN (coturn) should run as a separate Deployment/Service; the UDP Service shape here is provided for replication;
+#   - Cloud LBs must declare UDP explicitly and preserve client source addresses (otherwise QUIC/TURN candidates are unusable);
+#     The annotations below use AWS NLB as an example; replace them per your platform's documentation.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lattice-node-quic
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: node
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "udp"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    # Key: preserve the client source IP (QUIC connection migration / TURN candidates depend on it)
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: "preserve_client_ip.enabled=true"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: node
+  ports:
+    - name: quic
+      protocol: UDP
+      port: 443
+      targetPort: 443
+---
+# TURN's UDP ingress shape (replicate when coturn runs as its own Deployment; adjust ports to the actual config)
+apiVersion: v1
+kind: Service
+metadata:
+  name: lattice-turn-udp
+  labels:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: turn
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "udp"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: lattice
+    app.kubernetes.io/component: turn
+  ports:
+    - name: turn
+      protocol: UDP
+      port: 3478
+      targetPort: 3478
+    - name: turn-tls
+      protocol: TCP
+      port: 5349
+      targetPort: 5349
+---
+# Caveats:
+# 1) NetworkPolicy must allow UDP 443/3478 and the TURN relay port range (default 49160-49200/udp);
+# 2) If the LB does not support UDP or cannot preserve source IPs, the media plane must explicitly degrade to the WS tunnel (design §17.9-3),
+#    with clients switching via the fallback declaration in stream-sig;
+# 3) This skeleton is not proof that "the QUIC proxy is implemented"—until 13.3 lands it only serves network-side pre-configuration.
+

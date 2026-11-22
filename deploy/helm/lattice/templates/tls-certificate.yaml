@@ -1,0 +1,163 @@
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{/*
+ cert-manager Certificate (rendered only when provider=certManager).
+ - this file **only issues/renews certificates**; Issuer/ClusterIssuer are cluster-scoped resources pre-created by operations
+     (example in deploy/production/tls/cert-manager.yaml); the chart does not build cluster-level trust roots.
+ - private keys are written by cert-manager into the Secret named in values (same naming contract as existingSecret mode);
+     the chart does not read them, persist them, or expose them in values/ConfigMap.
+*/}}
+{{- $ns := .Release.Namespace }}
+{{- $node := include "lattice.node.fullname" . }}
+{{- $web := include "lattice.web.fullname" . }}
+{{- $issuer := .Values.tls.certManager.issuerRef }}
+{{- $nodeDns := default (list $node (printf "%s.%s" $node $ns) (printf "%s.%s.svc" $node $ns) (printf "%s.%s.svc.cluster.local" $node $ns)) .Values.tls.certManager.nodeDnsNames }}
+{{- if .Values.ingress.enabled }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "lattice.fullname" . }}-ingress
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ingress
+spec:
+  secretName: {{ include "lattice.ingressTlsSecretName" . }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  issuerRef:
+    name: {{ $issuer.name }}
+    kind: {{ $issuer.kind }}
+    group: {{ $issuer.group }}
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    - {{ default .Values.ingress.host .Values.tls.certManager.ingressDnsName | quote }}
+{{- end }}
+{{- if and .Values.grpc.enabled .Values.tls.grpc.enabled }}
+---
+# internal node gRPC mTLS: one certificate serves both as server and as outbound client (usages include client auth)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $node }}-grpc
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  secretName: {{ .Values.tls.grpc.secretName }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  issuerRef:
+    name: {{ $issuer.name }}
+    kind: {{ $issuer.kind }}
+    group: {{ $issuer.group }}
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+  dnsNames:
+    {{- toYaml $nodeDns | nindent 4 }}
+{{- end }}
+{{- if and .Values.mqtt.enabled .Values.tls.mqtt.enabled }}
+---
+# MQTT TLS: device certificates are issued separately by the internal CA (`certificates.clientCa` chain); only server certificates are issued here
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $node }}-mqtt
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mqtt
+spec:
+  secretName: {{ .Values.tls.mqtt.secretName }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  issuerRef:
+    name: {{ $issuer.name }}
+    kind: {{ $issuer.kind }}
+    group: {{ $issuer.group }}
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    {{- toYaml $nodeDns | nindent 4 }}
+    - {{ printf "%s-mqtt" $node | quote }}
+    - {{ printf "%s-mqtt.%s.svc" $node $ns | quote }}
+{{- end }}
+{{- if .Values.tls.quic.enabled }}
+---
+# QUIC/WebTransport (UDP): rustls server-side TLS; QUIC does not authenticate client certificates, identity relies on the join token
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $node }}-quic
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  secretName: {{ .Values.tls.quic.secretName }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  issuerRef:
+    name: {{ $issuer.name }}
+    kind: {{ $issuer.kind }}
+    group: {{ $issuer.group }}
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    {{- toYaml $nodeDns | nindent 4 }}
+{{- end }}
+{{- if and .Values.web.enabled (include "lattice.webTlsEnabled" .) }}
+---
+# web nginx 8443 ssl (direct-connect shape without an Ingress/LB); with an Ingress, the ingress certificate terminates TLS
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $web }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  secretName: {{ .Values.tls.http.web.secretName }}
+  duration: {{ .Values.tls.certManager.duration }}
+  renewBefore: {{ .Values.tls.certManager.renewBefore }}
+  issuerRef:
+    name: {{ $issuer.name }}
+    kind: {{ $issuer.kind }}
+    group: {{ $issuer.group }}
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+    size: 256
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  dnsNames:
+    - {{ default .Values.ingress.host .Values.tls.certManager.ingressDnsName | quote }}
+    - {{ include "lattice.web.fullname" . | quote }}
+    - {{ printf "%s.%s.svc" $web $ns | quote }}
+{{- end }}
+{{- end }}
