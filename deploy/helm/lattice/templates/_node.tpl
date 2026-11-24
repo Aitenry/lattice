@@ -89,6 +89,13 @@ spec:
             secretKeyRef:
               name: {{ include "lattice.secretName" $root }}
               key: admin-bootstrap-password
+        # transfer plane: the node signs download capability tokens with this key and the transfer Deployment
+        # verifies them, so both workloads read the same Secret key (the rest of [transfer] arrives via the ConfigMap)
+        - name: LATTICE__TRANSFER__SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "lattice.secretName" $root }}
+              key: transfer-secret
         - name: LATTICE__NODE__METRICS
           value: {{ $v.node.metrics | quote }}
         - name: RUST_LOG

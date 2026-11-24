@@ -16,8 +16,10 @@ import type {
   DrainReq,
   FormatRow,
   HubInstallRow,
+  HubMineRow,
   HubPluginDetail,
   HubPluginRow,
+  HubReviewRow,
   HubPublishReq,
   HubPublishResp,
   HubSort,
@@ -457,6 +459,15 @@ export async function listHubPlugins(params?: {
   return data
 }
 
+/**
+ * `GET /v1/hub/mine`: my own plugins including pending upload / waiting for review /
+ * rejected submissions (the public catalog only lists approved content).
+ */
+export async function listMyHubPlugins(): Promise<{ items: HubMineRow[] }> {
+  const { data } = await http.get<{ items: HubMineRow[] }>('/hub/mine')
+  return data
+}
+
 /** ⑤ §12.2 Detail (readme, version list, caller's install record) */
 export async function getHubPlugin(pluginId: string): Promise<HubPluginDetail> {
   const { data } = await http.get<HubPluginDetail>(
@@ -555,6 +566,44 @@ export async function deleteHubVersion(pluginId: string, version: string): Promi
 /** ⑤ §12.6 Unpublish plugin (install records are kept) */
 export async function deleteHubPlugin(pluginId: string): Promise<void> {
   await http.delete(`/hub/plugins/${encodeURIComponent(pluginId)}`)
+}
+
+/**
+ * `GET /v1/admin/hub/reviews`: versions waiting for an administrator (admin only).
+ *
+ * User-published plugins become visible/installable for others only after approval, so
+ * this queue is the gate for the whole catalog.
+ */
+export async function listHubReviews(params?: {
+  page?: number
+  page_size?: number
+}): Promise<Paged<HubReviewRow>> {
+  const { data } = await http.get<Paged<HubReviewRow>>('/admin/hub/reviews', { params })
+  return data
+}
+
+/** `POST /v1/admin/hub/plugins/{plugin_id}/versions/{version}/approve` (admin only) */
+export async function approveHubVersion(
+  pluginId: string,
+  version: string,
+): Promise<{ plugin_id: string; version: string; status: string; published_at: string | null }> {
+  const { data } = await http.post(
+    `/admin/hub/plugins/${encodeURIComponent(pluginId)}/versions/${encodeURIComponent(version)}/approve`,
+  )
+  return data
+}
+
+/** `POST /v1/admin/hub/plugins/{plugin_id}/versions/{version}/reject` (admin only; reason required) */
+export async function rejectHubVersion(
+  pluginId: string,
+  version: string,
+  reason: string,
+): Promise<{ plugin_id: string; version: string; status: string; review_note: string | null }> {
+  const { data } = await http.post(
+    `/admin/hub/plugins/${encodeURIComponent(pluginId)}/versions/${encodeURIComponent(version)}/reject`,
+    { reason },
+  )
+  return data
 }
 
 /** ⑤ §12.7 Current user's install records (cross-device sync; read-only in the console) */

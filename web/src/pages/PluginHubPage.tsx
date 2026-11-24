@@ -1,43 +1,37 @@
 import { useCallback, useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   Alert,
   App as AntApp,
-  Avatar,
+  Badge,
   Button,
   Card,
   Col,
-  Descriptions,
-  Drawer,
   Empty,
   Form,
   Input,
   Modal,
   Pagination,
-  Popconfirm,
   Progress,
   Row,
   Segmented,
   Select,
   Space,
   Spin,
-  Table,
   Tag,
   Tooltip,
   Typography,
   Upload,
 } from 'antd'
 import {
-  AppstoreOutlined,
   ClockCircleOutlined,
+  CloudSyncOutlined,
   CloudUploadOutlined,
-  DeleteOutlined,
   DownloadOutlined,
-  HddOutlined,
-  HistoryOutlined,
   InboxOutlined,
   ReloadOutlined,
+  SafetyCertificateOutlined,
   SearchOutlined,
-  TeamOutlined,
   UserOutlined,
 } from '@ant-design/icons'
 import { ApiError } from '@/api/http'
@@ -49,12 +43,14 @@ import {
   getHubPlugin,
   getHubStats,
   listHubPlugins,
+  listHubReviews,
+  listMyHubPlugins,
   publishHubPlugin,
   uploadHubBlob,
   uploadHubSource,
 } from '@/api/endpoints'
 import type {
-  HubOwner,
+  HubMineRow,
   HubPluginDetail,
   HubPluginRow,
   HubPublishReq,
@@ -64,12 +60,12 @@ import type {
 } from '@/api/types'
 import { useAuth } from '@/auth/AuthProvider'
 import { HelpTip } from '@/components/HelpTip'
-import { JsonPeek } from '@/components/JsonPeek'
-import { StatCard } from '@/components/StatCard'
+import { HubPluginDetailDrawer } from '@/components/HubPluginDetailDrawer'
+import { PluginIcon } from '@/components/PluginIcon'
 import { useI18n, type Translate } from '@/i18n'
 import { errText } from '@/lib/errors'
-import { fmtBytes, fmtRelative, fmtTime } from '@/lib/format'
-import { HUB_CATEGORY, hubCategoryOptions, pick } from '@/lib/labels'
+import { fmtBytes, fmtRelative } from '@/lib/format'
+import { hubCategoryOptions, hubOwnerLabel } from '@/lib/labels'
 
 /**
  * Plugin hub (⑤ §12, the user-facing `/v1/hub`).
@@ -163,9 +159,36 @@ function guessPluginId(filename: string): string {
   return PLUGIN_ID_RE.test(id) ? id : ''
 }
 
-function ownerLabel(owner: HubOwner | undefined, t: Translate): string {
-  if (!owner) return t('Unknown publisher')
-  return owner.display_name?.trim() || owner.username || t('Unknown publisher')
+/**
+ * Review state → tag.
+ *
+ * Only `published` is public; `review`/`rejected`/`pending` are shown exclusively in the
+ * owner's "my plugins" view and the administrator review queue.
+ */
+function versionStatusTag(status: string | undefined, t: Translate) {
+  switch (status) {
+    case 'review':
+      return (
+        <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+          {t('In review')}
+        </Tag>
+      )
+    case 'rejected':
+      return (
+        <Tag color="red" style={{ marginInlineEnd: 0 }}>
+          {t('Review rejected')}
+        </Tag>
+      )
+    case 'pending':
+      return <Tag style={{ marginInlineEnd: 0 }}>{t('Not submitted')}</Tag>
+    case 'published':
+    default:
+      return (
+        <Tag color="green" style={{ marginInlineEnd: 0 }}>
+          {t('Approved')}
+        </Tag>
+      )
+  }
 }
 
 /** Save via a blob + a[download] (window.open cannot carry the Authorization header) */
@@ -242,28 +265,6 @@ function hubSubmitError(e: unknown, t: Translate): string {
 // ---------------------------------------------------------------------------
 // Small components
 // ---------------------------------------------------------------------------
-
-/** Plugin icon: render the URL when it is a directly usable image, otherwise fall back to the initial (remixicon names are resolved by the client, the console has no icon font) */
-function PluginIcon({ icon, name, size = 42 }: { icon: string | null; name: string; size?: number }) {
-  const isImage = Boolean(icon && /^(https?:\/\/|data:image\/)/i.test(icon))
-  if (isImage) {
-    return <Avatar shape="square" size={size} src={icon} style={{ flex: `0 0 ${size}px`, borderRadius: 10 }} />
-  }
-  return (
-    <Avatar
-      shape="square"
-      size={size}
-      style={{
-        flex: `0 0 ${size}px`,
-        borderRadius: 10,
-        fontSize: Math.round(size / 2.4),
-        fontWeight: 600,
-      }}
-    >
-      {(name || '?').trim().slice(0, 1).toUpperCase()}
-    </Avatar>
-  )
-}
 
 function PluginCard({ item, onOpen }: { item: HubPluginRow; onOpen: (pluginId: string) => void }) {
   const { t } = useI18n()
@@ -344,7 +345,7 @@ function PluginCard({ item, onOpen }: { item: HubPluginRow; onOpen: (pluginId: s
             <ClockCircleOutlined /> {fmtRelative(item.updated_at)}
           </Typography.Text>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            <UserOutlined /> {ownerLabel(item.owner, t)}
+            <UserOutlined /> {hubOwnerLabel(item.owner, t)}
           </Typography.Text>
         </Space>
         {(item.installed || item.update_available) && (
@@ -370,6 +371,99 @@ function PluginCard({ item, onOpen }: { item: HubPluginRow; onOpen: (pluginId: s
   )
 }
 
+/**
+ * Owner card ("My plugins" tab).
+ *
+ * Same card language as the catalogue — the point is to see one's own submissions as
+ * plugins, not as a database table: state, versions waiting for review and the rejection
+ * note all belong on the card, the actions stay at the bottom.
+ */
+function MyPluginCard({ item, onOpen }: { item: HubMineRow; onOpen: (pluginId: string) => void }) {
+  const { t } = useI18n()
+  const note = item.rejected_note?.trim()
+  return (
+    <Card
+      hoverable
+      size="small"
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(item.plugin_id)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onOpen(item.plugin_id)
+        }
+      }}
+      style={{ height: '100%' }}
+      styles={{
+        body: {
+          padding: 16,
+          height: '100%',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 10,
+        },
+      }}
+    >
+      <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+        <PluginIcon icon={item.icon} name={item.name} />
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            <Typography.Text strong ellipsis style={{ fontSize: 14, flex: '0 1 auto', minWidth: 0 }}>
+              {item.name}
+            </Typography.Text>
+            <Tag color="blue" style={{ marginInlineEnd: 0, flex: '0 0 auto' }}>
+              {item.latest_version ?? item.review_version ?? item.rejected_version ?? '—'}
+            </Tag>
+          </div>
+          <div className="cell-sub" title={item.plugin_id}>
+            {item.plugin_id}
+          </div>
+        </div>
+      </div>
+
+      <Typography.Paragraph
+        type="secondary"
+        ellipsis={{ rows: 2 }}
+        style={{ margin: 0, fontSize: 13, minHeight: 40 }}
+      >
+        {item.description || t('No description from the publisher')}
+      </Typography.Paragraph>
+
+      <Space size={[4, 4]} wrap>
+        {versionStatusTag(item.state, t)}
+        {item.review_version && (
+          <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+            {t('v{version} in review', { version: item.review_version })}
+          </Tag>
+        )}
+        {item.rejected_version && (
+          <Tag color="red" style={{ marginInlineEnd: 0 }}>
+            {t('v{version} rejected', { version: item.rejected_version })}
+          </Tag>
+        )}
+      </Space>
+
+      {note && (
+        <Tooltip title={note}>
+          <Typography.Text type="warning" ellipsis style={{ fontSize: 12 }}>
+            {t('Review feedback')}: {note}
+          </Typography.Text>
+        </Tooltip>
+      )}
+
+      <div style={{ marginTop: 'auto', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          <ClockCircleOutlined /> {fmtRelative(item.updated_at)}
+        </Typography.Text>
+        <Button size="small" type="link">
+          {t('Open')}
+        </Button>
+      </div>
+    </Card>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -378,6 +472,7 @@ export default function PluginHubPage() {
   const { message } = AntApp.useApp()
   const { session, role } = useAuth()
   const { t } = useI18n()
+  const nav = useNavigate()
 
   // Catalogue
   const [stats, setStats] = useState<HubStats | null>(null)
@@ -390,6 +485,14 @@ export default function PluginHubPage() {
   const [sort, setSort] = useState<HubSort>('recent')
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState<string | null>(null)
+
+  // Catalogue vs. my own submissions: two card grids, switched without leaving the page.
+  // Administrator review lives on its own page (`/hub-review`), not here.
+  const [view, setView] = useState<'catalog' | 'mine'>('catalog')
+  const [mine, setMine] = useState<HubMineRow[]>([])
+  // Admin shortcut: the queue itself is an independent page (`/hub-review`), but its size is
+  // worth surfacing where reviews are triggered.
+  const [pendingReviews, setPendingReviews] = useState(0)
 
   // Detail drawer
   const [detailId, setDetailId] = useState<string | null>(null)
@@ -443,6 +546,24 @@ export default function PluginHubPage() {
     }
   }, [search, category, sort, page])
 
+  const loadMine = useCallback(async () => {
+    try {
+      setMine((await listMyHubPlugins()).items ?? [])
+    } catch {
+      // The "my plugins" panel is supplementary: a failure must not hide the catalogue
+    }
+  }, [])
+
+  const loadPendingReviews = useCallback(async () => {
+    if (role !== 'admin') return
+    try {
+      const r = await listHubReviews({ page: 1, page_size: 1 })
+      setPendingReviews(r.total ?? 0)
+    } catch {
+      // The shortcut badge is informational only
+    }
+  }, [role])
+
   useEffect(() => {
     void loadStats()
   }, [loadStats])
@@ -450,6 +571,14 @@ export default function PluginHubPage() {
   useEffect(() => {
     void loadList()
   }, [loadList])
+
+  useEffect(() => {
+    void loadMine()
+  }, [loadMine])
+
+  useEffect(() => {
+    void loadPendingReviews()
+  }, [loadPendingReviews])
 
   // Debounce the search box: fire the request 300ms after typing stops, so each keystroke does not hit the API
   useEffect(() => {
@@ -470,7 +599,9 @@ export default function PluginHubPage() {
   const refreshAll = useCallback(() => {
     void loadList()
     void loadStats()
-  }, [loadList, loadStats])
+    void loadMine()
+    void loadPendingReviews()
+  }, [loadList, loadStats, loadMine, loadPendingReviews])
 
   // ---------- Detail ----------
 
@@ -810,9 +941,18 @@ export default function PluginHubPage() {
       setPhase('done')
       if (!needPackage && !ack.source_upload) {
         // Retry with the same version and sha: the server returns 200 and no body upload is needed
-        message.success(t('This version was already published with identical content; no need to upload again'))
+        message.success(
+          ack.submitted
+            ? t('This version is already waiting for administrator review; no need to upload again')
+            : t('This version was already published with identical content; no need to upload again'),
+        )
       } else {
-        message.success(t('Published {name} {version}; other users can download it now', { name, version }))
+        message.success(
+          t('Submitted {name} {version} for review; other users can see and install it once an administrator approves it', {
+            name,
+            version,
+          }),
+        )
       }
       finishUpload()
     } catch (e) {
@@ -821,7 +961,7 @@ export default function PluginHubPage() {
       const base = hubSubmitError(e, t)
       setUpErr(
         step === 'source'
-          ? `${base}\n${t('The package was published successfully; only the source archive upload failed. Click "Publish" again with the same version: unchanged package content is not written twice, and the source upload is retried.')}`
+          ? `${base}\n${t('The package was submitted for review; only the source archive upload failed. Click "Publish" again with the same version: unchanged package content is not written twice, and the source upload is retried.')}`
           : base,
       )
       message.error(errText(e))
@@ -842,7 +982,7 @@ export default function PluginHubPage() {
           : phase === 'source'
             ? t('Step 3: uploading the source archive {percent}% (keep this window open)', { percent: percent ?? 0 })
             : phase === 'done'
-              ? t('Publish complete')
+              ? t('Submission complete')
               : ''
 
   const progressPercent =
@@ -858,373 +998,200 @@ export default function PluginHubPage() {
 
   return (
     <div className="page-fill">
-      {/* Filter row: page-level actions always sit on the far right (hard README constraint) */}
-      <div className="toolbar" style={{ marginBottom: 0 }}>
-        <Input
-          allowClear
-          prefix={<SearchOutlined />}
-          placeholder={t('Search plugin name, description, ID or tag')}
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          style={{ width: 280 }}
-        />
-        <Select
-          allowClear
-          placeholder={t('All categories')}
-          value={category}
-          onChange={(v) => {
-            setCategory(v)
-            setPage(1)
-          }}
-          options={hubCategoryOptions(t)}
-          style={{ width: 140 }}
-        />
-        <Segmented
-          options={
-            SORT_OPTIONS.map((option) => ({
-              label: t(option.label),
-              value: option.value,
-            })) as { label: string; value: string }[]
-          }
-          value={sort}
-          onChange={(v) => {
-            setSort(v as HubSort)
-            setPage(1)
-          }}
-        />
-        <div className="toolbar-right">
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={refreshAll}>
-            {t('Refresh')}
-          </Button>
-          <Button type="primary" icon={<CloudUploadOutlined />} onClick={openUpload}>
-            {t('Upload plugin')}
-          </Button>
-        </div>
-      </div>
-
       {err && <Alert type="error" showIcon message={t('Failed to load')} description={err} />}
 
-      <Row gutter={[16, 16]}>
-        <Col xs={24} sm={12} xl={6}>
-          <StatCard
-            label={t('Plugins')}
-            value={stats ? stats.plugins.toLocaleString() : '—'}
-            hint={t('Plugins visible in the catalogue (published with at least one downloadable version)')}
-            icon={<AppstoreOutlined />}
-            tone="blue"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <StatCard
-            label={t('Versions')}
-            value={stats ? stats.versions.toLocaleString() : '—'}
-            hint={t('Total published versions across all plugins (old versions can be removed one by one)')}
-            icon={<HistoryOutlined />}
-            tone="violet"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <StatCard
-            label={t('Installs')}
-            value={stats ? stats.installs.toLocaleString() : '—'}
-            hint={t('Install records across all users; removing a plugin does not delete them')}
-            icon={<TeamOutlined />}
-            tone="green"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <StatCard
-            label={t('Storage used')}
-            value={stats ? fmtBytes(stats.storage_bytes) : '—'}
-            hint={t('Combined size of every downloadable package (a reference for capacity planning)')}
-            icon={<HddOutlined />}
-            tone="slate"
-          />
-        </Col>
-      </Row>
-
       <Card className="list-card">
-        <div className="hub-scroll">
-          <Spin spinning={loading}>
-            {items.length > 0 ? (
-              <div className="hub-grid">
-                {items.map((item) => (
-                  <PluginCard key={item.plugin_id} item={item} onOpen={(id) => void openDetail(id)} />
-                ))}
-              </div>
-            ) : (
-              <div style={{ minHeight: 240, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <Empty
-                  image={Empty.PRESENTED_IMAGE_SIMPLE}
-                  description={
-                    search || category
-                      ? t('No plugins match; try another keyword or category')
-                      : t('The plugin hub is empty; click "Upload plugin" in the top right to publish the first one')
-                  }
-                />
+        {/* First row is the page toolbar: filters on the left, page-level actions on the right */}
+        <div className="toolbar">
+          <Segmented
+            options={
+              [
+                { label: t('Plugin catalog'), value: 'catalog' },
+                { label: t('My plugins'), value: 'mine' },
+              ] as { label: string; value: string }[]
+            }
+            value={view}
+            onChange={(v) => setView(v as 'catalog' | 'mine')}
+          />
+          {view === 'catalog' && (
+            <>
+              <Input
+                allowClear
+                prefix={<SearchOutlined />}
+                placeholder={t('Search plugin name, description, ID or tag')}
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                style={{ width: 260 }}
+              />
+              <Select
+                allowClear
+                placeholder={t('All categories')}
+                value={category}
+                onChange={(v) => {
+                  setCategory(v)
+                  setPage(1)
+                }}
+                options={hubCategoryOptions(t)}
+                style={{ width: 120 }}
+              />
+              <Segmented
+                options={
+                  SORT_OPTIONS.map((option) => ({
+                    label: t(option.label),
+                    value: option.value,
+                  })) as { label: string; value: string }[]
+                }
+                value={sort}
+                onChange={(v) => {
+                  setSort(v as HubSort)
+                  setPage(1)
+                }}
+              />
+            </>
+          )}
+          {view === 'mine' && <span className="muted">{t('{count} plugins', { count: mine.length })}</span>}
+          <div className="toolbar-right">
+            {role === 'admin' && (
+              <Badge count={pendingReviews} size="small" offset={[-2, 2]}>
+                <Button icon={<SafetyCertificateOutlined />} onClick={() => nav('/hub-review')}>
+                  {t('Plugin review')}
+                </Button>
+              </Badge>
+            )}
+            <Button icon={<CloudSyncOutlined />} onClick={() => nav('/hub-data')}>
+              {t('My plugin data')}
+            </Button>
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={refreshAll}>
+              {t('Refresh')}
+            </Button>
+            <Button type="primary" icon={<CloudUploadOutlined />} onClick={openUpload}>
+              {t('Upload plugin')}
+            </Button>
+          </div>
+        </div>
+
+        {/* My plugins: a card grid, the same visual language as the catalogue — not a table. */}
+        {view === 'mine' && (
+          <>
+            <div className="hub-scroll">
+              {mine.length > 0 ? (
+                <div className="hub-grid">
+                  {mine.map((item) => (
+                    <MyPluginCard
+                      key={item.plugin_id}
+                      item={item}
+                      onOpen={(id) => void openDetail(id)}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div style={{ minHeight: 260, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <Empty
+                    image={Empty.PRESENTED_IMAGE_SIMPLE}
+                    description={t('You have not published any plugin yet')}
+                  >
+                    <Button type="primary" icon={<CloudUploadOutlined />} onClick={openUpload}>
+                      {t('Upload plugin')}
+                    </Button>
+                  </Empty>
+                </div>
+              )}
+            </div>
+            {mine.length > 0 && (
+              <div className="hub-pager">
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {t('Includes submissions that are not approved yet')}
+                </Typography.Text>
               </div>
             )}
-          </Spin>
-        </div>
-        {total > 0 && (
-          <div className="hub-pager">
-            <Pagination
-              size="small"
-              current={page}
-              pageSize={PAGE_SIZE}
-              total={total}
-              showSizeChanger={false}
-              showTotal={(count) => t('{count} plugins', { count })}
-              onChange={(p) => setPage(p)}
-            />
-          </div>
+          </>
         )}
-      </Card>
 
-      {/* Detail drawer */}
-      <Drawer
-        open={detailId != null}
-        onClose={closeDetail}
-        width={760}
-        destroyOnClose
-        title={detail ? detail.name : t('Plugin details')}
-        extra={
-          canManageDetail ? (
-            <Popconfirm
-              title={t('Remove this plugin?')}
-              description={t('Once removed it disappears from the catalogue and other users cannot download it. Install records are kept and come back if the same plugin is published again. Packages are kept for 30 days before automatic cleanup.')}
-              okText={t('Remove')}
-              okButtonProps={{ danger: true }}
-              cancelText={t('Cancel')}
-              onConfirm={() => void handleDeletePlugin()}
-            >
-              <Button danger size="small" icon={<DeleteOutlined />}>
-                {t('Remove plugin')}
-              </Button>
-            </Popconfirm>
-          ) : null
-        }
-      >
-        {detailLoading ? (
-          <div style={{ padding: '80px 0', textAlign: 'center' }}>
-            <Spin />
-          </div>
-        ) : detail ? (
-          <div className="stack">
-            <div style={{ display: 'flex', gap: 14, alignItems: 'flex-start' }}>
-              <PluginIcon icon={detail.icon} name={detail.name} size={54} />
-              <div style={{ minWidth: 0, flex: 1 }}>
-                <Space size={8} wrap>
-                  <Typography.Title level={5} style={{ margin: 0 }}>
-                    {detail.name}
-                  </Typography.Title>
-                  <Tag color="blue" style={{ marginInlineEnd: 0 }}>
-                    {detail.latest_version ?? t('No downloadable version')}
-                  </Tag>
-                  <Tag style={{ marginInlineEnd: 0 }}>
-                    {t(pick(HUB_CATEGORY, detail.category, detail.category))}
-                  </Tag>
-                </Space>
-                <div className="cell-sub" style={{ marginTop: 4 }}>
-                  {detail.plugin_id}
+        {view === 'catalog' && (
+          <>
+            <div className="metric-strip" style={{ marginBottom: 12 }}>
+              <div className="metric-cell">
+                <div className="metric-head">{t('Plugins')}</div>
+                <div className="metric-value">{stats ? stats.plugins.toLocaleString() : '—'}</div>
+                <div className="metric-hint">
+                  {t('Plugins visible in the catalogue (published with at least one downloadable version)')}
                 </div>
-                <Typography.Text type="secondary" style={{ fontSize: 13 }}>
-                  {detail.description || t('No description from the publisher')}
-                </Typography.Text>
+              </div>
+              <div className="metric-cell">
+                <div className="metric-head">{t('Versions')}</div>
+                <div className="metric-value">{stats ? stats.versions.toLocaleString() : '—'}</div>
+                <div className="metric-hint">
+                  {t('Total published versions across all plugins (old versions can be removed one by one)')}
+                </div>
+              </div>
+              <div className="metric-cell">
+                <div className="metric-head">{t('Installs')}</div>
+                <div className="metric-value">{stats ? stats.installs.toLocaleString() : '—'}</div>
+                <div className="metric-hint">
+                  {t('Install records across all users; removing a plugin does not delete them')}
+                </div>
+              </div>
+              <div className="metric-cell">
+                <div className="metric-head">{t('Storage used')}</div>
+                <div className="metric-value">{stats ? fmtBytes(stats.storage_bytes) : '—'}</div>
+                <div className="metric-hint">
+                  {t('Combined size of every downloadable package (a reference for capacity planning)')}
+                </div>
               </div>
             </div>
 
-            {detail.tags.length > 0 && (
-              <Space size={[4, 4]} wrap>
-                {detail.tags.map((tag) => (
-                  <Tag key={tag}>{tag}</Tag>
-                ))}
-              </Space>
-            )}
-
-            <Descriptions size="small" column={2} bordered>
-              <Descriptions.Item label={t('Publisher')}>{ownerLabel(detail.owner, t)}</Descriptions.Item>
-              <Descriptions.Item label={t('Total downloads')}>
-                {t('{count} downloads', { count: detail.downloads.toLocaleString() })}
-              </Descriptions.Item>
-              <Descriptions.Item label={t('First published')}>{fmtTime(detail.created_at)}</Descriptions.Item>
-              <Descriptions.Item label={t('Last updated')}>{fmtTime(detail.updated_at)}</Descriptions.Item>
-            </Descriptions>
-
-            {detail.my_install && (
-              <div className="soft-panel">
-                <b>{t('Your install:')}</b>{' '}
-                {t('Version {version} · {state}', {
-                  version: detail.my_install.version,
-                  state: detail.my_install.enabled ? t('Enabled') : t('Disabled'),
-                })}
-                {detail.my_install.data_rev > 0
-                  ? ` · ${t('plugin data revision {rev} (updated {time})', {
-                      rev: detail.my_install.data_rev,
-                      time: fmtTime(detail.my_install.data_updated_at),
-                    })}`
-                  : ''}
+            <div className="hub-scroll">
+              <Spin spinning={loading}>
+                {items.length > 0 ? (
+                  <div className="hub-grid">
+                    {items.map((item) => (
+                      <PluginCard key={item.plugin_id} item={item} onOpen={(id) => void openDetail(id)} />
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ minHeight: 240, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <Empty
+                      image={Empty.PRESENTED_IMAGE_SIMPLE}
+                      description={
+                        search || category
+                          ? t('No plugins match; try another keyword or category')
+                          : t('The plugin hub is empty; click "Upload plugin" in the top right to publish the first one')
+                      }
+                    />
+                  </div>
+                )}
+              </Spin>
+            </div>
+            {total > 0 && (
+              <div className="hub-pager">
+                <Pagination
+                  current={page}
+                  pageSize={PAGE_SIZE}
+                  total={total}
+                  showSizeChanger={false}
+                  showTotal={(count) => t('{count} plugins', { count })}
+                  onChange={(p) => setPage(p)}
+                />
               </div>
             )}
+          </>
+        )}
+      </Card>
 
-            <Card
-              size="small"
-              title={t('Plugin description')}
-              extra={
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {t('Raw text from the publisher; the console does not render rich text')}
-                </Typography.Text>
-              }
-            >
-              {detail.readme ? (
-                <div style={{ whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.8 }}>{detail.readme}</div>
-              ) : (
-                <Typography.Text type="secondary">{t('The publisher did not write a plugin description')}</Typography.Text>
-              )}
-            </Card>
-
-            <Card
-              size="small"
-              title={t('Versions')}
-              extra={
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {t('{count} downloadable versions', { count: detail.versions.length })}
-                </Typography.Text>
-              }
-            >
-              <Table<HubVersionRow>
-                size="small"
-                rowKey="version"
-                className="drawer-table"
-                dataSource={detail.versions}
-                pagination={false}
-                locale={{ emptyText: t('This plugin has no downloadable version yet') }}
-                columns={[
-                  {
-                    title: t('Version'),
-                    dataIndex: 'version',
-                    width: 120,
-                    render: (v: string, row) => (
-                      <Tooltip title={row.changelog || t('No changelog provided')}>
-                        <Tag color={row.version === detail.latest_version ? 'blue' : 'default'}>{v}</Tag>
-                      </Tooltip>
-                    ),
-                  },
-                  {
-                    title: t('Size'),
-                    dataIndex: 'size',
-                    width: 90,
-                    render: (v: number) => fmtBytes(v),
-                  },
-                  {
-                    title: (
-                      <Space size={2}>
-                        {t('Checksum')}
-                        <HelpTip
-                          title={t('First 12 characters of the package SHA-256. After download the client verifies the full value and refuses to install a package that does not match.')}
-                        />
-                      </Space>
-                    ),
-                    dataIndex: 'sha256',
-                    width: 130,
-                    render: (v: string) => (
-                      <Tooltip title={v}>
-                        <span className="table-id">{v.slice(0, 12)}</span>
-                      </Tooltip>
-                    ),
-                  },
-                  {
-                    title: t('Downloads'),
-                    dataIndex: 'downloads',
-                    width: 76,
-                    render: (v: number) => v.toLocaleString(),
-                  },
-                  {
-                    title: t('Published'),
-                    dataIndex: 'published_at',
-                    width: 124,
-                    render: (v: string | null) =>
-                      v ? (
-                        <Tooltip title={fmtTime(v)}>
-                          <span>{fmtRelative(v)}</span>
-                        </Tooltip>
-                      ) : (
-                        '—'
-                      ),
-                  },
-                  {
-                    title: (
-                      <Space size={2}>
-                        {t('Source')}
-                        <HelpTip
-                          title={t('Each version can optionally carry a source zip (≤50 MiB), which the client downloads together with an install or update. Sources can only be declared at publish time and cannot be overwritten afterwards.')}
-                        />
-                      </Space>
-                    ),
-                    dataIndex: 'has_source',
-                    width: 112,
-                    render: (has: boolean, row) =>
-                      has ? (
-                        <Space size={0}>
-                          <Tag color="green" style={{ marginInlineEnd: 0 }}>
-                            {t('Yes')}
-                          </Tag>
-                          <Button
-                            size="small"
-                            type="link"
-                            icon={<DownloadOutlined />}
-                            loading={downloadingSource === row.version}
-                            onClick={() => void handleDownloadSource(row)}
-                          >
-                            {t('Source')}
-                          </Button>
-                        </Space>
-                      ) : (
-                        <Typography.Text type="secondary">{t('No')}</Typography.Text>
-                      ),
-                  },
-                  {
-                    title: t('Actions'),
-                    width: canManageDetail ? 168 : 96,
-                    render: (_, row) => (
-                      <Space size={0}>
-                        <Button
-                          size="small"
-                          type="link"
-                          icon={<DownloadOutlined />}
-                          loading={downloading === row.version}
-                          onClick={() => void handleDownload(row)}
-                        >
-                          {t('Download')}
-                        </Button>
-                        {canManageDetail && (
-                          <Popconfirm
-                            title={t('Delete this version?')}
-                            description={t('The version disappears from the catalogue and the latest version falls back to the highest remaining one. The package is kept for 30 days before automatic cleanup. To change the content, publish a new version.')}
-                            okText={t('Delete')}
-                            okButtonProps={{ danger: true }}
-                            cancelText={t('Cancel')}
-                            onConfirm={() => void handleDeleteVersion(row.version)}
-                          >
-                            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-                              {t('Delete')}
-                            </Button>
-                          </Popconfirm>
-                        )}
-                      </Space>
-                    ),
-                  },
-                ]}
-              />
-            </Card>
-
-            <JsonPeek
-              data={detail}
-              label={t('Raw response of the plugin detail API (GET /v1/hub/plugins/{plugin_id})')}
-            />
-          </div>
-        ) : null}
-      </Drawer>
+      {/* Detail drawer: identity, publisher strip, versions, readme, raw data */}
+      <HubPluginDetailDrawer
+        open={detailId != null}
+        loading={detailLoading}
+        detail={detail}
+        canManage={canManageDetail}
+        downloading={downloading}
+        downloadingSource={downloadingSource}
+        onClose={closeDetail}
+        onDownload={(row) => void handleDownload(row)}
+        onDownloadSource={(row) => void handleDownloadSource(row)}
+        onDeleteVersion={(version) => void handleDeleteVersion(version)}
+        onDeletePlugin={() => void handleDeletePlugin()}
+      />
 
       {/* Upload wizard: pick the package, hash it, fill in metadata, then POST and PUT */}
       <Modal
@@ -1252,6 +1219,14 @@ export default function PluginHubPage() {
             description={<span style={{ whiteSpace: 'pre-line' }}>{upErr}</span>}
           />
         )}
+
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={t('Submissions require administrator review')}
+          description={t('Until an administrator approves it, a submitted version is visible only to you. Approved versions are immutable: to change the content, publish a new version and submit it for review again.')}
+        />
 
         <Upload.Dragger
           accept=".zip"

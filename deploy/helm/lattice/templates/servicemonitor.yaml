@@ -20,4 +20,28 @@ spec:
     - port: metrics
       interval: {{ .Values.metrics.serviceMonitor.interval }}
       path: /metrics
+{{- if .Values.transfer.enabled }}
+---
+{{/*
+ Transfer ServiceMonitor: the download plane is a separate Deployment with its own Service, so its metrics need a
+ separate scrape target (the transfer Service exposes the `metrics` port on transfer.service.metricsPort).
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "lattice.transfer.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "lattice.transfer.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}
 {{- end }}

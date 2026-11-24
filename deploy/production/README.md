@@ -1,136 +1,95 @@
-# Lattice production HA deployment skeleton (PG / Redis / NATS / MinIO)
+# Lattice production HA deployment templates (PostgreSQL / Redis / NATS / MinIO)
 
-> **Status: a copyable template, not a running cluster.** This repository only has a single-host dev Docker
-> environment, with no more than 3 hosts, so every configuration in this directory has **only been validated
-> offline** (`python scripts/ha-manifest-check.py` + `docker compose config`); **no production/multi-node
-> cluster has been brought up**, and no real leader election, switchover, or cross-site replication has been
-> performed.
-> When "production RPO/RTO achieved" may be declared from this directory: after completing the quarterly
-> drill checklist in §7 and recording data on a real cluster.
+> **Status: copyable templates, not a running cluster.** This repository contains a single-host development stack, not a production multi-node environment. The assets in this directory describe the intended topology and have been reviewed statically; no multi-host cluster has been brought up with them, and no leader election, switchover, or cross-site replication has been performed.
 >
-> Design basis (authoritative parameters have exactly one source): the design document (outside this repository) §2 (RPO ≤5min /
-> RTO ≤30min), §11 (topology), §17.13 (infrastructure parameters: PG 16+Patroni+etcd×3, Redis Sentinel×3,
-> NATS JetStream×3, MinIO 4×4 drives EC 12+4). This directory does not redefine values; it only projects
-> them into deployment.
+> Targets used throughout: **RPO ≤ 5 min and RTO ≤ 30 min**. These are deployment targets, not accepted results. Declare them achieved only after a drill on the target infrastructure using the checklist below.
 
-## 1. Topology
+## Topology
 
 ```
-                       Clients: Tauri desktop / Web console / MQTT devices
-                                    │
-                    ┌───────────────▼─────────────────┐
-                    │ Keepalived VIP ×2 (active-active)│  VIP drifts in seconds on failure
-                    └───────────────┬─────────────────┘
-                    ┌───────────────▼─────────────────┐
-                    │ Nginx/Envoy ×2                  │  TLS termination / WS upgrade / SSE / canary weights
-                    └──┬────────────┬────────────┬────┘
-        ┌──────────────┘            │            └──────────────┐
-┌───────▼────────┐        ┌─────────▼────────┐        ┌─────────▼────────┐
-│ lattice-node 1 │        │ lattice-node 2   │        │ lattice-node 3   │   ≥3 stateless, HPA-capable
-│ :8080 :9090    │        │                  │        │                  │
-│ :9100 :1883    │        │                  │        │                  │
-└──┬───┬───┬───┬─┘        └──────────────────┘        └──────────────────┘
-   │   │   │   │
-   │   │   │   └──► S3 stable endpoint (LB, TLS termination) ──► MinIO ×4 (4×4=16 drives, EC 12+4)
+                     Clients: desktop / web console / MQTT devices
+                                  │
+                    ┌─────────────▼──────────────┐
+                    │ Keepalived VIP ×2 (active-active) │  VIP drifts in seconds
+                    └─────────────┬──────────────┘
+                    ┌─────────────▼──────────────┐
+                    │ Nginx/Envoy ×2             │  TLS, WS upgrade, SSE, canary weights
+                    └──┬──────────┬──────────┬───┘
+        ┌──────────────┘          │          └──────────────┐
+┌───────▼────────┐      ┌─────────▼────────┐      ┌─────────▼────────┐
+│ lattice-node 1 │      │ lattice-node 2   │      │ lattice-node 3   │  ≥3 stateless
+│ 8080 9090 9100 │      │                  │      │                  │
+│ 1883           │      │                  │      │                  │
+└──┬───┬───┬───┬─┘      └──────────────────┘      └──────────────────┘
+   │   │   │   └──► S3 stable endpoint (LB, TLS) ──► MinIO ×4, 4×4=16 drives, EC 12+4
    │   │   │                                        └─ lattice-large/media/cold/plugins
-   │   │   │                                           (lattice-cold is also the PG WAL archive target)
    │   │   └──────► NATS stable endpoint (L4 VIP/DNS) ──► JetStream ×3 (Raft)
    │   │                                          └─ LATTICE_ROUTE/BROADCAST/AUDIT/MEDIA
    │   └──────────► Redis stable endpoint (HAProxy/VIP) ──► 1 primary + 2 replicas + Sentinel ×3 (quorum 2)
-   └──────────────► PG stable endpoint (HAProxy/VIP) ─────► Patroni + PG16 1 primary + 2 replicas + etcd ×3
-                                                     └─ WAL archive ──► MinIO lattice-cold (PITR)
-
-    Observability: Prometheus scrapes node:9100 / nats exporter / minio / node_exporter / postgres_exporter
-        + alert rules in deploy/observability; grafana dashboards
+   └──────────────► PG stable endpoint (HAProxy/VIP) ─────► Patroni + PG 16: 1 primary + 2 replicas + etcd ×3
+                                                └─ WAL archive ──► MinIO lattice-cold (PITR)
+    Observability: Prometheus scrapes node :9100, NATS exporter, MinIO, node_exporter, postgres_exporter; rules and dashboard in deploy/observability
 ```
 
-> Every "stable endpoint" in the diagram is mandatory, not an optional optimization: the node code has only
-> **single-endpoint** clients for PG/Redis/NATS/S3 (see the "Node-side limitation" column in §5). Without a
-> stable endpoint, any instance switchover points the node at the old address.
+Every stable endpoint is mandatory. The node takes a **single** endpoint for PG, Redis, NATS, and S3; without a VIP, load balancer, or DNS name that follows the current primary, an instance switchover leaves the node pointed at the old address.
 
-## 2. Deployment order (dependencies)
+## Deployment order
 
-Follow this order strictly; each step includes its acceptance point. **PG is always recovered first, and
-web/LB traffic ramp-up is last** (② §7.5).
+Follow this order; each step lists its acceptance check. **Recover PostgreSQL first and ramp traffic last.**
 
-| # | Step | What to do | Acceptance |
-|---|---|---|---|
-| 0 | Prerequisites | Domains/DNS, VIP+Keepalived, LB, certificates (JWT private key / mTLS / LB TLS), secret management, **NTP clock sync** (replication/Sentinel/Raft all depend on the clock), monitoring | `chronyc tracking` skew <100ms; Secrets can inject environment variables |
-| 1 | etcd ×3 | The etcd topology in `deploy/production/patroni/` (production = 3 hosts) | `etcdctl endpoint health` all green on 3 hosts; `etcdctl member list` shows 3 members |
-| 2 | PG Patroni ×3 | `deploy/production/patroni/README.md` §1: render `patroni.yml` → start the 3 hosts → create database/migration | `patronictl list` shows 1 Leader + 2 Replica, lag≈0; `pg_stat_archiver.failed_count=0` |
-| 3 | MinIO ×4 | `deploy/production/minio/`: start 4 nodes (16 drives) → `bucket-setup.sh` creates buckets/versioning/IAM | `mc admin info` shows 4 nodes online with 4 drives each; the 4 buckets exist and are versioned |
-| 4 | Redis HA | `deploy/production/redis/`: master→replica×2→sentinel×3 | Sentinel `master lattice` shows quorum 2 / 2 replicas / link up |
-| 5 | NATS ×3 | `deploy/production/nats/`: start 3 nodes → **`streams.sh` pre-creates the streams with replicas=3** | `nats stream report` shows Replicas=3 for all 4 streams; `/healthz` ok on all 3 |
-| 6 | lattice-node ×N | Helm chart or bare metal; inject Secrets such as `LATTICE__PG__URL`; **start 1 instance to run migrations first, then scale to ≥3** | `/v1/health` 200, `/v1/ready` 200; logs show `migration` complete, the 4 Streams reused, S3 bucket HEAD hits |
-| 7 | web ×2 + Nginx/LB | The web from `deploy/helm` + the `deploy/nginx.conf` shape; LB drain/canary | `curl https://<vip>/` 200; WS upgrade works; `/v1` reverse proxy 200 |
-| 8 | Observability/alerting | Prometheus rules/dashboards in `deploy/observability/` | Alert rules load successfully (`promtool check rules`); key panels have data |
-| 9 | Acceptance | `scripts/ha-manifest-check.py`; the production equivalent of `scripts/smoke-container.ps1`; `python scripts/reconcile.py`; one controlled failover drill | All green + a filed drill record (RTO/RPO numbers) |
+| Step | Action | Acceptance |
+|---|---|---|
+| 0 | Prerequisites: DNS, VIP + Keepalived, load balancer, certificates, secret manager, **NTP clock sync**, monitoring | `chronyc tracking` skew < 100 ms; secrets can be injected as environment variables |
+| 1 | etcd ×3 from [`patroni/etcd.conf.template`](patroni/etcd.conf.template) and [`patroni/etcd.service.template`](patroni/etcd.service.template) | `etcdctl endpoint health` green on all 3; `etcdctl member list` shows 3 members |
+| 2 | PostgreSQL Patroni ×3: render [`patroni/patroni.yml`](patroni/patroni.yml), start the hosts, create the database | `patronictl list` shows 1 Leader + 2 Replicas with lag ≈ 0; `pg_stat_archiver.failed_count = 0` |
+| 3 | MinIO ×4: 4 nodes × 4 drives ([`minio/docker-compose.yml`](minio/docker-compose.yml)), then [`minio/bucket-setup.sh`](minio/bucket-setup.sh) | `mc admin info` shows 4 nodes × 4 drives; the four buckets exist with versioning, plus object lock on `lattice-cold` |
+| 4 | Redis HA: one primary, two replicas, three Sentinels ([`redis/README.md`](redis/README.md)) | `redis-cli -p 26379 sentinel master lattice` shows quorum 2, two replicas, link up |
+| 5 | NATS ×3 ([`nats/README.md`](nats/README.md)), then **run [`nats/streams.sh`](nats/streams.sh) to create the four streams with `replicas=3`** | `nats stream report` shows Replicas=3 for all four; `/healthz` returns ok on all three nodes |
+| 6 | lattice-node ×N: [Helm chart](../helm/lattice/README.md) or bare metal, secrets injected; **start one instance to run migrations, then scale to ≥3** | `/v1/health` and `/v1/ready` return 200; logs show migrations complete and the four streams reused |
+| 7 | `lattice-transfer` ×N (same image, entrypoint `/usr/local/bin/lattice-transfer`; chart `transfer.enabled=true`), behind the same LB/Ingress on `/t/` | `/healthz` 200, `/readyz` 200 on every replica; a plugin download from the public entry returns 206 for a `Range` request and the package sha256 matches |
+| 8 | Web ×2 and Nginx/LB, following the shape of [`nginx.conf`](../nginx.conf); drain and canary on the LB | `curl -fsS https://<vip>/` returns 200; WebSocket upgrade works; `/v1` reverse proxy works; `/t/` reaches the transfer Service |
+| 9 | Acceptance: static checks below, `promtool check rules deploy/observability/prometheus/lattice-alerts.yml`, a production smoke test, and one controlled failover drill | All checks pass and a drill record with RTO/RPO numbers is filed |
 
-> The only manual database-creation step: create the `lattice` database after Patroni first elects a primary
-> (`patroni/init-lattice-db.sh`, already hooked into `bootstrap.post_bootstrap`) — the node only creates
-> tables via sqlx migrations; it never creates databases.
-> Production migrations should be **run by a single instance** (start 1 first) and the replicas scaled out
-> afterwards.
->
-> Order for landing TLS/certificates and backups:
-> - **Before step 6**: the certificate system is ready (`deploy/production/tls/README.md`: cert-manager or
->   sealed-secrets, Secret key contract, node gRPC/MQTT/QUIC and Ingress certificates); otherwise enabling
->   node `tls.*` fails because the Secret is missing;
-> - **After step 6**: enable Helm's `backup.enabled` / `backup.pitr.enabled`, and make sure `archive_command`
->   on the PG side already points at object storage (`deploy/production/backup/README.md`).
+> The only manual database step is creating the `lattice` database after Patroni first elects a primary. [`patroni/init-lattice-db.sh`](patroni/init-lattice-db.sh) is wired into `bootstrap.post_bootstrap`; the node creates tables through migrations and never creates databases. Run migrations from a single instance before scaling out.
 
-## 2.1 TLS / backup productionization entry points (new, still templates)
+- **Before step 6**, have the certificate system ready ([`tls/README.md`](tls/README.md)); otherwise enabling node `tls.*` fails because the Secret is missing.
+- **After step 6**, enable the chart's `backup.enabled` and `backup.pitr.enabled`, and confirm PG's `archive_command` already targets object storage ([`backup/README.md`](backup/README.md)).
 
-| Topic | Document | Coverage | Unvalidated |
-|---|---|---|---|
-| TLS/mTLS certificate system | [`tls/README.md`](tls/README.md), [`tls/cert-manager.yaml`](tls/cert-manager.yaml), [`tls/sealed-secret.example.yaml`](tls/sealed-secret.example.yaml) | HTTP/WS (Ingress/web 8443), MQTT 8883 (device certificate mTLS), gRPC 9090 (inter-node mTLS), QUIC UDP (server TLS); Secret key contract/least privilege/rotation/revocation | Real issuance, handshakes, rotation, sealed-secrets decryption, LB termination |
-| Backup / PITR | [`backup/README.md`](backup/README.md), [`backup/archive-verify.sql`](backup/archive-verify.sql), [`backup/base-backup.sh`](backup/base-backup.sh), [`backup/pitr-verify.sh`](backup/pitr-verify.sh) | Three backup layers (pg_dump/physical base/WAL archive), scheduling/retention, SSE-KMS+object lock+off-site copy, archive health check (same SQL as the Helm CronJob) | Object-storage archive path, CronJob execution, retention/encrypted restore, cross-site replication |
-| Canary release | [`canary-runbook.md`](canary-runbook.md), [`../helm/lattice/README.md`](../helm/lattice/README.md) §10 | Dual Deployment (stable/canary node) + ingress-nginx `canary-weight`/`canary-by-header` splitting, phased ramp-up/decision metrics/rollback commands; chart-side offline assertions in `scripts/helm-canary-validate.py` | Real ingress-nginx proportional splitting and header matching, external LB weights, MQTT/QUIC device canary, proportional gRPC splitting |
+## RPO / RTO expectations
 
-## 3. Per-component RPO / RTO expectations
+**Target: RPO ≤ 5 min, RTO ≤ 30 min.** The table records the mechanism behind each target; no time in it has been measured on a production cluster.
 
-Design target (design §2): **RPO ≤ 5min, RTO ≤ 30min**. The "Measured" column below cites only **dev
-single-host** drill numbers from this repository and **must not** be extrapolated into production conclusions
-(see §7).
-
-| Component | Target RPO | Target RTO | Mechanism | Status / measured reference |
+| Component | RPO target | RTO target | Mechanism | Status |
 |---|---|---|---|---|
-| **PG (automatic failover)** | **0** (committed transactions are not lost) | about 30–60s (estimate: leader key ttl=30s expiry + election/promotion; design target switchover <30s, not measured) | `synchronous_mode=true` (commit needs ≥1 synchronous replica ack) + Patroni election (ttl 30s) + stable endpoint drift | Template; cluster unvalidated. Failover time not measured (estimated from `ttl/loop_wait/retry_timeout`) |
-| **PG (disaster recovery / PITR)** | ≤ 5min (mechanical upper bound = `archive_timeout=60s` + archive upload time + one WAL segment; measured archive lag 4.1s) | ≤ 30min (including manual confirmation/drain/restore/verification/ramp-up) | `archive_mode=on` + `archive_command` → MinIO; daily `pg_basebackup` base + WAL archiving | Local-directory archive PITR **34/34 PASS** (measured RPO 4.1s, PG automated segment RTO 3.92s, `perf/reports/pitr-20261121.txt`); **object-storage archiving / cross-host / manual ramp-up unvalidated** |
-| **Redis (Sentinel switchover)** | Business durable data **0** (authority is in PG: `delivery_log`/`conv_seq_watermark`; switchover losses are backfilled by reconcile); Redis's own asynchronous replication window ≈ ≤1s + AOF everysec | 5–15s (`down-after=5s` + election/promotion; design target: routing uses stale cache during the switchover window) | 1 primary + 2 replicas + Sentinel ×3 (quorum 2); nodes reconnect via the stable endpoint | Template; cluster unvalidated; single-host RDB recovery **29/29 PASS** (0.81s, `perf/reports/recovery-redis-20261121.txt`) does not represent HA |
-| **NATS (JetStream 3 replicas)** | Acked messages **0** (Raft 2/3 quorum, 1 node failure loses nothing); if `streams.sh` is forgotten (streams with replicas=1), a single node failure loses that node's stream data | Single node failure: 0 downtime (clients reconnect via the LB, Raft elects in seconds); 2 node failure → degrade to Redis/direct PG writes | 3-node Raft + Stream `replicas=3` + node degradation matrix (② §4.8) | Template; cluster unvalidated; single-host store recovery **31/31 PASS** (1.20–1.53s, `perf/reports/recovery-nats-20261121.txt`) |
-| **MinIO (EC 12+4)** | Written objects **0** (tolerates any 4 drive failures ≈ 1 entire node); site-level replication (optional) is asynchronous → cross-site RPO = replication lag | Single drive/node failure does not stop service (background heal); whole-site disaster recovery relies on off-site copies/backups (unvalidated) | 4×4=16 drives in a single set EC 12+4; bucket-setup versioning + optional cross-site replication | Template; distributed cluster unvalidated; single-host single-drive directory recovery **28/28 PASS** (3.12s, `perf/reports/recovery-minio-20261121.txt`) |
-| **Access/service layer (node ×≥3)** | 0 (messages land in PG first; when PG is not writable the local WAL absorbs small messages, ≤64MiB) | seconds (LB health check removal + automatic client reconnect; rolling upgrade with `maxUnavailable=0`) | PDB N-1, HPA min 3, preStop drain, node drain semantics | Validated in dev on the Helm/node side; production LB/VIP unvalidated |
+| PostgreSQL automatic failover | 0 (committed transactions are not lost) | ~30–60 s, estimated from `ttl=30s` plus election/promotion | `synchronous_mode=true` (commit needs ≥ 1 synchronous replica ack) + Patroni election + stable endpoint | Template only; failover time not measured |
+| PostgreSQL disaster recovery / PITR | ≤ 5 min (mechanical bound: `archive_timeout=60s` + upload + one WAL segment) | ≤ 30 min including manual confirmation, restore, verification, and ramp-up | `archive_mode=on` + `archive_command` to MinIO + daily `pg_basebackup` base | Object-storage archive path unvalidated |
+| Redis Sentinel switchover | Business-durable data 0 (PostgreSQL is authoritative; `delivery_log`/`conv_seq_watermark` losses are backfilled by reconcile); asynchronous replication window ≈ ≤ 1 s | 5–15 s (`down-after=5s` plus election/promotion) | 1 primary + 2 replicas + 3 Sentinels (quorum 2); clients follow the stable endpoint | Template only; node reconnect behavior unmeasured |
+| NATS JetStream | Acked messages 0 with `replicas=3`; streams left at the code default of 1 lose data on a node failure | Single node failure: no downtime; two nodes down: degrade to Redis Pub/Sub, then paused broadcast | 3-node Raft with pre-created streams | Template only |
+| MinIO EC 12+4 | Written objects 0 (tolerates any 4 drive failures, about one node); site replication is asynchronous | Single drive/node failure does not stop service; whole-site loss relies on off-site copies | 16 drives in one erasure set | Distributed shape unvalidated |
+| Access layer (node ×≥3) | 0 (PostgreSQL first; while PG is unwritable the local WAL absorbs inline messages ≤ 1 MiB) | Seconds (load balancer removes an unhealthy node; clients reconnect) | PDB N−1, HPA min 3, `preStop` drain | Chart-level only |
 
-**Overall**: RPO ≤5min / RTO ≤30min is a **design target**; this skeleton only provides the mechanism and
-expectations; it is **not accepted end to end** (the recovery drill covers only the component automation
-segment, excluding manual failure triage/drain/phased ramp-up and cross-host networking).
+## Stable endpoints and node configuration
 
-## 4. Stable endpoints and the `[pg]/[redis]/[bus]/[s3]` configuration mapping
+The production configuration template is [`config/production.toml.example`](config/production.toml.example), deployed as `/etc/lattice/config.toml`. The "Node-side limitation" column is the core constraint: the code has no Sentinel, multi-host, or server-list client, so HA must come from infrastructure.
 
-Node-side configuration (`crates/lattice-node/src/config.rs`) and the corresponding production components.
-**The "Node-side limitation" column is the core constraint of this skeleton**: the code has no Sentinel,
-multi-host, or server-list client, so HA must provide a stable endpoint at the infrastructure layer.
-
-| Config | Production value (example) | Component providing the stable endpoint | Node-side limitation |
+| Config | Production value (example) | Stable endpoint | Node-side limitation |
 |---|---|---|---|
-| `[pg] url` | `postgres://lattice_app@pg-lattice.lattice.internal:5432/lattice?sslmode=verify-full` | HAProxy/VIP: health check Patroni `GET :8008/primary` (200=primary) | sqlx single URL, no multi-host failover; password via the `LATTICE__PG__URL` Secret |
-| `[pg] pool_size` | 32/instance | — | 3 nodes ×32=96 connections; Patroni `max_connections=500` leaves headroom; adding PgBouncer requires recalculating |
-| `[redis] url` | `redis://:${REDIS_PASSWORD}@redis-lattice.lattice.internal:6379/0` | HAProxy/VIP: `tcp-check` reads `INFO replication` and asserts `role:master` | `redis::Client::open` single URL, **no Sentinel protocol support**; after a switchover it relies on endpoint drift + ConnectionManager reconnect |
-| `[bus] kind` / `nats_url` | `kind="nats"` / `nats://lattice-nats.lattice.internal:4222` | L4 VIP/DNS round-robin over the three 4222 ports; async-nats reconnects on its own | `async_nats::connect(&str)` parses only a **single** server address (`cargo-vendor2/async-nats/src/lib.rs:1805-1811`); comma-separated lists are not allowed |
-| `[bus] jetstream` | `true` | NATS 3-node Raft; **run `nats/streams.sh` first to create streams with replicas=3** | The node's `get_or_create_stream` uses the default replicas=1 and does no config comparison when the stream exists → no redundancy without pre-creation |
-| `[s3] endpoint` | `http://minio-lattice.lattice.internal:9000` | L4 LB forwarding to the four nodes on 9000 | The bucket-create/direct-write path in `store/s3.rs` **supports `http://` only** (https errors out; TLS is terminated at the LB) |
-| `[s3] public_endpoint` | `https://s3.example.com` | The same LB's external TLS domain (the Host header must be preserved) | scheme+Host of presigned URLs; must be reachable by clients |
-| `[s3] access_key/secret_key` | Dedicated IAM user (created by `bucket-setup.sh`) | — | Do not use root in production; passwords via a Secret |
-| `[s3] bucket_*` | `lattice-large/media/cold/plugins` | MinIO 4 nodes EC 12+4 | The node's `ensure_buckets()` only creates plain buckets (no versioning/lock) → in production run `bucket-setup.sh` **first** |
-| `[wal] dir/max_bytes` | `/var/lib/lattice/wal` / 64MiB | Local disk (the node itself) | Backstop for small messages when PG is not writable; over the limit messages are rejected and counted in `lattice_wal_dropped_total` |
-| `[auth] key_dir` | `/etc/lattice/keys` | Secret volume (`jwt.key.pem` + `jwt.key.prev.pem`) | Rotation via `POST /v1/admin/keys/rotate`; a read-only mount returns an explicit error |
-| `[grpc] enabled/tls_*` | Internal mTLS | In-cluster Service/LB | Cross-node fallback routing; the plaintext dev shape must not be used in production |
+| `[pg] url` | `postgres://lattice_app@pg-lattice.lattice.internal:5432/lattice?sslmode=verify-full` | HAProxy/VIP checking Patroni `GET :8008/primary` (200 = primary) | sqlx takes a single URL; password comes from the `LATTICE__PG__URL` secret |
+| `[pg] pool_size` | 32 per instance | — | 3 nodes × 32 = 96 connections; Patroni `max_connections=500` leaves headroom; adding PgBouncer requires recalculating |
+| `[redis] url` | `redis://:${REDIS_PASSWORD}@redis-lattice.lattice.internal:6379/0` | HAProxy/VIP with `tcp-check` asserting `role:master` from `INFO replication` | `redis::Client::open` takes a single URL and has no Sentinel protocol support; reconnect relies on endpoint drift |
+| `[bus] kind` / `nats_url` | `nats` / `nats://lattice-nats.lattice.internal:4222` | L4 VIP or DNS across the three 4222 ports | `async_nats::connect` parses a single server address; comma-separated lists are rejected |
+| `[bus] jetstream` | `true` | NATS 3-node Raft | The node's `get_or_create_stream` uses `replicas=1` and does not compare configuration; run `streams.sh` first for redundancy |
+| `[s3] endpoint` | `http://minio-lattice.lattice.internal:9000` | L4 load balancer to the four nodes on 9000 | The bucket and direct-write paths support `http://` only; TLS terminates at the load balancer |
+| `[s3] public_endpoint` | `https://s3.example.com` | The same load balancer's external TLS domain, preserving the Host header | Scheme and Host of presigned URLs; must be reachable by clients |
+| `[s3] access_key` / `secret_key` / `bucket_*` | Dedicated IAM user from `bucket-setup.sh`; buckets `lattice-large`, `lattice-media`, `lattice-cold`, `lattice-plugins` | MinIO EC 12+4 | Never use the root account. `ensure_buckets()` only creates plain buckets, so run `bucket-setup.sh` first for versioning and object lock |
+| `[wal] dir` / `max_bytes` | `/var/lib/lattice/wal` / 64 MiB | Local disk on the node | Backstop for small inline messages while PostgreSQL is unwritable; over the limit messages are rejected and counted in `lattice_wal_dropped_total` |
+| `[auth] key_dir` | `/etc/lattice/keys` | Secret volume with `jwt.key.pem` and `jwt.key.prev.pem` | Rotate through `POST /v1/admin/keys/rotate`; a read-only mount returns an explicit error |
+| `[grpc] enabled` / `tls_*` | Internal mTLS | In-cluster Service or internal load balancer | Cross-node fallback routing; the plaintext development shape must not be used in production |
 
-**HAProxy fragments (PG primary / Redis primary)** — these two entry points are the key to a "stable address":
+HAProxy fragments for the two entry points that need a "stable address":
 
 ```haproxy
-# PG: only the node where Patroni /primary returns 200 is primary; client writes go only there
+# PostgreSQL: only the node where Patroni /primary returns 200 is primary
 backend pg_primary
   mode tcp
   option httpchk GET /primary
@@ -140,7 +99,7 @@ backend pg_primary
   server pg2 10.20.0.13:5432 check port 8008
 
 # Redis: read INFO replication; only the node with role:master is healthy
-# (expand ${REDIS_PASSWORD} with HAProxy 2.x environment variables, or put it in a separate 0600 config file)
+# (expand ${REDIS_PASSWORD} with HAProxy 2.x environment variables, or use a separate 0600 config file)
 backend redis_master
   mode tcp
   option tcp-check
@@ -154,172 +113,59 @@ backend redis_master
   server redis2 10.30.0.13:6379 check
 ```
 
-> HAProxy/VIP itself also needs active-active (Keepalived); this repository **does not provide** their
-> production configuration, only a UDP access topology reference in `deploy/quic-lb-udp.yaml`.
+## Switchover / failback runbook
 
-## 5. Switchover / failback runbook (general flow)
+Every component follows the same rhythm; do not improvise a different order during an incident.
 
-Every component switchover follows the same rhythm; **do not improvise a different order during an incident**:
+1. **Detect** the alert (component `up=0`, replication lag, `pg_stat_archiver.failed_count > 0`, Sentinel `+odown`, NATS `server down`, MinIO `drive offline`) and record `T0` as the RTO start.
+2. **Confirm** that a switchover is really needed: `patronictl list` and `pg_isready` for PostgreSQL, Sentinel `master lattice` flags for Redis, `nats server list` for NATS, `mc admin info` for MinIO.
+3. **Drain and freeze writes**: remove the load-balancer weight, wait for connections to drain (node `preStop` 10 s plus the WS `bye` frame), then freeze writes to the target component. Read-only troubleshooting does not need downtime.
+4. **Switch over or restore** with the commands in [`patroni/README.md`](patroni/README.md), [`redis/README.md`](redis/README.md), [`nats/README.md`](nats/README.md), or [`minio/README.md`](minio/README.md).
+5. **Verify** component self-checks and a production smoke test (login, health, message round-trip, object download).
+6. **Reconcile**: `lock:reconcile` rebuilds pending state from `delivery_log` at node startup or on its periodic task; confirm idempotence.
+7. **Ramp up and record**: load-balancer weight 5% → 25% → 100%, observing error rate, latency, and backlog for at least 10 minutes at each step; then record RTO (`T0` → ramp-up complete), RPO (last successful archive/replication), cause, and improvements in the drill report.
 
-1. **Detect**: alert (component `up=0` / replication lag / `pg_stat_archiver.failed_count>0` / Sentinel `+odown` /
-   NATS `server down` / MinIO `drive offline`) → record `T0` (the RTO start).
-2. **Confirm**: do not just check process liveness; confirm "is a switchover really needed": for PG check
-   `patronictl list` and `pg_isready`; for Redis check the flags of Sentinel `master lattice`; for NATS check
-   `nats server list`; for MinIO check `mc admin info`.
-3. **Drain/freeze writes** (when the data plane is involved): remove the LB weight → wait for connections to
-   drain (node preStop 10s + WS `byef`) → freeze writes to the target component. **Read-only troubleshooting
-   may proceed without downtime**, but switchover/restore requires freezing.
-4. **Perform switchover/restore**: per the commands in each component README (PG §4, Redis §4, NATS §4, MinIO §4).
-5. **Verify**: component self-checks + `python scripts/reconcile.py` + production smoke test (login/health/message round-trip/object download).
-6. **Reconcile**: `lock:reconcile` (node startup or periodic task) rebuilds pending from `delivery_log`;
-   confirm idempotence.
-7. **Phased ramp-up**: LB weight 5% → 25% → 100%, observing error rate/latency/backlog for ≥10min at each step.
-8. **Record**: RTO (T0→ramp-up complete), RPO (the data point of the last successful archive/replication),
-   cause, and improvements; write them into the drill/incident report (report fields in `scripts/restore-runbook.md`).
+### Failback principles
 
-### 5.1 Failback principles
+- Do not fail back merely to restore the previous layout; let Patroni, Sentinel, or Raft decide the steady state.
+- PostgreSQL: wait until the old primary rejoins as a replica with lag ≈ 0, then run one `patronictl switchover` ([`patroni/README.md`](patroni/README.md)).
+- Redis: trigger `sentinel failover lattice` again; never run `slaveof` manually ([`redis/README.md`](redis/README.md)).
+- NATS and MinIO: a recovered node rejoins and catches up automatically; roll back only configuration or image tags.
+- A failback is itself a switchover and requires draining, reconciliation, and RTO/RPO recording.
 
-- **Do not fail back just to "look restored"**: let the steady-state topology be decided by Patroni/Sentinel/Raft.
-- Planned PG switchover back to the original primary: wait until the original primary has rejoined as a
-  replica with lag≈0, then run `patronictl switchover` once (`patroni/README.md` §4.2).
-- Redis failback: trigger `sentinel failover lattice` once more; **do not run `slaveof` manually** (`redis/README.md` §4).
-- NATS/MinIO: a recovered node rejoins the cluster/catches up with Raft automatically; failback only needs a
-  configuration/image tag rollback.
-- Failback also counts as a switchover → it equally requires draining, reconciliation, and RTO/RPO recording.
+## Static validation
 
-### 5.2 Component-level command index
-
-| Component | Document |
-|---|---|
-| PG (failover / switchover / PITR / etcd quorum) | [`patroni/README.md`](patroni/README.md) §4 |
-| Redis (Sentinel failover / failback / reconciliation) | [`redis/README.md`](redis/README.md) §4 |
-| NATS (single-node failure / 2-node failure degradation / rolling upgrade) | [`nats/README.md`](nats/README.md) §4 |
-| MinIO (drive/node failure, heal, replication) | [`minio/README.md`](minio/README.md) §4 |
-
-## 6. Validation
-
-Offline validation (no Docker, no cluster, no containers started):
-
-```powershell
-python scripts/ha-manifest-check.py            # YAML/TOML parsing + replica counts/ports/probes/secret placeholders + EC/RPO parameters
-python scripts/ha-manifest-check.py --docker   # additionally runs `docker compose config` (requires the local docker CLI)
-python scripts/ha-prod-validate.py             # production hardening: Helm multi-profile lint/template + TLS/Patroni/PITR asset checks
-python scripts/helm-canary-validate.py         # canary templates + PITR schedule retention assertions; regresses the previous 47 items / 182 items
+```bash
+# these checks need no cluster and start no containers
+docker compose -f deploy/compose/ha-dev.yaml config --quiet
+for f in deploy/production/*/docker-compose.yml; do docker compose -f "$f" config --quiet; done
+helm lint deploy/helm/lattice
+helm template lattice deploy/helm/lattice --namespace lattice > /dev/null
+for f in deploy/production/*/*.sh; do sh -n "$f"; done
 ```
 
-- The `ha-manifest-check.py` baseline = **all 182 items PASS** (unchanged after this hardening; new assets are covered by `ha-prod-validate.py`);
-- `ha-prod-validate.py` covers: `helm lint` + `helm template` for multiple chart values profiles + Python
-  structural checks (resource fields/references/TOML/security context/NetworkPolicy/PDB/CronJob/TLS path
-  alignment), this directory's TLS (cert-manager manifests/Secret key contract/no plaintext private keys),
-  Patroni (etcd templates/runbook/sync-async overlay/REST API TLS), and backup (SQL shares the same source as
-  the chart, script retention/encryption sections), and verifies that the two copies of `archive-verify.sql`
-  are verbatim identical; without kubeconform locally it falls back to Python structural checks
-  (`--kubeconform <path>` can specify the binary explicitly);
-- Validation details are in each script's header comments; it prints per-item `PASS/FAIL` + `RESULT: checks=N pass=N fail=N`;
-- The compose files in this directory **publish no host ports** (they only express topology), so there is zero
-  port conflict with the dev stack (5432/6379/4222/9000/8080/8088/1883/9090/9100/8222);
-- This directory does not modify `deploy/compose/dev.yaml` and does not touch the `lattice-dev-*` containers.
+The assets were reviewed statically: compose topology, replica counts, ports, health checks, probe definitions, secret placeholders, Patroni parameters, and the erasure-coding shape. These checks do not prove HA behavior and do not replace a drill.
 
-## 7. Limitations explicitly not validated on this machine (must not be skipped)
+## Limitations
 
-1. **No multi-node cluster**: this machine only has single-host Docker; Patroni/etcd/Sentinel/NATS Raft/MinIO
-   distributed EC **cluster behavior is entirely unmeasured** (the configuration has only been statically validated).
-2. **Failover has never happened**: the PG 30–60s figure is estimated from `ttl=30/loop_wait=10/retry_timeout=10`
-   (leader key expiry dominates), Redis 5–15s from `down-after=5s`, and NATS Raft election is untested; split-brain
-   protection (`watchdog`) is disabled by default. The automatic/manual switchover, pg_rewind, and split-brain
-   handling in `patroni/failover-runbook.md` are equally **not drilled**.
-3. **TLS/mTLS is a template, not an integration result**: `tls/` now has certificate manifests, the Secret key
-   contract, and rotation procedures, but this machine has no cert-manager/real certificates, and **no real
-   TLS/mTLS handshake has ever been performed**; `pg_hba` still defaults to plaintext `host` rules (change to
-   `hostssl` in production); the QUIC/WebTransport UDP LB and source IP preservation are unvalidated.
-4. **WAL archiving to object storage is unvalidated**: `wal-gateway.sh` has only done an equivalent-mechanism
-   drill with local-directory archiving (PITR 34/34, `perf/README.md` §8); the MinIO archive path, archive
-   failure alerting, and `pg_wal` backlog thresholds are unvalidated. The retention/encryption (SSE-KMS, object
-   lock, age), cross-site replication, and real execution of the Helm CronJobs in `backup/` are equally **unvalidated**.
-5. **Redis Sentinel has not been integration-tested with nodes**: nodes do not support the Sentinel protocol
-   (a code fact), and the stable-endpoint (HAProxy/VIP/DNS) approach has not been validated with nodes; node
-   behavior during the switchover window (connection error → reconnect) is unmeasured.
-6. **The NATS replica-count gap is avoided by deployment**: the code creates streams with the default
-   `replicas=1`; this skeleton requires running `streams.sh` first. That script has never run on a real 3-node
-   cluster (no cluster available); online scale-out with `nats stream update --replicas 3` is unvalidated.
-7. **MinIO distributed shape/cross-site replication unvalidated**: EC 12+4 fault tolerance and self-healing,
-   heal duration, cross-site replication, and the interaction between object lock and the node delete path have
-   never been exercised; the only drill was single-host single-drive data-directory recovery.
-8. **Backup scheduling and off-site copies are not in place**: the Helm daily `pg_dump` CronJob is only a full
-   baseline, not PITR; the `backup.pitr` physical base/archive-verify CronJobs are new templates (never run on a
-   cluster); archiving to `lattice-cold`, off-site copies, and backup monitoring all still need ops to fill in
-   (the "quarterly drill" requirement in design §11).
-9. **The manual phase is not drilled**: the human decision time for failure triage/drain/phased ramp-up/failback
-   is not included in any measured RTO.
-10. **Capacity/large databases unvalidated**: base backup windows, archive backlog, EC write amplification, and
-    Stream storage limits have not been load-tested at production data volumes.
-11. **No production LB/VIP/Keepalived configuration is provided**: this directory only has illustrative HAProxy
-    fragments (§4), with no high availability or integration testing.
-12. **Canary release unvalidated on a real cluster**: the chart's canary only has offline render assertions
-    (weights/headers/rollback/resource contract, `scripts/helm-canary-validate.py`); real ingress-nginx
-    proportional splitting and header matching, the precedence of `/v1` versus the existing `/` prefix, and
-    hot-updating of Ingress annotations by `helm upgrade --reuse-values` are all **unmeasured**; in the production
-    topology, traffic weights for Nginx/Envoy directly hitting nodes must be configured on the external LB
-    (`canary-runbook.md` §1/§10).
-13. **This directory is not wired into `scripts/check-all.ps1` yet**: lead integrates it centrally; run the §6
-    commands manually before that.
+1. **No multi-node cluster**: Patroni/etcd, Sentinel, NATS Raft, and MinIO distributed EC behavior are unmeasured; the configuration has only been reviewed statically. A single-host drill stack is available in [`../compose/ha-dev.yaml`](../compose/ha-dev.yaml), but it is a demonstration, not a production cluster.
+2. **Failover is not exercised**: the PostgreSQL 30–60 s figure is derived from `ttl=30`/`loop_wait=10`/`retry_timeout=10`; Redis 5–15 s from `down-after=5s`; NATS Raft election is untested. `watchdog`, `pg_rewind`, and split-brain handling are equally not drilled.
+3. **TLS/mTLS is a template**: no certificate authority, cert-manager, or real handshake has been exercised. `pg_hba` still defaults to plaintext `host` rules; switch to `hostssl` in production. QUIC/WebTransport UDP load balancing and source-IP preservation are unvalidated.
+4. **WAL archiving to object storage is unvalidated**: [`patroni/wal-gateway.sh`](patroni/wal-gateway.sh) only performs single-object put/get with size verification using `mc`; the MinIO archive path, archive-failure alerting, and `pg_wal` backlog thresholds are untested. The templates also provide no encryption, compression, or retention policy; use WAL-G or pgBackRest in production.
+5. **Redis Sentinel is not integration-tested with nodes**: the node does not implement the Sentinel protocol, and the stable-endpoint approach has not been validated with a running node; behavior during the switchover window is unmeasured.
+6. **The NATS replica gap is avoided by deployment**: the code creates streams with `replicas=1`, so `streams.sh` must run first. That script has not run on a real three-node cluster, and online scale-out with `nats stream update --replicas 3` is unvalidated.
+7. **MinIO distributed shape and cross-site replication are unvalidated**: EC 12+4 fault tolerance, self-healing duration, cross-site replication, and the interaction between object lock and the node's delete path have not been exercised.
+8. **Backup scheduling and off-site copies are not in place**: the Helm daily `pg_dump` CronJob is a full baseline, not PITR; the PITR CronJobs are templates and have never run on a cluster; archive retention, off-site copies, and backup-failure monitoring still need operations work.
+9. **The manual phase and capacity are not measured**: human triage, drain, phased ramp-up, and failback time are not included in any RTO; base-backup windows, archive backlog, EC write amplification, and stream storage limits have not been load-tested at production volume.
+10. **No production load balancer or VIP configuration is provided**: this directory has illustrative HAProxy fragments only, and the canary release has never run on a real cluster, so ingress-nginx weight/header splitting, `/v1` prefix precedence, and annotation hot-updates are unmeasured ([`canary-runbook.md`](canary-runbook.md)).
 
-## 8. Rollback (removing this skeleton / rolling back a deployed cluster)
+## Rollback
 
 | Layer | Rollback action |
 |---|---|
-| **Repository files** (not deployed) | Simply delete `deploy/production/`, `deploy/compose/ha-dev.yaml`, `scripts/ha-manifest-check.py`, and `scripts/ha-prod-validate.py`; there is no runtime state and no container/port residue |
-| **New production assets** (TLS/Patroni/PITR) | Not deployed: delete `deploy/production/tls/`, `deploy/production/backup/`, and the added `etcd-*`/`failover-runbook.md`/`*.overlay.yml` under `deploy/production/patroni/`; on the Helm side, turn `tls.enabled`/`backup.pitr.enabled`/`networkPolicy.*`/`security.*` back to their defaults and `helm upgrade` (workloads only, no data change) |
-| **Production already deployed per the skeleton** | For per-component rollback see each README's "Rollback" table; overall rollback order = reverse of the deployment order: LB drain → node tag rollback → web → NATS/Redis/MinIO configuration rollback → PG rollback (PG last, and major-version upgrades cannot be reverted in place) |
-| **Drill residue** | None of this skeleton's compose files publishes host ports; if it was ever started on a single host (`ha-dev.yaml`), clean up with `docker compose -f deploy/compose/ha-dev.yaml down -v` and verify the `lattice-dev-*` container IDs are unchanged |
-| **Switchover failback** | See §5.1; every failback counts as a new switchover and requires reconciliation + recording |
-| **Canary rollback** | First `--set canary.weight=0` (0% traffic, canary replicas kept for troubleshooting), then `--set canary.enabled=false` (removes the canary resources), or `helm rollback <release> <revision>` to roll back the whole release; database migrations only move forward, so confirm compatibility before rolling back the image (chart README §8, `canary-runbook.md` §7) |
-
-## 9. File list
-
-| Path | Content |
-|---|---|
-| `README.md` | This file: topology/deployment order/RPO-RTO/configuration mapping/runbook/boundaries/rollback |
-| `config/production.toml.example` | Production `config.toml` template (including `[pg]/[redis]/[bus]/[s3]` + `[mqtt]/[grpc]/[quic]` TLS sections and the Secret injection list) |
-| `patroni/patroni.yml` | Authoritative Patroni parameters (one copy per node, rendered from placeholders; synchronous replication/pg_rewind/WAL archiving/PITR prerequisites) |
-| `patroni/docker-compose.yml` | Single-host topology reference for 3 Patroni + 3 etcd |
-| `patroni/wal-gateway.sh` | Reference implementation of `archive_command`/`restore_command` (MinIO archiving → PITR) |
-| `patroni/init-lattice-db.sh` | Idempotent database creation at first bootstrap |
-| `patroni/README.md` | Patroni deployment/probes/switchover/failback/archiving/boundaries |
-| `patroni/etcd-dcs.md` | etcd/DCS production notes: 3 nodes, quorum, DCS key layout, failure handling, snapshot backup/restore |
-| `patroni/etcd.conf.template` / `etcd.service.template` | etcd configuration + systemd unit templates (TLS/mTLS, quota/compaction, non-root hardening) |
-| `patroni/failover-runbook.md` | Failover runbook: decision matrix, automatic/manual failover, pg_rewind, split-brain handling, post-switchover verification |
-| `patroni/patroni-restapi-tls.overlay.yml` | REST API TLS + etcd mTLS configuration fragment (optional) |
-| `patroni/patroni-dcs-async.overlay.yml` | Synchronous→asynchronous replication downgrade fragment (cost of RPO>0 and failback) |
-| `tls/README.md` | Production TLS/mTLS certificate system: termination-point matrix, trust root, cert-manager/sealed-secrets, Secret contract, rotation/revocation, verification |
-| `tls/cert-manager.yaml` | ClusterIssuers (internal CA/ACME) + 5 Certificate examples (placeholder domains) |
-| `tls/sealed-secret.example.yaml` | SealedSecret manifest shape (empty shell; requires kubeseal output to apply) |
-| `backup/README.md` | Backup/PITR productionization: three backup layers, scheduling/retention (object storage + K8s Job layers), encryption/object lock/off-site copy, alerting, restore procedure |
-| `canary-runbook.md` | Canary release/rollback runbook: prerequisites, traffic path, phased ramp-up and decision metrics, rollback decision matrix, unvalidated boundaries (chart-side implementation in `../helm/lattice/README.md` §10) |
-| `backup/archive-verify.sql` | Archive health SQL (verbatim identical to the chart's `files/archive-verify.sql`) |
-| `backup/base-backup.sh` / `pitr-verify.sh` | Bare-metal equivalent scripts (pg_basebackup upload + archive verification; offline-checkable with `sh -n`) |
-| `redis/redis-master.conf` / `redis-replica.conf` | Primary/replica templates (AOF, noeviction, TLS/ACL placeholders) |
-| `redis/sentinel.conf` | Sentinel template ×3 (master `lattice`, quorum 2, auth/TLS placeholders) |
-| `redis/docker-compose.yml` | Single-host topology reference for 1 primary, 2 replicas, Sentinel×3 |
-| `redis/README.md` | Redis deployment, node-side limitations, failover, failback, boundaries |
-| `nats/nats-0.conf`/`nats-1.conf`/`nats-2.conf` | 3-node JetStream cluster configuration (three-way routes) |
-| `nats/streams.sh` | **Pre-creates the 4 Streams with replicas=3** (retention identical to the code) + verification |
-| `nats/docker-compose.yml` | Single-host 3-node topology reference |
-| `nats/README.md` | Stream retention policy, why pre-creation is required, failure behavior, boundaries |
-| `minio/docker-compose.yml` | 4 nodes ×4 drives EC 12+4 startup template (`MINIO_ERASURE_SET_DRIVE_COUNT=16`) |
-| `minio/bucket-setup.sh` | 4 buckets + versioning + object lock (cold) + IAM user + replication notes |
-| `minio/README.md` | EC capacity/fault tolerance, mapping to `[s3]`, failure/heal, replication, boundaries |
-| `../compose/ha-dev.yaml` | **Optional** single-host multi-container drill stack (non-conflicting ports; takes no traffic) |
-| `../../scripts/ha-manifest-check.py` | Offline validation script (PASS/FAIL; baseline 182 items) |
-| `../../scripts/ha-prod-validate.py` | Production hardening validation (Helm multi-profile + TLS/Patroni/PITR assets; new) |
-
-## 10. Isolation from the dev environment
-
-- None of the compose files in this directory **publish host ports** (production entry points live on the
-  LB/VIP); there is **zero conflict** with the dev stack's 5432/6379/4222/9000/9001/8080/8088/1883/9090/9100/8222.
-- `deploy/compose/ha-dev.yaml` uses non-conflicting ports 15432–15434 / 16379–16381 / 26379–26381 /
-  14222–14224 / 18222–18224 / 19000–19003, is profile-gated, and does not start by default.
-- This skeleton (including the added `tls/`, `backup/`, `patroni/etcd-*`/runbooks, and Helm TLS/PITR templates)
-  is **read-only file work**: `ha-manifest-check.py --docker` only runs `docker compose config` (starting no
-  containers), and `ha-prod-validate.py` only runs local Helm binary (`.tooling/helm/`) rendering + Python
-  structural checks, never exec/stop/restart any `lattice-dev-*` container.
+| Repository files (not deployed) | Delete `deploy/production/` and `deploy/compose/ha-dev.yaml`; there is no runtime state, container, or port residue |
+| New TLS/Patroni/PITR templates (not deployed) | Delete `deploy/production/tls/`, `deploy/production/backup/`, and the added `etcd-*`/`failover-runbook.md`/`*.overlay.yml` files under `deploy/production/patroni/`; on the Helm side reset `tls.enabled`, `backup.pitr.enabled`, `networkPolicy.*`, and `security.*` to their defaults and run `helm upgrade` |
+| Production deployed from this skeleton | Per-component rollback is in each component README; overall order is the reverse of deployment: LB drain → node image rollback → web → NATS/Redis/MinIO configuration rollback → PostgreSQL last (major-version upgrades cannot be reverted in place) |
+| Drill residue | These compose files publish no host ports; if the single-host drill stack was started, clean up with `docker compose -f deploy/compose/ha-dev.yaml down -v` and confirm the `lattice-dev-*` containers are untouched |
+| Switchover failback | Follow the failback principles above; every failback counts as a new switchover and requires reconciliation and recording |
+| Canary rollback | Set `canary.weight=0` first (0% traffic, canary replicas kept for troubleshooting), then `canary.enabled=false`, or use `helm rollback <release> <revision>`; migrations only move forward, so confirm compatibility before rolling back the image ([`canary-runbook.md`](canary-runbook.md), [`../helm/lattice/README.md`](../helm/lattice/README.md)) |

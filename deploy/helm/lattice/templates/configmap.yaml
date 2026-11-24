@@ -42,6 +42,22 @@ data:
     bucket_cold = {{ .Values.deps.s3.bucketCold | quote }}
     bucket_plugins = {{ .Values.deps.s3.bucketPlugins | quote }}
 
+    [transfer]
+    # Download transfer plane: the node mints a short-lived capability token per object and answers 302 to
+    # {public_base_url}/t/{token}; the standalone transfer Deployment verifies it and streams the object from the
+    # internal S3 endpoint. The HMAC key itself is injected through the environment and never appears in this file.
+    enabled = {{ .Values.transfer.enabled }}
+    # Empty transfer.publicBaseUrl = derived: the Ingress host when ingress.enabled, else the in-cluster Service
+    public_base_url = {{ include "lattice.transfer.publicBaseUrl" . | quote }}
+    token_ttl_secs = {{ .Values.transfer.tokenTtlSecs }}
+    listen = {{ printf "0.0.0.0:%v" .Values.transfer.service.port | quote }}
+    metrics_listen = {{ printf "0.0.0.0:%v" .Values.transfer.service.metricsPort | quote }}
+    connect_timeout_ms = 3000
+    read_timeout_ms = 30000
+    # whole-request cap of the transfer service; in-flight downloads are cut by terminationGracePeriodSeconds, not here
+    request_timeout_ms = 300000
+    max_inflight = {{ .Values.transfer.maxInflight }}
+
     [bus]
     kind = {{ .Values.deps.bus.kind | quote }}
     nats_url = {{ .Values.deps.bus.natsUrl | quote }}

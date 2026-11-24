@@ -205,6 +205,37 @@ impl S3 {
         self.presign("GET", bucket, key, ttl_secs)
     }
 
+    /// Ordered internal endpoints for the transfer plane (design §6.10): `endpoint` first, then
+    /// `[s3] endpoints`. Duplicates and blank entries are dropped; hosts keep their scheme/port.
+    pub(crate) fn transfer_endpoints(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for raw in std::iter::once(&self.cfg.endpoint).chain(self.cfg.endpoints.iter()) {
+            let ep = raw.trim().trim_end_matches('/').to_string();
+            if ep.is_empty() || out.iter().any(|e| e == &ep) {
+                continue;
+            }
+            out.push(ep);
+        }
+        out
+    }
+
+    /// Internal presigned URL against an explicit endpoint base (transfer failover).
+    ///
+    /// The signature covers only the `Host` header, so each candidate endpoint must sign with
+    /// its own host; reusing one URL against another endpoint would be a 403.
+    pub(crate) fn internal_url_at(
+        &self,
+        method: &str,
+        base: &str,
+        bucket: &str,
+        key: &str,
+        ttl_secs: u64,
+    ) -> String {
+        let base = base.trim().trim_end_matches('/');
+        let host = strip_host(base);
+        self.presign_with_query(method, bucket, key, ttl_secs, &[], &host, base)
+    }
+
     // ------------------------------------------------------------------
     // Residual multipart cleanup (E04 / `lock:gc-multipart`, ⑥ §2.6 / ⑥ §4)
     // ------------------------------------------------------------------
@@ -987,8 +1018,7 @@ struct HttpResp {
 ///
 /// Explicitly supports only `http://`: same constraint as [`S3::endpoint_host_port`] (TLS is terminated by the fronting proxy);
 /// on `https://` it must error rather than silently downgrade to plaintext.
-fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {
-    let rest = url
+pub(crate) fn parse_http_url(url: &str) -> Result<(String, u16, String), String> {    let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("only http:// endpoints are supported for object IO: {url}"))?;
     let (host_port, path) = match rest.find('/') {

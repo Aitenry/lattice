@@ -46,6 +46,11 @@ app.kubernetes.io/component: node
 app.kubernetes.io/component: web
 {{- end -}}
 
+{{- define "lattice.transfer.selectorLabels" -}}
+{{ include "lattice.selectorLabels" . }}
+app.kubernetes.io/component: transfer
+{{- end -}}
+
 {{- define "lattice.node.fullname" -}}
 {{ include "lattice.fullname" . }}-node
 {{- end -}}
@@ -67,6 +72,25 @@ app.kubernetes.io/component: node-canary
 
 {{- define "lattice.web.fullname" -}}
 {{ include "lattice.fullname" . }}-web
+{{- end -}}
+
+{{- define "lattice.transfer.fullname" -}}
+{{ include "lattice.fullname" . }}-transfer
+{{- end -}}
+
+{{/*
+ Public base URL of the download transfer plane (no trailing slash: the node appends /t/{token}).
+ transfer.publicBaseUrl pins it; otherwise derive from the Ingress host, or from the in-cluster transfer Service
+ (the last case is reachable only inside the cluster, so a deployment without an Ingress must pin the value).
+*/}}
+{{- define "lattice.transfer.publicBaseUrl" -}}
+{{- if .Values.transfer.publicBaseUrl -}}
+{{- .Values.transfer.publicBaseUrl -}}
+{{- else if .Values.ingress.enabled -}}
+{{- printf "https://%s" .Values.ingress.host -}}
+{{- else -}}
+{{- printf "http://%s:%v" (include "lattice.transfer.fullname" .) .Values.transfer.service.port -}}
+{{- end -}}
 {{- end -}}
 
 {{- define "lattice.secretName" -}}

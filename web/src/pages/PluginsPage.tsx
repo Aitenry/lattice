@@ -6,7 +6,6 @@ import {
   Card,
   Descriptions,
   Drawer,
-  Empty,
   Form,
   Input,
   InputNumber,
@@ -15,15 +14,14 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import {
-  AppstoreOutlined,
   DatabaseOutlined,
   FolderOpenOutlined,
   ReloadOutlined,
   RocketOutlined,
-  SafetyCertificateOutlined,
   ThunderboltOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
@@ -32,7 +30,8 @@ import { listPlugins, pluginAction, pluginStats } from '@/api/endpoints'
 import type { AdminPluginsResp, PluginRow, WasmRuntimeState } from '@/api/types'
 import { useAuth } from '@/auth/AuthProvider'
 import { PLUGIN_STATUS, pick, toneOf } from '@/lib/labels'
-import { fmtBytes } from '@/lib/format'
+import { fmtBytes, fmtRelative, fmtTime } from '@/lib/format'
+import { HelpTip } from '@/components/HelpTip'
 import { JsonPeek } from '@/components/JsonPeek'
 import { useI18n, type Translate } from '@/i18n'
 
@@ -58,194 +57,216 @@ function loadedName(entry: Record<string, unknown>, t: Translate): string {
 /**
  * WASM runtime status card (read-only).
  *
- * Data comes from the `wasm` section of `GET /v1/admin/plugins`: enabled/compiled/trusted_keys/
- * loaded/rejected/sources stats. **When the feature is off the API omits this field and the whole card is hidden**
- * (the caller decides); nothing here guesses defaults or allows any action.
+ * Data comes from the `wasm` section of `GET /v1/admin/plugins`. **When the feature is off the API
+ * omits this field and the whole card is hidden** (the caller decides); nothing here guesses
+ * defaults or allows any action.
+ *
+ * Layout: status tags in the card header, three headline numbers and load/rejection details in
+ * the main column, source facts in a side column. The old design packed six equally-sized tiles
+ * into one row and put everything else in the same column, which made the page look crowded; the
+ * two-column split keeps numbers and narrative apart without hiding any field.
  */
-function WasmStatusPanel({ wasm, loading }: { wasm: WasmRuntimeState; loading: boolean }) {
+function WasmStatusPanel({ wasm }: { wasm: WasmRuntimeState }) {
   const { t } = useI18n()
   const loaded = Array.isArray(wasm.loaded) ? wasm.loaded : []
   const rejected = Array.isArray(wasm.rejected) ? wasm.rejected : []
   const dir = wasm.sources?.dir ?? null
   const pg = wasm.sources?.pg ?? null
   const enabled = Boolean(wasm.enabled)
-  const compiled = Boolean(wasm.compiled)
   const trustLabel =
-    typeof wasm.signature_verification === 'string' && wasm.signature_verification && wasm.signature_verification !== 'not_implemented'
+    typeof wasm.signature_verification === 'string' &&
+    wasm.signature_verification &&
+    wasm.signature_verification !== 'not_implemented'
       ? wasm.signature_verification
       : t('Signature verification off')
   const dirLoaded = dir?.loaded
   const dirRejected = dir?.rejected
+  const trustedKeys = wasm.trusted_key_ids?.length ?? wasm.trusted_keys ?? 0
+  const pgMeta =
+    !pg || pg.enabled === false
+      ? t('Not enabled')
+      : typeof pg.rows === 'number'
+        ? t('Queried {count} rows · {conflicts} conflicts', {
+            count: pg.rows,
+            conflicts: typeof pg.conflicts === 'number' ? pg.conflicts : 0,
+          })
+        : '—'
 
   return (
-    <div className="wasm-panel" data-testid="wasm-panel">
-      <div className="wasm-panel-head">
-        <div>
-          <div className="wasm-panel-title">
-            <ThunderboltOutlined />
-            {t('WASM plugin sandbox')}
-            <Tag color={enabled ? 'green' : 'default'}>{enabled ? t('Runtime enabled') : t('Runtime disabled')}</Tag>
-            <Tag color={compiled ? 'blue' : 'default'}>{compiled ? t('Can compile and run') : t('Not compiled')}</Tag>
-            {wasm.require_verified_signature ? <Tag color="gold">{t('Signed plugins only')}</Tag> : null}
-          </div>
-          <div className="wasm-panel-sub">
-            {t(
-              'Read-only status, from the WASM section of the plugin API. WASM plugins run inside a wasmtime sandbox: it limits resources, but',
+    <section className="panel wasm-card">
+      <div className="panel-head">
+        <span className="panel-title">
+          <ThunderboltOutlined />
+          {t('WASM plugin runtime')}
+          <HelpTip
+            title={t(
+              'Loads signed .wasm plugins from the plugin directory and the PG registry. WASM runs inside a wasmtime sandbox that limits resources, but that is not a substitute for signatures: failed verification is rejected without affecting startup or other plugins.',
             )}
-            <b>{t(' not a substitute for signatures')}</b>
-            {t(': plugins that fail signature verification are refused, and node readiness is unaffected.')}
-          </div>
-        </div>
-        {typeof wasm.wasm_dir === 'string' && wasm.wasm_dir ? (
-          <span className="wasm-panel-sub">
-            <FolderOpenOutlined /> {wasm.wasm_dir}
-          </span>
-        ) : null}
-      </div>
-
-      <div className="wasm-stats">
-        <div className="wasm-stat">
-          <div className="wasm-stat-label">{t('Runtime')}</div>
-          <div className="wasm-stat-value small">{enabled ? t('Enabled') : t('Not enabled')}</div>
-          <div className="wasm-stat-hint">{compiled ? t('Module compilation ready') : t('Module compilation unavailable')}</div>
-        </div>
-        <div className="wasm-stat">
-          <div className="wasm-stat-label">{t('Loaded plugins')}</div>
-          <div className="wasm-stat-value">{countText(loaded.length)}</div>
-          <div className="wasm-stat-hint">
-            {t('Directory {fromDir} · Database {fromDb}', { fromDir: countText(dirLoaded), fromDb: countText(pg?.loaded) })}
-          </div>
-        </div>
-        <div className="wasm-stat">
-          <div className="wasm-stat-label">{t('Trusted public keys')}</div>
-          <div className="wasm-stat-value">{countText(wasm.trusted_keys)}</div>
-          <div className="wasm-stat-hint">{trustLabel}</div>
-        </div>
-        <div className="wasm-stat">
-          <div className="wasm-stat-label">{t('Rejected')}</div>
-          <div className="wasm-stat-value" style={{ color: rejected.length ? 'var(--tone-orange-fg)' : undefined }}>
-            {countText(rejected.length)}
-          </div>
-          <div className="wasm-stat-hint">{t('Fail-closed: a rejection never blocks startup')}</div>
-        </div>
-        <div className="wasm-stat">
-          <div className="wasm-stat-label">{t('Source · plugin directory')}</div>
-          <div className="wasm-stat-value small">
-            {t('Loaded {loaded} · Rejected {rejected}', {
-              loaded: countText(dirLoaded),
-              rejected: countText(dirRejected),
-            })}
-          </div>
-          <div className="wasm-stat-hint">{t('wasm_dir scan')}</div>
-        </div>
-        <div className="wasm-stat">
-          <div className="wasm-stat-label">{t('Source · PG registry')}</div>
-          <div className="wasm-stat-value small">
-            {pg?.enabled === false
-              ? t('Not enabled')
-              : t('Loaded {loaded} · Rejected {rejected}', {
-                  loaded: countText(pg?.loaded),
-                  rejected: countText(pg?.rejected),
-                })}
-          </div>
-          <div className="wasm-stat-hint">
-            {typeof pg?.rows === 'number' ? t('Queried {count} rows · ', { count: pg.rows }) : ''}
-            {typeof pg?.conflicts === 'number' ? t('{count} conflicts · ', { count: pg.conflicts }) : ''}
-            {t('Directory takes precedence')}
-          </div>
-        </div>
-      </div>
-
-      {loaded.length ? (
-        <div>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            {t('Loaded (source: {source}; in load order)', {
-              source: wasm.from_db ? t('directory + database') : t('directory'),
-            })}
-          </Typography.Text>
-          <Space wrap size={[8, 8]} style={{ marginTop: 8 }}>
-            {loaded.map((entry, index) => {
-              const item = entry as Record<string, unknown>
-              const source = typeof item.source === 'string' ? item.source : null
-              const version = typeof item.version === 'string' ? item.version : null
-              return (
-                <Tag key={`${loadedName(item, t)}-${version ?? index}`} color="blue">
-                  {loadedName(item, t)}
-                  {version ? <span style={{ opacity: 0.75 }}> @ {version}</span> : null}
-                  {source ? <span style={{ opacity: 0.75 }}> · {source}</span> : null}
-                </Tag>
-              )
-            })}
-          </Space>
-        </div>
-      ) : (
-        <Empty
-          image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description={
-            <span className="wasm-panel-sub">
-              {enabled
-                ? t('The WASM runtime is enabled, but no plugin is loaded yet.')
-                : t('The WASM runtime is disabled, and no plugin is loaded.')}{' '}
-              {t('Put signed plugins into')}{' '}
-              <span className="mono">{wasm.wasm_dir || 'wasm_dir'}</span>
-              {t(', or publish them in the PG plugin registry and refresh this page. Unsigned plugins and plugins that fail verification are listed under "Rejected".')}
-            </span>
-          }
-        />
-      )}
-
-      {rejected.length ? (
-        <div>
-          <Alert
-            type="warning"
-            showIcon
-            icon={<WarningOutlined />}
-            message={t('{count} plugins were refused (fail-closed; other plugins and node readiness are unaffected)', {
-              count: rejected.length,
-            })}
-            style={{ marginBottom: 8 }}
           />
-          <div className="wasm-reject-list">
-            {rejected.slice(0, 5).map((entry, index) => {
-              const item = entry as Record<string, unknown>
-              const kind = typeof item.kind === 'string' ? item.kind : 'unknown'
-              const plugin = typeof item.plugin === 'string' ? item.plugin : typeof item.ns === 'string' ? item.ns : '—'
-              const reason = typeof item.reason === 'string' ? item.reason : ''
-              return (
-                <div key={`${plugin}-${index}`} className="wasm-reject-item">
-                  <span className="kind">{kind}</span>
-                  <span className="plugin">{plugin}</span>
-                  <span style={{ minWidth: 0 }}>{reason}</span>
-                </div>
-              )
-            })}
-            {rejected.length > 5 ? (
-              <span className="wasm-panel-sub">{t('Showing the first 5 only; see technical details for every reason.')}</span>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-
-      <div className="wasm-foot">
-        <span>
-          <AppstoreOutlined />{' '}
-          {t('Max module {size}', {
-            size: typeof wasm.max_wasm_bytes === 'number' ? fmtBytes(wasm.max_wasm_bytes) : '—',
-          })}
-        </span>
-        <span>
-          <SafetyCertificateOutlined />{' '}
-          {t('Trusted keys: {count}', { count: wasm.trusted_key_ids?.length ?? wasm.trusted_keys ?? 0 })}
-        </span>
-        <span>
-          <DatabaseOutlined />{' '}
-          {wasm.from_db ? t('Reads the database registry') : t('Does not read the database registry')}
         </span>
       </div>
+      <div className="wasm-grid">
+        <div className="wasm-main">
+          <div className="wasm-summary">
+            <div className="wasm-stat">
+              <div className="wasm-stat-label">{t('Loaded plugins')}</div>
+              <div className="wasm-stat-value">{countText(loaded.length)}</div>
+              <div className="wasm-stat-hint">
+                {t('Directory {fromDir} · Database {fromDb}', {
+                  fromDir: countText(dirLoaded),
+                  fromDb: countText(pg?.loaded),
+                })}
+              </div>
+            </div>
+            <div className="wasm-stat">
+              <div className="wasm-stat-label">{t('Rejected')}</div>
+              <div
+                className="wasm-stat-value"
+                style={{ color: rejected.length ? 'var(--tone-orange-fg)' : undefined }}
+              >
+                {countText(rejected.length)}
+              </div>
+              <div className="wasm-stat-hint">{t('Fail-closed: a rejection never blocks startup')}</div>
+            </div>
+            <div className="wasm-stat">
+              <div className="wasm-stat-label">{t('Trusted public keys')}</div>
+              <div className="wasm-stat-value">{countText(trustedKeys)}</div>
+              <div className="wasm-stat-hint">{trustLabel}</div>
+            </div>
+          </div>
 
-      <JsonPeek data={wasm} label={t('Raw response of the WASM section of the plugin API (read-only; with load and rejection details and safety notes)')} />
-      {loading ? <span className="wasm-panel-sub">{t('Refreshing…')}</span> : null}
-    </div>
+          {loaded.length ? (
+            <div className="wasm-block">
+              <div className="wasm-block-head">
+                <span className="wasm-block-title">{t('Load details')}</span>
+                <span className="wasm-block-sub">
+                  {t('Loaded (source: {source}; in load order)', {
+                    source: wasm.from_db ? t('directory + database') : t('directory'),
+                  })}
+                </span>
+              </div>
+              <Space wrap size={[8, 8]}>
+                {loaded.map((entry, index) => {
+                  const item = entry as Record<string, unknown>
+                  const source = typeof item.source === 'string' ? item.source : null
+                  const version =
+                    typeof item.version === 'string'
+                      ? item.version
+                      : typeof item.version === 'number'
+                        ? String(item.version)
+                        : null
+                  return (
+                    <Tag key={`${loadedName(item, t)}-${version ?? index}`} color="blue">
+                      {loadedName(item, t)}
+                      {version ? <span style={{ opacity: 0.75 }}> @ {version}</span> : null}
+                      {source ? <span style={{ opacity: 0.75 }}> · {source}</span> : null}
+                    </Tag>
+                  )
+                })}
+              </Space>
+            </div>
+          ) : (
+            <div className="wasm-empty">
+              <div className="wasm-empty-title">
+                {enabled
+                  ? t('The WASM runtime is enabled, but no plugin is loaded yet.')
+                  : t('The WASM runtime is disabled, and no plugin is loaded.')}
+              </div>
+              <div className="muted">
+                {t('Put signed plugins into')} <span className="inline-code">{wasm.wasm_dir || 'wasm_dir'}</span>
+                {t(', or publish them in the PG registry and refresh this page.')}
+              </div>
+              <div className="muted">
+                {t(
+                  'Unsigned plugins and plugins that fail verification are listed under "Rejection details" and never block startup.',
+                )}
+              </div>
+            </div>
+          )}
+
+          {rejected.length ? (
+            <div className="wasm-block">
+              <div className="wasm-block-head">
+                <span className="wasm-block-title">
+                  <WarningOutlined /> {t('Rejection details')}
+                </span>
+                <Tag color="orange">{rejected.length}</Tag>
+              </div>
+              <div className="wasm-reject-list">
+                {rejected.slice(0, 5).map((entry, index) => {
+                  const item = entry as Record<string, unknown>
+                  const kind = typeof item.kind === 'string' ? item.kind : 'unknown'
+                  const plugin =
+                    typeof item.plugin === 'string' ? item.plugin : typeof item.ns === 'string' ? item.ns : '—'
+                  const reason = typeof item.reason === 'string' ? item.reason : ''
+                  return (
+                    <div key={`${plugin}-${index}`} className="wasm-reject-item">
+                      <span className="kind">{kind}</span>
+                      <span className="plugin">{plugin}</span>
+                      <span className="reason">{reason || '—'}</span>
+                    </div>
+                  )
+                })}
+                {rejected.length > 5 ? (
+                  <span className="wasm-block-sub">
+                    {t('Showing the first 5 only; see technical details for every reason.')}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <aside className="wasm-side">
+          <div className="wasm-side-title">{t('Security & sources')}</div>
+          <div className="wasm-side-row">
+            <span className="k">{t('Max module')}</span>
+            <span className="v">
+              {typeof wasm.max_wasm_bytes === 'number' ? fmtBytes(wasm.max_wasm_bytes) : '—'}
+            </span>
+          </div>
+
+          <div className="wasm-side-sep" />
+
+          <div className="wasm-source">
+            <div className="wasm-side-sub">
+              <FolderOpenOutlined /> {t('Plugin directory')}
+            </div>
+            <div className="wasm-side-path mono">{wasm.wasm_dir || '—'}</div>
+            <div className="wasm-side-meta">
+              {t('Loaded {loaded} · Rejected {rejected}', {
+                loaded: countText(dirLoaded),
+                rejected: countText(dirRejected),
+              })}
+            </div>
+          </div>
+
+          <div className="wasm-source">
+            <div className="wasm-side-sub">
+              <DatabaseOutlined /> {t('PG registry')}
+            </div>
+            <div className="wasm-side-meta">{pgMeta}</div>
+            <div className="wasm-side-meta">
+              {t('Loaded {loaded} · Rejected {rejected}', {
+                loaded: countText(pg?.loaded),
+                rejected: countText(pg?.rejected),
+              })}
+              {' · '}
+              {t('Directory takes precedence')}
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <div className="wasm-raw">
+        <JsonPeek
+          data={wasm}
+          label={t(
+            'Raw response of the WASM section of the plugin API (read-only; with load and rejection details and safety notes)',
+          )}
+        />
+      </div>
+    </section>
   )
 }
 
@@ -303,10 +324,29 @@ export default function PluginsPage() {
   const statEntries = scalarEntries(stats?.data)
 
   return (
-    <div className="page-scroll">
-      <div className="toolbar">
-        <div className="toolbar-right">
-          <Space>
+    <div className="page-fill">
+      {err && <Alert type="error" showIcon message={t('Failed to load')} description={err} />}
+
+      <Card className="list-card">
+        <div className="toolbar">
+          {wasm ? (
+            <>
+              <Tag color={wasm.enabled ? 'green' : 'default'}>
+                {wasm.enabled ? t('Runtime enabled') : t('Runtime disabled')}
+              </Tag>
+              <Tag color={wasm.compiled ? 'blue' : 'default'}>
+                {wasm.compiled ? t('Can compile and run') : t('Not compiled')}
+              </Tag>
+              {wasm.require_verified_signature ? <Tag color="gold">{t('Signed plugins only')}</Tag> : null}
+            </>
+          ) : null}
+          <span className="muted">{t('{count} plugins', { count: rows.length })}</span>
+          <HelpTip
+            title={t(
+              'Server-side plugins (WASM / sidecar) extend format detection and message processing — not the desktop-client Plugin hub. Publishing switches all traffic, canary routes only a share, and rollback returns to an earlier version; every action is written to the audit log.',
+            )}
+          />
+          <div className="toolbar-right">
             <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
               {t('Refresh')}
             </Button>
@@ -321,34 +361,76 @@ export default function PluginsPage() {
                 {t('Publish / roll back / canary')}
               </Button>
             )}
-          </Space>
+          </div>
         </div>
-      </div>
 
-      {err && <Alert type="error" showIcon message={t('Failed to load')} description={err} />}
+        <div className="card-scroll">
+          {/* WASM runtime status: rendered only when the API returns a wasm field (the feature is enabled) */}
+          {wasm ? <WasmStatusPanel wasm={wasm} /> : null}
 
-      {/* WASM runtime status card: rendered only when the API returns a wasm field (the feature is enabled) */}
-      {wasm ? <WasmStatusPanel wasm={wasm} loading={loading} /> : null}
+          <section className="panel plugins-registry" style={{ marginTop: wasm ? 18 : 0 }}>
+            <div className="panel-head">
+              <span className="panel-title">
+                {t('Plugin registry')}
+                <HelpTip
+                  title={t(
+                    'Versions of server plugins registered in the PG table: each row is one namespace and the current version is what nodes load. Publish switches all traffic, canary routes only a share, and rollback returns to an earlier version; every action is written to the audit log.',
+                  )}
+                />
+              </span>
+              <span className="panel-sub">{t('{count} plugins', { count: rows.length })}</span>
+            </div>
 
-      <Card>
-        <Table<PluginRow>
-          size="small"
-          rowKey={(r) => String(r.ns)}
-          loading={loading}
-          dataSource={rows}
-          locale={{ emptyText: <Empty description={t('No plugins registered yet')} image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
-          pagination={false}
-          columns={[
-            {
-              title: t('Plugin'),
-              dataIndex: 'ns',
-              render: (v: string) => <span className="cell-sub">{v}</span>,
+            <Table<PluginRow>
+              size="small"
+              tableLayout="fixed"
+              rowKey={(r) => String(r.ns)}
+              loading={loading}
+              dataSource={rows}
+              locale={{
+                emptyText: (
+                  <div className="plugins-empty">
+                    <div>{t('No plugins registered yet')}</div>
+                    <div className="muted">
+                      {t('Publish a version with "Publish / roll back / canary" and it appears here.')}
+                    </div>
+                  </div>
+                ),
+              }}
+              pagination={false}
+              columns={[
+                {
+                  title: t('Plugin (namespace)'),
+                  dataIndex: 'ns',
+              width: 220,
+              render: (v: string) => (
+                <Tooltip title={v}>
+                  <span className="mono plugins-ns">{v}</span>
+                </Tooltip>
+              ),
             },
-            { title: t('Current version'), dataIndex: 'version', width: 120, render: (v) => v ?? '—' },
+            {
+              title: t('Execution form'),
+              dataIndex: 'form',
+              width: 100,
+              responsive: ['xl'],
+              render: (v: string | undefined) =>
+                v ? (
+                  <Tag color={v === 'sidecar' ? 'purple' : 'blue'}>{v === 'sidecar' ? t('Sidecar') : 'WASM'}</Tag>
+                ) : (
+                  '—'
+                ),
+            },
+            {
+              title: t('Current version'),
+              dataIndex: 'version',
+              width: 90,
+              render: (v: number | undefined) => (v == null ? '—' : `v${v}`),
+            },
             {
               title: t('Status'),
               dataIndex: 'status',
-              width: 120,
+              width: 100,
               render: (v: string | undefined) => (
                 <Tag color={toneOf(v)}>{t(pick(PLUGIN_STATUS, v, v ? v : t('Unknown')))}</Tag>
               ),
@@ -357,17 +439,29 @@ export default function PluginsPage() {
               title: t('Canary share'),
               dataIndex: 'canary_ratio',
               width: 110,
-              render: (v: number | undefined) =>
-                v == null ? (
-                  <span className="muted">{t('All traffic')}</span>
+              render: (v: number | undefined, r) => {
+                if (r.status === 'active') return <span className="muted">{t('All traffic')}</span>
+                if (r.status === 'canary' && v) return <span>{t('{ratio}% of traffic', { ratio: v })}</span>
+                return <span className="muted">—</span>
+              },
+            },
+            {
+              title: t('Published'),
+              dataIndex: 'published_at',
+              width: 150,
+              responsive: ['xl'],
+              render: (v: string | undefined) =>
+                v ? (
+                  <Tooltip title={fmtTime(v)}>
+                    <span>{fmtRelative(v)}</span>
+                  </Tooltip>
                 ) : (
-                  <span>{t('{ratio}% of traffic', { ratio: v })}</span>
+                  '—'
                 ),
             },
-            { title: t('Calls'), dataIndex: 'calls', width: 100, render: (v) => (v == null ? '—' : v.toLocaleString()) },
             {
               title: t('Actions'),
-              width: 90,
+              width: 100,
               render: (_, r) => (
                 <Button
                   size="small"
@@ -384,8 +478,10 @@ export default function PluginsPage() {
                 </Button>
               ),
             },
-          ]}
-        />
+              ]}
+            />
+          </section>
+        </div>
       </Card>
 
       <Modal
@@ -409,8 +505,12 @@ export default function PluginsPage() {
               options={rows.map((r) => ({ value: r.ns, label: r.ns }))}
             />
           </Form.Item>
-          <Form.Item name="version" label={t('Target version')} rules={[{ required: true, message: t('Enter a version') }]}>
-            <Input placeholder={t('e.g. 1.4.2')} />
+          <Form.Item
+            name="version"
+            label={t('Target version')}
+            rules={[{ required: true, message: t('Enter a version') }]}
+          >
+            <InputNumber min={1} precision={0} style={{ width: '100%' }} placeholder={t('e.g. 3')} />
           </Form.Item>
           <Form.Item name="action" label={t('What to do')} rules={[{ required: true }]}>
             <Select

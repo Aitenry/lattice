@@ -102,7 +102,7 @@ export default function ConversationsPage() {
             total,
             showSizeChanger: false,
             onChange: (p) => setPage(p),
-            showTotal: (count) => t('{count} total', { count }),
+            showTotal: (count) => t('{count} conversations', { count }),
           }}
           columns={[
             {

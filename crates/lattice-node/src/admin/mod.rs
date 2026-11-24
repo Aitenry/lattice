@@ -108,7 +108,8 @@ async fn online(
     user: AuthUser,
     Q(q): Q<OnlineQuery>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    // Global connection inventory (not personal content): ops/admin only.
+    require_role(&user, crate::auth::Role::Ops)?;
     let target = q
         .user
         .clone()
@@ -145,13 +146,13 @@ async fn online(
 /// Shares `live::online_payload` with the SSE `online` event, so the numbers cannot diverge ("two separate
 /// calculations that disagree" — v0.13 cleanup).
 async fn online_stats(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     Ok(Json(crate::live::online_payload(&st)).into_response())
 }
 
 /// `GET /v1/admin/nodes`: node list (heartbeat/connections/version/health).
 async fn nodes(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     Ok(Json(crate::live::nodes_payload(&st).await).into_response())
 }
 
@@ -213,7 +214,7 @@ async fn drain_progress(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let remaining = if id == st.node_id { st.hub.len() } else { 0 };
     Ok(Json(json!({
         "node_id": id,
@@ -249,7 +250,7 @@ async fn queue(
     user: AuthUser,
     Q(q): Q<QueueQuery>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let target = q
         .user
         .ok_or_else(|| ApiErr(LatticeError::protocol("user is required")))?;
@@ -451,7 +452,7 @@ async fn queue_purge(
 /// and dependency health probes PG/Redis; computing per connection would multiply cost by 100 with 100 concurrent connections
 /// (v0.13 fix, see ⑤ §8.5).
 async fn stream(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     if st.metrics.sse_connections.get() as usize >= st.cfg.admin.sse_max_connections {
         return Err(ApiErr(
             LatticeError::rate("too many sse connections").with_reason("sse_limit"),
@@ -519,7 +520,7 @@ impl Drop for SseGuard {
 
 /// `GET /v1/admin/metrics`: Prometheus text (internal network only, ⑤ §8.1).
 async fn metrics(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let body = st.metrics.render();
     let mut resp = body.into_response();
     resp.headers_mut().insert(
@@ -548,9 +549,16 @@ async fn users(
 ) -> ApiResult<Response> {
     require_role(&user, crate::auth::Role::User)?;
     let (page, size) = q.page.clamp();
-    let (rows, total) =
-        crate::store::pg::list_users(&st.admin_db, q.q.as_deref(), q.status.as_deref(), page, size)
-            .await?;
+    // `user` sees only its own row; ops/admin keep the global list (see `AuthUser::owner_scope`).
+    let (rows, total) = crate::store::pg::list_users(
+        &st.admin_db,
+        user.owner_scope(),
+        q.q.as_deref(),
+        q.status.as_deref(),
+        page,
+        size,
+    )
+    .await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|u| {
@@ -1182,7 +1190,7 @@ async fn purge_progress(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let counts = crate::store::pg::purge_counts(&st.db, &id).await?;
     let cleanup = crate::jobs::load_purge_progress(&st, &id)
         .await
@@ -1303,7 +1311,11 @@ async fn devices(
     Q(q): Q<DeviceQuery>,
 ) -> ApiResult<Response> {
     require_role(&user, crate::auth::Role::User)?;
-    let rows = crate::store::pg::list_devices_admin(&st.admin_db, q.user.as_deref(), q.revoked).await?;
+    // A per-account caller may not widen the filter to somebody else: `scope` always wins.
+    let scope = user.owner_scope();
+    let filter_user = if scope.is_some() { scope } else { q.user.as_deref() };
+    let rows =
+        crate::store::pg::list_devices_admin(&st.admin_db, scope, filter_user, q.revoked).await?;
     let items: Vec<Value> = rows
         .iter()
         .map(|d| {
@@ -1316,17 +1328,28 @@ async fn devices(
     Ok(Json(json!({ "items": items })).into_response())
 }
 
-/// `DELETE /v1/admin/devices/{id}`: force-revoke a device (ops).
+/// `DELETE /v1/admin/devices/{id}`: revoke a device.
+///
+/// Ops/admin may revoke any device; the `user` tier may only revoke its **own** device
+/// (self-service "sign out this device"), which is still an operation on its own content.
 async fn device_revoke(
     State(st): State<Arc<AppState>>,
     user: AuthUser,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::Ops)?;
     let dev = crate::store::pg::device_by_id(&st.db, &id)
         .await?
         .ok_or_else(|| ApiErr(LatticeError::not_found("device not found")))?;
+    if user.owner_scope().is_some() {
+        if dev.user_id != user.user_id {
+            return Err(ApiErr(
+                LatticeError::forbidden("can only revoke your own devices").with_reason("rbac"),
+            ));
+        }
+    } else {
+        require_role(&user, crate::auth::Role::Ops)?;
+    }
     crate::store::pg::revoke_device(&st.db, &id).await?;
     st.unregister_online(&dev.user_id, &dev.id).await;
     crate::routing::audit::audit_emit(
@@ -1360,8 +1383,10 @@ async fn conversations(
 ) -> ApiResult<Response> {
     require_role(&user, crate::auth::Role::User)?;
     let (page, size) = q.page.clamp();
+    // `user` only sees conversations (including topics) it is a member of.
     let (rows, total) = crate::store::pg::list_conversations_admin(
         &st.admin_db,
+        user.owner_scope(),
         q.q.as_deref(),
         q.kind.as_deref(),
         page,
@@ -1387,6 +1412,12 @@ async fn conversation_detail(
     let conv = crate::store::pg::conversation_by_id(&st.admin_db, &id)
         .await?
         .ok_or_else(|| ApiErr(LatticeError::not_found("conversation not found")))?;
+    if let Some(scope) = user.owner_scope() {
+        // 404 rather than 403: do not confirm that somebody else's conversation exists.
+        if !crate::store::pg::is_conversation_member(&st.admin_db, &id, scope).await? {
+            return Err(ApiErr(LatticeError::not_found("conversation not found")));
+        }
+    }
     let members = crate::store::pg::members_of(&st.admin_db, &id).await?;
     Ok(Json(json!({
         "id": conv.id, "kind": conv.kind, "name": conv.name, "created_at": conv.created_at,
@@ -1422,9 +1453,21 @@ async fn messages(
     if let Some(state) = q.state.as_deref() {
         parse_state(state)?;
     }
+    if let Some(scope) = user.owner_scope() {
+        // Explicitly asking for another account's messages is refused; filters on a
+        // conversation/id simply resolve to "nothing" when the caller is not a participant.
+        if let Some(who) = q.user.as_deref() {
+            if who != scope {
+                return Err(ApiErr(
+                    LatticeError::forbidden("can only read your own messages").with_reason("rbac"),
+                ));
+            }
+        }
+    }
     let (page, size) = q.page.clamp();
     let rows = crate::store::pg::search_messages_admin(
         &st.admin_db,
+        user.owner_scope(),
         q.id.as_deref(),
         q.conv.as_deref(),
         q.user.as_deref(),
@@ -1444,6 +1487,12 @@ async fn delivery(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     require_role(&user, crate::auth::Role::User)?;
+    if let Some(scope) = user.owner_scope() {
+        // Delivery details of somebody else's message must look nonexistent.
+        if !crate::store::pg::message_visible_to(&st.admin_db, &id, scope).await? {
+            return Err(ApiErr(LatticeError::not_found("message not found")));
+        }
+    }
     let rows = crate::store::pg::delivery_of(&st.admin_db, &id).await?;
     let items: Vec<Value> = rows
         .iter()
@@ -1536,7 +1585,7 @@ async fn dlq(
     user: AuthUser,
     Q(q): Q<DlqQuery>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let (page, size) = q.page.clamp();
     let rows = crate::store::pg::dlq_list(&st.admin_db, q.conv.as_deref(), q.user.as_deref(), page, size)
         .await?;
@@ -1567,7 +1616,7 @@ async fn audit(
     user: AuthUser,
     Q(q): Q<AuditQuery>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let (page, size) = q.page.clamp();
     let (rows, total) =
         crate::store::pg::audit_list(&st.admin_db, q.actor.as_deref(), q.action.as_deref(), page, size)
@@ -1587,7 +1636,7 @@ async fn audit(
 // ---------------------------------------------------------------------------
 
 async fn plugins(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let rows = crate::store::pg::plugins_all(&st.admin_db).await?;
     let items: Vec<Value> = rows
         .iter()
@@ -1666,7 +1715,7 @@ async fn plugin_stats(
     user: AuthUser,
     Path(ns): Path<String>,
 ) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Admin)?;
     let body = st.metrics.render();
     Ok(Json(json!({
         "ns": ns,
@@ -1912,7 +1961,7 @@ async fn plugin_wasm_reload(
 }
 
 async fn formats(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Ops)?;
     let rows = crate::store::pg::formats_all(&st.admin_db).await?;
     let items: Vec<Value> = rows
         .iter()
@@ -1963,7 +2012,7 @@ async fn format_upsert(
 
 /// `GET /v1/admin/config`: dynamic config snapshot + source markers (authority in PG).
 async fn config_get(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
-    require_role(&user, crate::auth::Role::User)?;
+    require_role(&user, crate::auth::Role::Admin)?;
     let rows = crate::store::pg::config_all(&st.admin_db).await?;
     let mut items = serde_json::Map::new();
     for (k, v) in rows {

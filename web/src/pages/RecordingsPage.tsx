@@ -301,31 +301,6 @@ export default function RecordingsPage() {
 
       <Card className="list-card">
         <div className="toolbar">
-          <div className="toolbar-right">
-            <Tooltip title={firstPage ? t('Already on the first page (newest recordings)') : t('Back to newer recordings')}>
-              <Button
-                icon={<LeftOutlined />}
-                disabled={firstPage || loading}
-                onClick={goPrev}
-                aria-label={t('Previous page')}
-              >
-                {t('Previous page')}
-              </Button>
-            </Tooltip>
-            <Tooltip title={lastPage ? t('Already on the last page (no older recordings)') : t('View older recordings')}>
-              <Button
-                icon={<RightOutlined />}
-                disabled={lastPage || loading}
-                onClick={goNext}
-                aria-label={t('Next page')}
-              >
-                {t('Next page')}
-              </Button>
-            </Tooltip>
-            <Button icon={<ReloadOutlined />} loading={loading} onClick={refresh} aria-label={t('Refresh')}>
-              {t('Refresh')}
-            </Button>
-          </div>
           <Input.Search
             allowClear
             enterButton
@@ -335,29 +310,17 @@ export default function RecordingsPage() {
             onChange={(e) => setSearchText(e.target.value)}
             onSearch={(v) => applySearch(v)}
           />
+          <span className="muted">{t('{count} items', { count: rows.length })}</span>
           <HelpTip
             title={t(
               'Recording is off by default (server setting [media] record_enabled). When enabled, raw frames forwarded through the WS tunnel become segment files in object storage; this page shows only the segment index and never stores or shows payloads. Newest first, paged with Previous/Next by cursor, so no total count is shown.',
             )}
           />
-          <span
-            className="toolbar-meta"
-            title={
-              lastRefreshedAt
-                ? t('Last successful refresh: {time}', { time: fmtTime(lastRefreshedAt.toISOString()) })
-                : t('Not refreshed yet')
-            }
-          >
-            <ClockCircleOutlined />
-            {loading
-              ? t('Refreshing…')
-              : lastRefreshedAt
-                ? t('Updated at {time}', { time: fmtClock(lastRefreshedAt) })
-                : t('Waiting for the first load')}
-            <span className="dot-sep" />
-            {t('Page {page}{last}', { page, last: lastPage ? t(' (last page)') : '' })}
-            {streamFilter ? t(' · Filter: {filter}', { filter: streamFilter }) : ''}
-          </span>
+          <div className="toolbar-right">
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={refresh} aria-label={t('Refresh')}>
+              {t('Refresh')}
+            </Button>
+          </div>
         </div>
 
         {loading && rows.length === 0 ? (
@@ -471,6 +434,49 @@ export default function RecordingsPage() {
               ]}
             />
           )}
+
+        <div className="card-pager">
+          <span
+            className="toolbar-meta"
+            title={
+              lastRefreshedAt
+                ? t('Last successful refresh: {time}', { time: fmtTime(lastRefreshedAt.toISOString()) })
+                : t('Not refreshed yet')
+            }
+          >
+            <ClockCircleOutlined />
+            {loading
+              ? t('Refreshing…')
+              : lastRefreshedAt
+                ? t('Updated at {time}', { time: fmtClock(lastRefreshedAt) })
+                : t('Waiting for the first load')}
+            <span className="dot-sep" />
+            {t('Page {page}{last}', { page, last: lastPage ? t(' (last page)') : '' })}
+            {streamFilter ? t(' · Filter: {filter}', { filter: streamFilter }) : ''}
+          </span>
+          <Space size={8}>
+            <Tooltip title={firstPage ? t('Already on the first page (newest recordings)') : t('Back to newer recordings')}>
+              <Button
+                icon={<LeftOutlined />}
+                disabled={firstPage || loading}
+                onClick={goPrev}
+                aria-label={t('Previous page')}
+              >
+                {t('Previous page')}
+              </Button>
+            </Tooltip>
+            <Tooltip title={lastPage ? t('Already on the last page (no older recordings)') : t('View older recordings')}>
+              <Button
+                icon={<RightOutlined />}
+                disabled={lastPage || loading}
+                onClick={goNext}
+                aria-label={t('Next page')}
+              >
+                {t('Next page')}
+              </Button>
+            </Tooltip>
+          </Space>
+        </div>
       </Card>
 
       <Drawer open={detailOpen} width={580} title={t('Recording details')} onClose={closeDetail} destroyOnClose>

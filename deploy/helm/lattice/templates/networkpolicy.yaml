@@ -93,3 +93,75 @@ spec:
         - protocol: TCP
           port: 8080
 {{- end }}
+{{- if and .Values.networkPolicy.enabled .Values.transfer.enabled }}
+---
+{{/*
+ transfer NetworkPolicy: the download plane is reached only through the Ingress Controller (or the peers listed in
+ networkPolicy.ingressFrom) and reads objects from the internal S3 endpoint; it needs nothing else.
+ Egress is deny-by-default for these Pods (unlike node): the transfer service never calls PG/Redis/NATS or the K8s
+ API, so DNS plus the object-storage port is the complete set. If object storage listens on another port (a gateway
+ or an external endpoint), add that port here — this policy is the only place that whitelists it.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "lattice.transfer.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transfer
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "lattice.transfer.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- if or .Values.networkPolicy.ingressControllerNamespace .Values.networkPolicy.ingressFrom }}
+    # /t downloads: the Ingress Controller namespace, plus the optional extra peers
+    - from:
+        {{- if .Values.networkPolicy.ingressControllerNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressControllerNamespace | quote }}
+        {{- end }}
+        {{- with .Values.networkPolicy.ingressFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.transfer.service.port }}
+    {{- else }}
+    # No ingress sources configured: keep the rule port-only (the same degradation as the node's MQTT/QUIC rules) so
+    # /t does not silently blackhole behind default deny; set networkPolicy.ingressControllerNamespace in production.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.transfer.service.port }}
+    {{- end }}
+    # metrics port (same rule as node:9100: with metricsNamespace set, only that namespace may scrape)
+    - {{- if .Values.networkPolicy.metricsNamespace }}
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.metricsNamespace | quote }}
+      {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.transfer.service.metricsPort }}
+  egress:
+    # DNS (required: otherwise Service names fail to resolve)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.dnsNamespace | default "kube-system" | quote }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # object storage: no `to` = any destination on that port (the S3 endpoint may live in another namespace or
+    # outside the cluster); object bytes are the only upstream the transfer plane needs
+    - ports:
+        - protocol: TCP
+          port: 9000
+{{- end }}

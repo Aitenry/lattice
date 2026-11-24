@@ -2,8 +2,8 @@ apiVersion: v2
 name: lattice
 description: Lattice unified message transport platform (lattice-node cluster + web console)
 type: application
-version: 0.2.0
-appVersion: "0.5.0"
+version: 0.1.0
+appVersion: "0.1.0"
 keywords:
   - messaging
   - websocket

@@ -3,11 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Lattice admin console (admin-plane API, Doc ⑤ §8)",
+  "description": "Lattice administration console for the platform admin API",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "verify": "node scripts/verify.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

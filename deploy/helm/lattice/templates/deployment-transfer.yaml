@@ -1,0 +1,150 @@
+{{- if .Values.transfer.enabled }}
+{{/*
+ Download transfer plane: a standalone stateless service (`lattice-transfer`, same image as the node, different
+ entrypoint). It verifies the node's short-lived HMAC capability token and streams exactly one object from the
+ internal S3 endpoint with Range/If-Range pass-through, so the node never proxies object bytes and clients never
+ need to reach MinIO (design §6.10 / §17.17).
+
+ Why a separate Deployment instead of a node sidecar: downloads are long, bandwidth-heavy streams that must scale
+ and fail independently of the business/message plane — a download spike must not evict WS/SSE capacity — and any
+ replica can serve any token (no shared state, no sticky sessions), so rolling updates and scaling are unrestricted.
+
+ It mounts the **same** ConfigMap file as the node (`/etc/lattice/config.toml`, rendered by configmap.yaml): the
+ `[s3]` and `[transfer]` sections are shared, only the entrypoint differs. Credentials never enter that file; they
+ are injected from the chart Secret through env vars exactly like the node does.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lattice.transfer.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transfer
+spec:
+  replicas: {{ .Values.transfer.replicaCount }}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # in-flight downloads are long-lived: start the replacement before stopping the old replica
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "lattice.transfer.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lattice.transfer.selectorLabels" . | nindent 8 }}
+      annotations:
+        # config changes trigger a rollout (ConfigMap only, not Secrets: key rotation is a deliberate operations decision)
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.transfer.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "lattice.serviceAccountName" . }}
+      # the transfer plane never calls the K8s API: no ServiceAccount token is mounted
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.transfer.terminationGracePeriodSeconds }}
+      securityContext:
+        # same image and process runtime as the node: non-root, read-only root filesystem, explicit writable /tmp
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: {{ .Values.security.seccompProfile }}
+      containers:
+        - name: transfer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/lattice-transfer", "--config", "/etc/lattice/config.toml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: {{ .Values.security.node.readOnlyRootFilesystem }}
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.transfer.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.transfer.service.metricsPort }}
+              protocol: TCP
+          env:
+            # node signs and this service verifies with the same shared key (Secret → env; never in the ConfigMap)
+            - name: LATTICE__TRANSFER__SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lattice.secretName" . }}
+                  key: transfer-secret
+            # streaming reads are signed requests to object storage, so the transfer plane needs the S3 credentials
+            # as well; the node's ConfigMap carries no credentials, they only ever arrive through Secret env vars
+            - name: LATTICE__S3__ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lattice.secretName" . }}
+                  key: s3-access-key
+            - name: LATTICE__S3__SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "lattice.secretName" . }}
+                  key: s3-secret-key
+          lifecycle:
+            preStop:
+              exec:
+                # let Endpoints/LB draining propagate before SIGTERM; then the process stops accepting connections
+                command: ["sh", "-c", "sleep {{ .Values.transfer.preStopSleepSeconds }}"]
+          readinessProbe:
+            # /readyz = at least one object-storage endpoint answers a short TCP probe
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            # /healthz = process is alive only (object-storage outages must not restart-loop the Pod)
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.transfer.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/lattice/config.toml
+              subPath: config.toml
+              readOnly: true
+            # same runtime as the node: /tmp stays writable under a read-only root filesystem
+            {{- range .Values.security.node.writableEmptyDirs }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "lattice.node.fullname" . }}-config
+        {{- range .Values.security.node.writableEmptyDirs }}
+        - name: {{ .name }}
+          emptyDir:
+            sizeLimit: {{ .sizeLimit }}
+        {{- end }}
+      {{- with .Values.transfer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.transfer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.transfer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

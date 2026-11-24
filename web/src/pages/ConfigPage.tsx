@@ -16,6 +16,7 @@ import {
   App as AntApp,
 } from 'antd'
 import { EditOutlined, ReloadOutlined } from '@ant-design/icons'
+import { LIST_PAGE_SIZE, LIST_SCROLL_Y } from '@/components/listLayout'
 import { errText } from '@/lib/errors'
 import { getConfig, patchConfig } from '@/api/endpoints'
 import type { ConfigItem, ConfigSnapshot } from '@/api/types'
@@ -78,6 +79,8 @@ export default function ConfigPage() {
   const { can } = useAuth()
   const [snap, setSnap] = useState<ConfigSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
+  const [page, setPage] = useState(1)
+  const pageSize = LIST_PAGE_SIZE
   const [err, setErr] = useState<string | null>(null)
   const [editKey, setEditKey] = useState<string | null>(null)
   const [form] = Form.useForm()
@@ -145,6 +148,13 @@ export default function ConfigPage() {
 
   const items = snap?.items ?? {}
   const keys = Object.keys(items)
+
+  // Keep the current page valid when the number of settings shrinks
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(keys.length / pageSize))
+    if (page > maxPage) setPage(maxPage)
+  }, [keys.length, page, pageSize])
+
   const editValue = editKey ? (items[editKey]?.value ?? null) : null
   const editInitial = (() => {
     if (!editKey) return {}
@@ -162,37 +172,38 @@ export default function ConfigPage() {
   })()
 
   return (
-    <div className="page-scroll">
-
-      <div className="toolbar">
-        <div className="toolbar-right">
-        <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
-          {t('Refresh')}
-        </Button>
-        </div>
-      </div>
-
+    <div className="page-fill">
       {err && <Alert type="error" showIcon message={t('Failed to load')} description={err} />}
 
-      <Card
-        title={
-          <Space size={4}>
-            {t('Current configuration')}
-            <HelpTip
-              title={t(
-                'Configuration is stored in the database and broadcast to every node after a change; each node keeps a short-lived cache, so changes apply within a few seconds.',
-              )}
-            />
-          </Space>
-        }
-        extra={<Typography.Text type="secondary">{t('{count} settings', { count: keys.length })}</Typography.Text>}
-      >
+      <Card className="list-card">
+        <div className="toolbar">
+          <span className="muted">{t('{count} settings', { count: keys.length })}</span>
+          <HelpTip
+            title={t(
+              'Configuration is stored in the database and broadcast to every node after a change; each node keeps a short-lived cache, so changes apply within a few seconds.',
+            )}
+          />
+          <div className="toolbar-right">
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
+              {t('Refresh')}
+            </Button>
+          </div>
+        </div>
+
         <Table<{ key: string; item: ConfigItem }>
           size="small"
+          scroll={{ y: LIST_SCROLL_Y }}
           rowKey="key"
           loading={loading}
-          dataSource={keys.map((k) => ({ key: k, item: items[k] }))}
-          pagination={false}
+          dataSource={keys.slice((page - 1) * pageSize, page * pageSize).map((k) => ({ key: k, item: items[k] }))}
+          pagination={{
+            current: page,
+            pageSize,
+            total: keys.length,
+            showSizeChanger: false,
+            onChange: (p) => setPage(p),
+            showTotal: (count) => t('{count} settings', { count }),
+          }}
           locale={{ emptyText: <Empty description={t('No configuration items')} image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
           expandable={{
             expandedRowRender: (r) => (

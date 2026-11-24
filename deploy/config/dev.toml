@@ -41,6 +41,19 @@ bucket_plugins = "lattice-plugins"
 presign_ttl = 900
 upload_parallel = 8
 
+# Download transfer plane (design §6.10): downloads 302 to lattice-transfer instead of
+# handing clients a presigned MinIO URL. In compose, nginx routes /t/ to the transfer service.
+[transfer]
+enabled = true
+# Empty = same-origin relative Location (/t/{token}); every client resolves it against the
+# host it already used (remote clients no longer receive 127.0.0.1). Set an absolute URL only
+# when the transfer service lives on a different origin, e.g. "http://10.66.66.2:8088".
+public_base_url = ""
+secret = "lattice_dev_transfer_secret_0123456789abcdef"  # dev only (>=32 bytes); production injects the env var
+token_ttl_secs = 900
+listen = "0.0.0.0:8090"
+metrics_listen = "0.0.0.0:9101"
+
 [mqtt]
 enabled = true
 bind = "0.0.0.0:1883"

@@ -6,6 +6,13 @@
 //! Trust boundaries (② §4.9):
 //! ① only owner/admin can add versions or unpublish; ② downloaders verify integrity via the metadata sha256;
 //! ③ the installer performs in-package validation (entry file, path traversal rejection). The server validates **structure** only (zip + plugin.json).
+//!
+//! **Review policy (2026-11-23):** a user-published version is stored as `review` after the
+//! package upload and is invisible/uninstallable for other users until an administrator
+//! approves it (`published`). Every new version repeats the review; approved versions are
+//! immutable (same-version overwrite and post-approval source upload are rejected). The owner
+//! sees its own pending/rejected submissions (`GET /v1/hub/mine`, detail) and the admin queue
+//! is `GET /v1/admin/hub/reviews` with approve/reject actions.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -91,6 +98,25 @@ pub fn routes() -> Router<Arc<AppState>> {
             put(upsert_install).delete(delete_install),
         )
         .route("/v1/hub/stats", get(stats))
+        // Owner view: my plugins including the versions that are not approved yet.
+        .route("/v1/hub/mine", get(my_plugins))
+}
+
+/// Administrator review plane (`GET/POST /v1/admin/hub/...`), mounted by `admin::routes`.
+///
+/// Review is admin-only by product decision (2026-11-23): ops can operate the platform but
+/// cannot approve user-published content.
+pub fn admin_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/admin/hub/reviews", get(review_list))
+        .route(
+            "/v1/admin/hub/plugins/:plugin_id/versions/:version/approve",
+            axum::routing::post(review_approve),
+        )
+        .route(
+            "/v1/admin/hub/plugins/:plugin_id/versions/:version/reject",
+            axum::routing::post(review_reject),
+        )
 }
 
 /// Upload body limit guard: checks `Content-Length` before buffering the body, returning a ⑤ §0.5 error body.
@@ -231,13 +257,16 @@ async fn detail(
     Path(plugin_id): Path<String>,
 ) -> ApiResult<Response> {
     let plugin = load_visible_plugin(&st, &user, &plugin_id).await?;
-    let versions = pg::hub_versions_of(&st.db, &plugin.id, false).await?;
+    // Owner/admin also see the versions that are not approved yet (pending upload, in review,
+    // rejected). Everybody else only ever sees `published` rows.
+    let privileged = plugin.owner_id == user.user_id || user.is_admin();
+    let versions = pg::hub_versions_of(&st.db, &plugin.id, privileged).await?;
     let install = pg::hub_install_of(&st.db, &user.user_id, &plugin_id).await?;
 
     let version_items: Vec<Value> = versions
         .iter()
         .map(|v| {
-            json!({
+            let mut item = json!({
                 "version": v.version,
                 "asset_name": v.asset_name,
                 "size": v.size,
@@ -250,7 +279,15 @@ async fn detail(
                 "source_asset_name": v.source_asset_name,
                 "source_size": v.source_size,
                 "source_sha256": v.source_sha256,
-            })
+                "status": v.status,
+            });
+            if privileged {
+                // Review metadata is owner/admin-only (a rejection note is not public).
+                item["submitted_at"] = json!(v.submitted_at);
+                item["review_note"] = json!(v.review_note);
+                item["reviewed_at"] = json!(v.reviewed_at);
+            }
+            item
         })
         .collect();
     Ok(Json(json!({
@@ -287,8 +324,12 @@ async fn load_visible_plugin(
     let plugin = pg::hub_plugin_by_plugin_id(&st.db, plugin_id)
         .await?
         .ok_or_else(|| ApiErr(LatticeError::not_found("plugin not found")))?;
-    let visible =
-        plugin.status == "published" || plugin.owner_id == user.user_id || user.is_admin();
+    // Others may only see a live plugin with at least one approved version. A submission
+    // that is still waiting for review must look nonexistent (a published plugin row alone
+    // is not enough: the first version is created before any version is approved).
+    let public = plugin.status == "published"
+        && pg::hub_has_published_version(&st.db, &plugin.id).await?;
+    let visible = public || plugin.owner_id == user.user_id || user.is_admin();
     if !visible {
         return Err(ApiErr(LatticeError::not_found("plugin not found")));
     }
@@ -409,6 +450,20 @@ async fn create(
             }))
             .into_response())
         }
+        Ok(HubDraftOutcome::ReviewPending { plugin, version }) => {
+            // Same package is already waiting for an administrator: no second upload target
+            // (the bytes are stored already), just report the current state.
+            let source_upload = source_upload_of(&req.plugin_id, &version);
+            Ok(Json(json!({
+                "plugin": plugin_json(&plugin),
+                "version": version_json(&version),
+                "upload": null,
+                "source_upload": source_upload,
+                "idempotent": true,
+                "submitted": true,
+            }))
+            .into_response())
+        }
         Err(HubDraftError::NotOwner) => Err(ApiErr(
             LatticeError::forbidden("only the owner can publish a new version").with_reason("not_owner"),
         )),
@@ -416,6 +471,19 @@ async fn create(
             LatticeError::conflict("version already published with a different package")
                 .with_reason("version_published")
                 .with_detail("published_sha256", json!(sha256)),
+        )),
+        Err(HubDraftError::VersionInReview { sha256 }) => Err(ApiErr(
+            LatticeError::conflict("this version is already waiting for review with a different package")
+                .with_reason("version_in_review")
+                .with_detail("review_sha256", json!(sha256)),
+        )),
+        Err(HubDraftError::VersionRemoved) => Err(ApiErr(
+            LatticeError::conflict("a removed version cannot be revived; bump the version number")
+                .with_reason("version_removed"),
+        )),
+        Err(HubDraftError::PluginRemoved) => Err(ApiErr(
+            LatticeError::conflict("this plugin was removed; publish it under a new plugin ID")
+                .with_reason("plugin_removed"),
         )),
         Err(HubDraftError::Db(e)) => Err(ApiErr(error::db(e))),
     }
@@ -485,11 +553,14 @@ async fn upload_blob(
         ));
     }
 
-    if row.status == "published" {
-        // Already published with the same sha: the upload is an idempotent retry, do not store the object again (⑤ §12.4)
+    if row.status == "published" || row.status == "review" {
+        // Same sha already stored (approved, or waiting for review): idempotent retry,
+        // do not write the object again (⑤ §12.4).
         return Ok(Json(json!({
-            "plugin_id": plugin_id, "version": version, "status": "published",
-            "sha256": row.sha256, "size": row.size, "published_at": row.published_at,
+            "plugin_id": plugin_id, "version": version, "status": row.status,
+            "sha256": row.sha256, "size": row.size,
+            "published_at": row.published_at,
+            "submitted_at": row.submitted_at,
             "download_path": download_path(&plugin_id, &version),
             "idempotent": true,
         }))
@@ -508,26 +579,30 @@ async fn upload_blob(
             )
         })?;
 
-    let published = pg::hub_publish_version(&st.db, &row.id)
+    // Package bytes are stored: the version now waits for an administrator. It is **not**
+    // visible/installable by other users until `POST .../approve` succeeds.
+    let submitted = pg::hub_submit_review(&st.db, &row.id)
         .await?
         .ok_or_else(|| ApiErr(LatticeError::not_found("plugin version not found")))?;
     audit(
         &st,
         &user,
-        "hub.version.publish",
+        "hub.version.submit",
         &plugin_id,
-        json!({ "version": version, "size": published.size, "sha256": published.sha256 }),
+        json!({ "version": version, "size": submitted.size, "sha256": submitted.sha256 }),
     )
     .await;
 
     Ok(Json(json!({
         "plugin_id": plugin_id,
         "version": version,
-        "status": published.status,
-        "sha256": published.sha256,
-        "size": published.size,
-        "published_at": published.published_at,
+        "status": submitted.status,
+        "sha256": submitted.sha256,
+        "size": submitted.size,
+        "published_at": submitted.published_at,
+        "submitted_at": submitted.submitted_at,
         "download_path": download_path(&plugin_id, &version),
+        "review_required": true,
     }))
     .into_response())
 }
@@ -604,7 +679,8 @@ async fn read_source_body(body: Body) -> ApiResult<(Vec<u8>, String)> {
 /// `PUT /v1/hub/plugins/{plugin_id}/versions/{version}/source` (v2 contract §1.3).
 ///
 /// Idempotent: same sha already uploaded → 200; source exists with a different sha → 409 `source_published`.
-/// May be called at any time before or after package upload; source visibility still depends on the package being `published`.
+/// Allowed while the version is `pending`, `review` or `rejected` (i.e. before approval); a
+/// `published` version is immutable and rejects source uploads with 409 `version_published`.
 async fn upload_source(
     State(st): State<Arc<AppState>>,
     user: AuthUser,
@@ -621,6 +697,16 @@ async fn upload_source(
     if row.status == "removed" {
         // An unpublished version must not be revived via the same path (same rule as package upload, ⑤ §12.6)
         return Err(ApiErr(LatticeError::not_found("plugin version not found")));
+    }
+    if row.status == "published" {
+        // Approved content is immutable: a source archive is part of what was reviewed, so it
+        // must be uploaded before approval. Changing it later requires a new version.
+        return Err(ApiErr(
+            LatticeError::conflict(
+                "a published version cannot receive or change a source archive; submit a new version",
+            )
+            .with_reason("version_published"),
+        ));
     }
 
     let header_sha = header_str(&headers, "x-content-sha256")
@@ -782,18 +868,31 @@ async fn upload_source(
     }
 }
 
-/// Visibility decision for source download (same conventions as package download: the version must be `published`).
+/// Whether a version's package bytes may be fetched by this caller.
+///
+/// - `published` → any signed-in user (the normal distribution path);
+/// - `review` / `rejected` → only the owner and admins (review material, never public);
+/// - `pending` (body not uploaded yet) / `removed` → nobody.
+fn version_downloadable(status: &str, privileged: bool) -> bool {
+    match status {
+        "published" => true,
+        "review" | "rejected" => privileged,
+        _ => false,
+    }
+}
+
+/// Visibility decision for source download (same conventions as package download).
 #[derive(Debug, PartialEq, Eq)]
 enum SourceDownloadDecision {
     Downloadable,
-    /// Version missing / unpublished / removed: always 404, never leak pending drafts
+    /// Version missing / not visible to this caller / removed: always 404, never leak drafts
     VersionNotFound,
-    /// Version published but has no source package
+    /// Version visible but has no source package
     MissingSource,
 }
 
-fn decide_source_download(status: &str, has_source: bool) -> SourceDownloadDecision {
-    if status != "published" {
+fn decide_source_download(status: &str, has_source: bool, privileged: bool) -> SourceDownloadDecision {
+    if !version_downloadable(status, privileged) {
         SourceDownloadDecision::VersionNotFound
     } else if !has_source {
         SourceDownloadDecision::MissingSource
@@ -813,10 +912,11 @@ async fn download_source(
     Path((plugin_id, version)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     let plugin = load_visible_plugin(&st, &user, &plugin_id).await?;
+    let privileged = plugin.owner_id == user.user_id || user.is_admin();
     let row = pg::hub_version(&st.db, &plugin.id, &version)
         .await?
         .ok_or_else(|| ApiErr(LatticeError::not_found("plugin version not found")))?;
-    match decide_source_download(&row.status, row.source_object_key.is_some()) {
+    match decide_source_download(&row.status, row.source_object_key.is_some(), privileged) {
         SourceDownloadDecision::VersionNotFound => {
             Err(ApiErr(LatticeError::not_found("plugin version not found")))
         }
@@ -835,7 +935,30 @@ async fn download_source(
                 ));
             };
             let bucket = st.s3.cfg().bucket_plugins.clone();
-            let url = st.s3.presign_get(&bucket, &object_key, PRESIGN_TTL_SECS);
+            let filename = row
+                .source_asset_name
+                .clone()
+                .unwrap_or_else(|| format!("{plugin_id}-{version}-src.zip"));
+            let url = crate::transfer::object_download_url(
+                &st,
+                crate::transfer::DownloadSpec {
+                    bucket: &bucket,
+                    key: &object_key,
+                    filename: &filename,
+                    content_type: "application/zip",
+                    size: size.max(0) as u64,
+                    sha256: &sha256,
+                    disposition: "attachment",
+                    // Only approved content may be cached by shared proxies/CDNs.
+                    cache: if row.status == "published" {
+                        "public"
+                    } else {
+                        "private"
+                    },
+                    user_id: &user.user_id,
+                    presign_ttl_secs: PRESIGN_TTL_SECS,
+                },
+            );
 
             let mut resp = StatusCode::FOUND.into_response();
             resp.headers_mut().insert(
@@ -910,27 +1033,50 @@ async fn download(
     Path((plugin_id, version)): Path<(String, String)>,
 ) -> ApiResult<Response> {
     let plugin = load_visible_plugin(&st, &user, &plugin_id).await?;
+    let privileged = plugin.owner_id == user.user_id || user.is_admin();
     let row = pg::hub_version(&st.db, &plugin.id, &version)
         .await?
         .ok_or_else(|| ApiErr(LatticeError::not_found("plugin version not found")))?;
-    if row.status != "published" {
+    if !version_downloadable(&row.status, privileged) {
         return Err(ApiErr(LatticeError::not_found("plugin version not found")));
     }
     let bucket = st.s3.cfg().bucket_plugins.clone();
-    let url = st.s3.presign_get(&bucket, &row.object_key, PRESIGN_TTL_SECS);
+    let url = crate::transfer::object_download_url(
+        &st,
+        crate::transfer::DownloadSpec {
+            bucket: &bucket,
+            key: &row.object_key,
+            filename: &row.asset_name,
+            content_type: "application/zip",
+            size: row.size.max(0) as u64,
+            sha256: &row.sha256,
+            disposition: "attachment",
+            cache: if row.status == "published" {
+                "public"
+            } else {
+                "private"
+            },
+            user_id: &user.user_id,
+            presign_ttl_secs: PRESIGN_TTL_SECS,
+        },
+    );
 
-    // Count best-effort (⑤ §12.5): failures only alert, never affect the download
-    let db = st.db.clone();
-    let plugin_row_id = plugin.id.clone();
-    let version_id = row.id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = pg::hub_bump_plugin_download(&db, &plugin_row_id).await {
-            tracing::warn!(error = %e, "hub plugin download counter failed");
-        }
-        if let Err(e) = pg::hub_bump_version_download(&db, &version_id).await {
-            tracing::warn!(error = %e, "hub version download counter failed");
-        }
-    });
+    // Count best-effort (⑤ §12.5): failures only alert, never affect the download.
+    // Only the public distribution path counts; owner/admin previews of a version under
+    // review must not inflate the catalog numbers.
+    if row.status == "published" {
+        let db = st.db.clone();
+        let plugin_row_id = plugin.id.clone();
+        let version_id = row.id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pg::hub_bump_plugin_download(&db, &plugin_row_id).await {
+                tracing::warn!(error = %e, "hub plugin download counter failed");
+            }
+            if let Err(e) = pg::hub_bump_version_download(&db, &version_id).await {
+                tracing::warn!(error = %e, "hub version download counter failed");
+            }
+        });
+    }
 
     let mut resp = StatusCode::FOUND.into_response();
     resp.headers_mut().insert(
@@ -1056,6 +1202,20 @@ async fn upsert_install(
                 LatticeError::format("invalid version").with_reason("version"),
             ));
         }
+        // Install records may only point at an approved version. A pending/rejected version
+        // must look nonexistent to everyone (including its owner): "submit ≠ usable".
+        let plugin = pg::hub_plugin_by_plugin_id(&st.db, &plugin_id)
+            .await?
+            .ok_or_else(|| ApiErr(LatticeError::not_found("plugin not found")))?;
+        let row = pg::hub_version(&st.db, &plugin.id, v)
+            .await?
+            .ok_or_else(|| ApiErr(LatticeError::not_found("plugin version not found")))?;
+        if row.status != "published" {
+            return Err(ApiErr(
+                LatticeError::not_found("plugin version not found")
+                    .with_reason("version_not_published"),
+            ));
+        }
     }
     if let Some(d) = &req.data {
         let size = serde_json::to_vec(d).map(|b| b.len()).unwrap_or(usize::MAX);
@@ -1130,6 +1290,210 @@ async fn delete_install(
 async fn stats(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
     user.require_read()?;
     Ok(Json(pg::hub_stats(&st.db).await?).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// §12.9 owner self-view and administrator review
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/hub/mine`: every plugin owned by the caller, including the ones that are not
+/// approved yet (waiting for review / rejected). This is the only way an owner can find a
+/// submission that is not in the public catalog.
+async fn my_plugins(State(st): State<Arc<AppState>>, user: AuthUser) -> ApiResult<Response> {
+    let rows = pg::hub_my_plugins(&st.db, &user.user_id).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            // Approved content wins the badge; a newer submission waiting for review is
+            // exposed separately so the owner sees "published + v1.2 in review".
+            let state = if r.versions_count > 0 {
+                "published"
+            } else if r.review_version.is_some() {
+                "review"
+            } else if r.rejected_version.is_some() {
+                "rejected"
+            } else {
+                "pending"
+            };
+            json!({
+                "plugin_id": r.plugin_id,
+                "name": r.name,
+                "description": r.description,
+                "icon": r.icon,
+                "category": r.category,
+                "tags": r.tags,
+                "status": r.status,
+                "state": state,
+                "latest_version": r.latest_version,
+                "versions_count": r.versions_count,
+                "review_version": r.review_version,
+                "rejected_version": r.rejected_version,
+                "rejected_note": r.rejected_note,
+                "created_at": r.created_at,
+                "updated_at": r.updated_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+/// `GET /v1/admin/hub/reviews`: versions waiting for an administrator, oldest first.
+async fn review_list(
+    State(st): State<Arc<AppState>>,
+    user: AuthUser,
+    Query(q): Query<ReviewQuery>,
+) -> ApiResult<Response> {
+    user.require_change()?;
+    let page = q.page.unwrap_or(1).max(1);
+    let page_size = q.page_size.unwrap_or(20).clamp(1, 100);
+    let (rows, total) =
+        pg::hub_review_queue(&st.db, page_size, (page - 1) * page_size).await?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "plugin_id": r.plugin_id,
+                "name": r.name,
+                "owner": {
+                    "id": r.owner_id,
+                    "username": r.owner_username,
+                    "display_name": r.owner_display_name,
+                },
+                "version": r.version,
+                "asset_name": r.asset_name,
+                "size": r.size,
+                "sha256": r.sha256,
+                "changelog": r.changelog,
+                "has_source": r.has_source,
+                "submitted_at": r.submitted_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "items": items, "total": total, "page": page, "page_size": page_size
+    }))
+    .into_response())
+}
+
+/// `POST /v1/admin/hub/plugins/{plugin_id}/versions/{version}/approve`: publish an
+/// approved version. Idempotent when the version is already published.
+async fn review_approve(
+    State(st): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((plugin_id, version)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    user.require_change()?;
+    let plugin = pg::hub_plugin_by_plugin_id(&st.db, &plugin_id)
+        .await?
+        .ok_or_else(|| ApiErr(LatticeError::not_found("plugin not found")))?;
+    let row = pg::hub_version(&st.db, &plugin.id, &version)
+        .await?
+        .ok_or_else(|| ApiErr(LatticeError::not_found("plugin version not found")))?;
+    match pg::hub_approve_version(&st.db, &row.id, &user.user_id).await? {
+        pg::HubReviewOutcome::Published(v) | pg::HubReviewOutcome::AlreadyPublished(v) => {
+            audit(
+                &st,
+                &user,
+                "hub.version.approve",
+                &plugin_id,
+                json!({ "version": version, "sha256": v.sha256 }),
+            )
+            .await;
+            Ok(Json(json!({
+                "plugin_id": plugin_id,
+                "version": v.version,
+                "status": "published",
+                "published_at": v.published_at,
+            }))
+            .into_response())
+        }
+        pg::HubReviewOutcome::NotFound => {
+            Err(ApiErr(LatticeError::not_found("plugin version not found")))
+        }
+        pg::HubReviewOutcome::NotInReview { status } => Err(ApiErr(
+            LatticeError::conflict("this version is not waiting for review")
+                .with_reason("not_in_review")
+                .with_detail("status", json!(status)),
+        )),
+        pg::HubReviewOutcome::Rejected(_) => {
+            Err(ApiErr(LatticeError::internal("unexpected review outcome")))
+        }
+        pg::HubReviewOutcome::PluginRemoved => Err(ApiErr(
+            LatticeError::conflict("the plugin was removed; this submission is stale")
+                .with_reason("plugin_removed"),
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewRejectReq {
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /v1/admin/hub/plugins/{plugin_id}/versions/{version}/reject`: reject a version
+/// waiting for review; the owner sees `review_note` and may correct + resubmit it.
+async fn review_reject(
+    State(st): State<Arc<AppState>>,
+    user: AuthUser,
+    Path((plugin_id, version)): Path<(String, String)>,
+    Json(req): Json<ReviewRejectReq>,
+) -> ApiResult<Response> {
+    user.require_change()?;
+    let note = req.reason.trim();
+    if note.is_empty() || note.chars().count() > 500 {
+        return Err(ApiErr(
+            LatticeError::format("a rejection reason of 1-500 characters is required")
+                .with_reason("reason")
+                .with_detail("field", json!("reason")),
+        ));
+    }
+    let plugin = pg::hub_plugin_by_plugin_id(&st.db, &plugin_id)
+        .await?
+        .ok_or_else(|| ApiErr(LatticeError::not_found("plugin not found")))?;
+    let row = pg::hub_version(&st.db, &plugin.id, &version)
+        .await?
+        .ok_or_else(|| ApiErr(LatticeError::not_found("plugin version not found")))?;
+    match pg::hub_reject_version(&st.db, &row.id, &user.user_id, note).await? {
+        pg::HubReviewOutcome::Rejected(v) => {
+            audit(
+                &st,
+                &user,
+                "hub.version.reject",
+                &plugin_id,
+                json!({ "version": version, "reason": note }),
+            )
+            .await;
+            Ok(Json(json!({
+                "plugin_id": plugin_id,
+                "version": v.version,
+                "status": "rejected",
+                "review_note": v.review_note,
+            }))
+            .into_response())
+        }
+        pg::HubReviewOutcome::NotFound => {
+            Err(ApiErr(LatticeError::not_found("plugin version not found")))
+        }
+        pg::HubReviewOutcome::NotInReview { status } => Err(ApiErr(
+            LatticeError::conflict("this version is not waiting for review")
+                .with_reason("not_in_review")
+                .with_detail("status", json!(status)),
+        )),
+        pg::HubReviewOutcome::Published(_) | pg::HubReviewOutcome::AlreadyPublished(_) => {
+            Err(ApiErr(LatticeError::internal("unexpected review outcome")))
+        }
+        pg::HubReviewOutcome::PluginRemoved => Err(ApiErr(
+            LatticeError::conflict("the plugin was removed; this submission is stale")
+                .with_reason("plugin_removed"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,6 +2287,9 @@ fn version_json(v: &pg::HubVersionRow) -> Value {
         "status": v.status,
         "downloads": v.downloads,
         "published_at": v.published_at,
+        "submitted_at": v.submitted_at,
+        "review_note": v.review_note,
+        "reviewed_at": v.reviewed_at,
         "has_source": v.source_object_key.is_some(),
         "source_asset_name": v.source_asset_name,
         "source_size": v.source_size,
@@ -2301,27 +2668,58 @@ mod tests {
 
     #[test]
     fn source_download_visibility_404_decisions() {
+        // Approved: visible to every signed-in user.
         assert_eq!(
-            decide_source_download("published", true),
+            decide_source_download("published", true, false),
             SourceDownloadDecision::Downloadable
         );
         // No source -> 404 source_missing
         assert_eq!(
-            decide_source_download("published", false),
+            decide_source_download("published", false, false),
             SourceDownloadDecision::MissingSource
+        );
+        // Waiting for review / rejected: owner and admin only; others must see 404 (never leak drafts).
+        assert_eq!(
+            decide_source_download("review", true, true),
+            SourceDownloadDecision::Downloadable
+        );
+        assert_eq!(
+            decide_source_download("review", true, false),
+            SourceDownloadDecision::VersionNotFound
+        );
+        assert_eq!(
+            decide_source_download("rejected", true, true),
+            SourceDownloadDecision::Downloadable
+        );
+        assert_eq!(
+            decide_source_download("rejected", true, false),
+            SourceDownloadDecision::VersionNotFound
         );
         // pending draft / removed version: always 404 (no draft leakage, no reviving removed versions)
         assert_eq!(
-            decide_source_download("pending", true),
+            decide_source_download("pending", true, true),
             SourceDownloadDecision::VersionNotFound
         );
         assert_eq!(
-            decide_source_download("pending", false),
+            decide_source_download("pending", false, false),
             SourceDownloadDecision::VersionNotFound
         );
         assert_eq!(
-            decide_source_download("removed", true),
+            decide_source_download("removed", true, true),
             SourceDownloadDecision::VersionNotFound
         );
+    }
+
+    #[test]
+    fn published_is_the_only_public_version_state() {
+        assert!(version_downloadable("published", false));
+        // A version waiting for review is review material: only owner/admin may fetch it.
+        assert!(!version_downloadable("review", false));
+        assert!(version_downloadable("review", true));
+        assert!(!version_downloadable("rejected", false));
+        assert!(version_downloadable("rejected", true));
+        // No package body has been written yet / removed is terminal.
+        assert!(!version_downloadable("pending", true));
+        assert!(!version_downloadable("removed", true));
     }
 }

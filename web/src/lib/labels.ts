@@ -173,9 +173,12 @@ export function auditActionOptions(t: Translate): { value: string; label: string
   return Object.entries(AUDIT_ACTION).map(([value, label]) => ({ value, label: t(label) }))
 }
 
-/** Plugin status */
+/** Plugin status (`plugins.status`: staging → canary → active, or rolled_back) */
 export const PLUGIN_STATUS: Record<string, string> = {
+  staging: 'Staging',
+  canary: 'Canary',
   active: 'Running',
+  rolled_back: 'Rolled back',
   enabled: 'Enabled',
   disabled: 'Disabled',
   draft: 'Draft',
@@ -196,6 +199,7 @@ export function toneOf(value: string | undefined): 'success' | 'warning' | 'erro
     case 'routed':
     case 'queued':
     case 'pending':
+    case 'canary':
       return 'processing'
     case 'suspended':
     case 'dlq':
@@ -206,6 +210,8 @@ export function toneOf(value: string | undefined): 'success' | 'warning' | 'erro
     case 'degraded':
     case 'warn':
     case 'deleted':
+    case 'staging':
+    case 'rolled_back':
       return 'warning'
     default:
       return 'default'
@@ -231,4 +237,16 @@ export const HUB_CATEGORY_OPTIONS = Object.entries(HUB_CATEGORY).map(([value, la
 /** Translated plugin-hub category options, for call sites that hold a translator. */
 export function hubCategoryOptions(t: Translate): { value: string; label: string }[] {
   return Object.entries(HUB_CATEGORY).map(([value, label]) => ({ value, label: t(label) }))
+}
+
+/**
+ * Publisher name of a hub plugin: display name first, then username, then a translated
+ * placeholder — the console never shows a blank publisher.
+ */
+export function hubOwnerLabel(
+  owner: { display_name?: string | null; username?: string | null } | null | undefined,
+  t: Translate,
+): string {
+  if (!owner) return t('Unknown publisher')
+  return owner.display_name?.trim() || owner.username?.trim() || t('Unknown publisher')
 }

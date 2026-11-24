@@ -21,3 +21,16 @@ cargo-vendor2/
 __pycache__/
 web/install.log
 web/*.tsbuildinfo
+
+# IDE project files
+.idea/
+.vscode/
+
+# Internal design documents and development-only harnesses are not part of this
+# repository; keep them out of the submission even when the local checkout has them.
+/Lattice-设计方案.md
+/Lattice-架构图.mermaid
+/client/
+/platform/
+/perf/
+/scripts/

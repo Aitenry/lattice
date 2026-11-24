@@ -139,8 +139,9 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // §8 admin plane
         .merge(crate::admin::routes())
-        // §12 plugin hub (user plane)
+        // §12 plugin hub (user plane + admin review plane)
         .merge(crate::hub::routes())
+        .merge(crate::hub::admin_routes())
 }
 
 // ---------------------------------------------------------------------------
@@ -1323,9 +1324,29 @@ pub mod messages {
         conversations::ensure_member(&st, &msg.conv_id, &user.user_id).await?;
 
         if let Some(key) = msg.payload_ref.clone() {
-            let url = st
-                .s3
-                .presign_get(&st.s3.cfg().bucket_large, &key, PRESIGN_TTL_SECS);
+            let bucket = st.s3.cfg().bucket_large.clone();
+            let filename = format!("{}.bin", msg.id);
+            let content_type = msg
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into());
+            let url = crate::transfer::object_download_url(
+                &st,
+                crate::transfer::DownloadSpec {
+                    bucket: &bucket,
+                    key: &key,
+                    filename: &filename,
+                    content_type: &content_type,
+                    size: msg.size.max(0) as u64,
+                    // The message row does not retain the object hash; integrity is optional
+                    // on this path (clients that need it use the delivery checksum).
+                    sha256: "",
+                    disposition: "attachment",
+                    cache: "private",
+                    user_id: &user.user_id,
+                    presign_ttl_secs: PRESIGN_TTL_SECS,
+                },
+            );
             let mut resp = StatusCode::FOUND.into_response();
             resp.headers_mut().insert(
                 HeaderName::from_static("location"),
@@ -1392,6 +1413,7 @@ pub mod messages {
                 .filter_map(|x| x.trim().parse::<u32>().ok())
                 .collect()
         });
+        let bucket = st.s3.cfg().bucket_large.clone();
         let items: Vec<Value> = rows
             .iter()
             .filter(|r| wanted.as_ref().map(|w| w.contains(&(r.idx as u32))).unwrap_or(true))
@@ -1401,7 +1423,24 @@ pub mod messages {
                     "size": r.size,
                     "checksum": r.checksum.as_ref().map(|c| lattice_core::envelope::base64_encode(c)),
                     "storage_key": r.storage_key,
-                    "presigned_url": r.storage_key.as_ref().map(|k| st.s3.presign_get(&st.s3.cfg().bucket_large, k, PRESIGN_TTL_SECS)),
+                    "presigned_url": r.storage_key.as_ref().map(|k| {
+                        let filename = format!("{msg_id}-c{}.bin", r.idx);
+                        crate::transfer::object_download_url(
+                            &st,
+                            crate::transfer::DownloadSpec {
+                                bucket: &bucket,
+                                key: k,
+                                filename: &filename,
+                                content_type: "application/octet-stream",
+                                size: r.size.max(0) as u64,
+                                sha256: "",
+                                disposition: "attachment",
+                                cache: "private",
+                                user_id: &user.user_id,
+                                presign_ttl_secs: PRESIGN_TTL_SECS,
+                            },
+                        )
+                    }),
                 })
             })
             .collect();
@@ -2425,12 +2464,29 @@ pub mod media {
             }
         };
         let mut body = recording_json(&row);
-        body["presigned_url"] = json!(st.s3.presign_get(
-            &row.bucket,
-            &row.object_key,
-            RECORDING_PRESIGN_TTL_SECS
+        let filename = format!("recording-{}.bin", row.id);
+        let ttl = st
+            .transfer
+            .as_ref()
+            .map(|s| s.ttl_secs())
+            .unwrap_or(RECORDING_PRESIGN_TTL_SECS);
+        body["presigned_url"] = json!(crate::transfer::object_download_url(
+            &st,
+            crate::transfer::DownloadSpec {
+                bucket: &row.bucket,
+                key: &row.object_key,
+                filename: &filename,
+                content_type: "application/octet-stream",
+                size: row.size_bytes.max(0) as u64,
+                // Recording rows carry no content hash; no ETag/caching for this path.
+                sha256: "",
+                disposition: "attachment",
+                cache: "private",
+                user_id: &user.user_id,
+                presign_ttl_secs: RECORDING_PRESIGN_TTL_SECS,
+            },
         ));
-        body["presign_ttl_seconds"] = json!(RECORDING_PRESIGN_TTL_SECS);
+        body["presign_ttl_seconds"] = json!(ttl);
         body["download_url"] = json!(format!("/v1/media/recordings/{}/download", row.id));
         // Replay manifest + capability boundary (PL-13 13.6): format/playable truthfully state "raw frame container, not playable";
         // manifest_url is given only for rows that recorded a manifest object (old rows are null, and the manifest API returns 404).
@@ -2466,10 +2522,21 @@ pub mod media {
                 return Err(ApiErr(e));
             }
         };
-        let url = st.s3.presign_get(
-            &row.bucket,
-            &row.object_key,
-            RECORDING_PRESIGN_TTL_SECS,
+        let filename = format!("recording-{}.bin", row.id);
+        let url = crate::transfer::object_download_url(
+            &st,
+            crate::transfer::DownloadSpec {
+                bucket: &row.bucket,
+                key: &row.object_key,
+                filename: &filename,
+                content_type: "application/octet-stream",
+                size: row.size_bytes.max(0) as u64,
+                sha256: "",
+                disposition: "attachment",
+                cache: "private",
+                user_id: &user.user_id,
+                presign_ttl_secs: RECORDING_PRESIGN_TTL_SECS,
+            },
         );
         // Audit (⑤ §8.4 management operations): records only object location/size, **no payload, no bytes**;
         // an audit failure does not affect the download (audit availability must not block the read path).

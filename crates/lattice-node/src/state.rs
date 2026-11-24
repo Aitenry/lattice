@@ -514,6 +514,10 @@ pub struct AppState {
     pub admin_db: pg::Pool,
     pub redis: Redis,
     pub s3: S3,
+    /// Download transfer plane signer (design §6.10): `Some` when `[transfer] enabled`, in
+    /// which case download endpoints answer `302` to the transfer service instead of handing
+    /// out presigned object-store URLs. `None` = legacy presign path.
+    pub transfer: Option<Arc<crate::transfer::TokenSigner>>,
     pub bus: Arc<dyn Bus>,
     pub wal: Wal,
     /// Short-term positive cache used while PG is unavailable (② §4.8 WAL degradation companion: membership check/member list degradation).

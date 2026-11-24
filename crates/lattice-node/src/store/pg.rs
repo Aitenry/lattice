@@ -462,8 +462,13 @@ pub async fn count_users_by_role(pool: &Pool, role: &str) -> Result<i64> {
     Ok(row.get::<i64, _>("c"))
 }
 
+/// List users (admin plane).
+///
+/// `scope` implements per-account isolation for the least-privileged role: `Some(user_id)`
+/// restricts the result to that account's own row, `None` (ops/admin) keeps the global view.
 pub async fn list_users(
     pool: &Pool,
+    scope: Option<&str>,
     q: Option<&str>,
     status: Option<&str>,
     page: i64,
@@ -473,10 +478,12 @@ pub async fn list_users(
     let total: i64 = sqlx::query_scalar(
         "select count(*) from users
          where ($1::text is null or username ilike $1 or display_name ilike $1)
-           and ($2::text is null or status = $2)",
+           and ($2::text is null or status = $2)
+           and ($3::text is null or id = $3)",
     )
     .bind(pattern.as_deref())
     .bind(status)
+    .bind(scope)
     .fetch_one(pool)
     .await
     .map_err(db)?;
@@ -485,10 +492,12 @@ pub async fn list_users(
         "select * from users
          where ($1::text is null or username ilike $1 or display_name ilike $1)
            and ($2::text is null or status = $2)
-         order by created_at desc limit $3 offset $4",
+           and ($3::text is null or id = $3)
+         order by created_at desc limit $4 offset $5",
     )
     .bind(pattern.as_deref())
     .bind(status)
+    .bind(scope)
     .bind(page_size)
     .bind((page - 1).max(0) * page_size)
     .fetch_all(pool)
@@ -615,8 +624,11 @@ pub async fn devices_of(pool: &Pool, user_id: &str) -> Result<Vec<Device>> {
     .map_err(db)
 }
 
+/// List devices (admin plane). `scope = Some(user_id)` pins the result to that account
+/// (the least-privileged role sees only its own devices); `None` is the global ops/admin view.
 pub async fn list_devices_admin(
     pool: &Pool,
+    scope: Option<&str>,
     user: Option<&str>,
     revoked: Option<bool>,
 ) -> Result<Vec<Device>> {
@@ -624,10 +636,12 @@ pub async fn list_devices_admin(
         "select * from devices
          where ($1::text is null or user_id = $1)
            and ($2::bool is null or (revoked_at is not null) = $2)
+           and ($3::text is null or user_id = $3)
          order by last_seen desc nulls last limit 500",
     )
     .bind(user)
     .bind(revoked)
+    .bind(scope)
     .fetch_all(pool)
     .await
     .map_err(db)
@@ -880,8 +894,14 @@ pub async fn list_conversations(pool: &Pool, user: &str) -> Result<Vec<ConvSumma
         .collect())
 }
 
+/// Admin conversation/topic list.
+///
+/// `scope = Some(user_id)` restricts the result to conversations the account is a member of
+/// (topics included: subscribing adds a `conversation_members` row); `None` is the global
+/// ops/admin view.
 pub async fn list_conversations_admin(
     pool: &Pool,
+    scope: Option<&str>,
     q: Option<&str>,
     kind: Option<&str>,
     page: i64,
@@ -889,11 +909,14 @@ pub async fn list_conversations_admin(
 ) -> Result<(Vec<ConvSummary>, i64)> {
     let pattern = q.map(|s| format!("%{s}%"));
     let total: i64 = sqlx::query_scalar(
-        "select count(*) from conversations
-         where ($1::text is null or name ilike $1) and ($2::text is null or kind = $2)",
+        "select count(*) from conversations c
+         where ($1::text is null or c.name ilike $1) and ($2::text is null or c.kind = $2)
+           and ($3::text is null or exists (
+                 select 1 from conversation_members cm where cm.conv_id = c.id and cm.user_id = $3))",
     )
     .bind(pattern.as_deref())
     .bind(kind)
+    .bind(scope)
     .fetch_one(pool)
     .await
     .map_err(db)?;
@@ -907,10 +930,13 @@ pub async fn list_conversations_admin(
             select max(seq) as max_seq, max(created_at) as last_at from messages m where m.conv_id = c.id
          ) mx on true
          where ($1::text is null or c.name ilike $1) and ($2::text is null or c.kind = $2)
-         order by c.created_at desc limit $3 offset $4",
+           and ($3::text is null or exists (
+                 select 1 from conversation_members cm2 where cm2.conv_id = c.id and cm2.user_id = $3))
+         order by c.created_at desc limit $4 offset $5",
     )
     .bind(pattern.as_deref())
     .bind(kind)
+    .bind(scope)
     .bind(page_size)
     .bind((page - 1).max(0) * page_size)
     .fetch_all(pool)
@@ -1097,8 +1123,14 @@ pub async fn max_seq(pool: &Pool, conv: &str) -> Result<i64> {
     Ok(v.unwrap_or(0))
 }
 
+/// Admin metadata search.
+///
+/// `scope = Some(user_id)` makes the query per-account: only messages in conversations the
+/// account belongs to, or messages delivered to it. `None` is the global ops/admin search.
+/// (`id`/`conv`/`user` is still required by the handler — ⑤ §13 I2 selectivity.)
 pub async fn search_messages_admin(
     pool: &Pool,
+    scope: Option<&str>,
     id: Option<&str>,
     conv: Option<&str>,
     user: Option<&str>,
@@ -1113,6 +1145,11 @@ pub async fn search_messages_admin(
            and ($2::text is null or m.conv_id = $2)
            and ($3::text is null or m.sender = $3 or d.to_user = $3)
            and ($4::text is null or d.state = $4)
+           and ($7::text is null or (
+                 exists (select 1 from conversation_members cm
+                          where cm.conv_id = m.conv_id and cm.user_id = $7)
+                 or exists (select 1 from delivery_log dd
+                             where dd.msg_id = m.id and dd.to_user = $7)))
          order by m.created_at desc limit $5 offset $6",
     )
     .bind(id)
@@ -1121,7 +1158,43 @@ pub async fn search_messages_admin(
     .bind(state)
     .bind(page_size)
     .bind((page - 1).max(0) * page_size)
+    .bind(scope)
     .fetch_all(pool)
+    .await
+    .map_err(db)
+}
+
+/// Is `user_id` a member of `conv_id`? Used to keep per-account callers inside their own
+/// conversations (a missing membership is reported as 404 by the handler, never 403, so the
+/// existence of somebody else's conversation is not leaked).
+pub async fn is_conversation_member(pool: &Pool, conv_id: &str, user_id: &str) -> Result<bool> {
+    sqlx::query_scalar(
+        "select exists (select 1 from conversation_members where conv_id = $1 and user_id = $2)",
+    )
+    .bind(conv_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db)
+}
+
+/// May `user_id` see this message's delivery details?
+///
+/// Same rule as [`search_messages_admin`] with a scope: a member of the conversation, or a
+/// recipient of the message.
+pub async fn message_visible_to(pool: &Pool, msg_id: &str, user_id: &str) -> Result<bool> {
+    sqlx::query_scalar(
+        "select exists (
+           select 1 from messages m
+           where m.id = $1 and (
+             exists (select 1 from conversation_members cm
+                      where cm.conv_id = m.conv_id and cm.user_id = $2)
+             or exists (select 1 from delivery_log d
+                         where d.msg_id = m.id and d.to_user = $2)))",
+    )
+    .bind(msg_id)
+    .bind(user_id)
+    .fetch_one(pool)
     .await
     .map_err(db)
 }
@@ -2062,6 +2135,16 @@ pub struct HubVersionRow {
     pub source_size: Option<i64>,
     pub source_sha256: Option<String>,
     pub source_object_key: Option<String>,
+    // ---- review workflow (migration 0012) ----
+    /// Catalog-field snapshot of this submission (`name/description/readme/icon/category/tags`),
+    /// applied to `hub_plugins` only on approval so a draft never edits a published plugin page.
+    pub meta: Option<Value>,
+    /// Administrator rejection reason (only the owner and admins can read it).
+    pub review_note: Option<String>,
+    pub reviewed_by: Option<String>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    /// Latest "submit for review" time (resubmits update it); the admin queue is ordered by it.
+    pub submitted_at: Option<DateTime<Utc>>,
 }
 
 /// Source package location info (projection of `hub_source_info`; returned only when all four columns are non-null).
@@ -2142,6 +2225,11 @@ pub enum HubDraftOutcome {
         plugin: HubPluginRow,
         version: HubVersionRow,
     },
+    /// The same package is already waiting for an administrator (idempotent retry).
+    ReviewPending {
+        plugin: HubPluginRow,
+        version: HubVersionRow,
+    },
 }
 
 /// Failure reason for publishing a draft (handler maps to 403/409).
@@ -2149,6 +2237,12 @@ pub enum HubDraftOutcome {
 pub enum HubDraftError {
     NotOwner,
     VersionPublished { sha256: String },
+    /// A different package is already waiting for review under this version.
+    VersionInReview { sha256: String },
+    /// The version was removed (terminal).
+    VersionRemoved,
+    /// The plugin was removed (terminal); publish under a new plugin_id.
+    PluginRemoved,
     Db(sqlx::Error),
 }
 
@@ -2160,6 +2254,20 @@ impl From<sqlx::Error> for HubDraftError {
 
 fn hub_owner_fields(row: HubPluginRow) -> HubPluginRow {
     row
+}
+
+/// Catalog-field snapshot of a submission (migration 0012). It is applied to
+/// `hub_plugins` only when an administrator approves the version, so a draft never
+/// mutates the public page of an already published plugin.
+fn hub_meta(v: &HubNewVersion<'_>) -> Value {
+    serde_json::json!({
+        "name": v.name,
+        "description": v.description,
+        "readme": v.readme,
+        "icon": v.icon,
+        "category": v.category,
+        "tags": v.tags,
+    })
 }
 
 /// Read the plugin body (including owner display name). `status` is unrestricted (the caller decides visibility).
@@ -2243,18 +2351,45 @@ pub async fn hub_catalog(
     Ok((items, total))
 }
 
-/// Version list (by default only published, newest published first).
-pub async fn hub_versions_of(pool: &Pool, plugin_row_id: &str, include_removed: bool) -> Result<Vec<HubVersionRow>> {
+/// Whether the plugin currently has at least one approved (`published`) version.
+///
+/// Catalog visibility requires this, and so does detail visibility for non-owners: a plugin
+/// whose only version is `pending`/`review`/`rejected` must look nonexistent to everybody
+/// except its owner and admins.
+pub async fn hub_has_published_version(pool: &Pool, plugin_row_id: &str) -> Result<bool> {
+    sqlx::query_scalar(
+        "select exists (select 1 from hub_plugin_versions
+                         where plugin_row_id = $1 and status = 'published')",
+    )
+    .bind(plugin_row_id)
+    .fetch_one(pool)
+    .await
+    .map_err(db)
+}
+
+/// Version list.
+///
+/// `include_unpublished = false` → only approved (`published`) versions, i.e. what any other
+/// user may see. `true` → everything except `removed`, i.e. the owner/admin view that also
+/// shows the pending upload, the version waiting for review and rejected submissions.
+pub async fn hub_versions_of(
+    pool: &Pool,
+    plugin_row_id: &str,
+    include_unpublished: bool,
+) -> Result<Vec<HubVersionRow>> {
     sqlx::query_as::<_, HubVersionRow>(
         "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
                 manifest, status, downloads, published_at, created_at,
-                source_asset_name, source_size, source_sha256, source_object_key
+                source_asset_name, source_size, source_sha256, source_object_key,
+                meta, review_note, reviewed_by, reviewed_at, submitted_at
          from hub_plugin_versions
-         where plugin_row_id = $1 and (status = 'published' or $2)
+         where plugin_row_id = $1
+           and status <> 'removed'
+           and (status = 'published' or $2)
          order by published_at desc nulls last, created_at desc",
     )
     .bind(plugin_row_id)
-    .bind(include_removed)
+    .bind(include_unpublished)
     .fetch_all(pool)
     .await
     .map_err(db)
@@ -2264,7 +2399,8 @@ pub async fn hub_version(pool: &Pool, plugin_row_id: &str, version: &str) -> Res
     sqlx::query_as::<_, HubVersionRow>(
         "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
                 manifest, status, downloads, published_at, created_at,
-                source_asset_name, source_size, source_sha256, source_object_key
+                source_asset_name, source_size, source_sha256, source_object_key,
+                meta, review_note, reviewed_by, reviewed_at, submitted_at
          from hub_plugin_versions where plugin_row_id = $1 and version = $2",
     )
     .bind(plugin_row_id)
@@ -2410,36 +2546,51 @@ pub async fn hub_create_draft(
             if plugin.owner_id != user_id && !is_admin {
                 return Err(HubDraftError::NotOwner);
             }
-            sqlx::query(
-                "update hub_plugins
-                 set name = $2, description = $3,
-                     readme = coalesce($4, readme),
-                     icon = coalesce($5, icon),
-                     category = $6, tags = $7,
-                     status = 'published', updated_at = now()
-                 where id = $1",
+            if plugin.status == "removed" {
+                // A removed plugin is terminal: re-publishing it would silently restore content
+                // others already saw removed. A new plugin_id is required.
+                return Err(HubDraftError::PluginRemoved);
+            }
+            // Catalog fields are part of the reviewed content. Once a plugin has at least one
+            // approved version, submission must not mutate its public page: the new fields are
+            // carried by the version's `meta` snapshot and applied on approval.
+            let has_published: bool = sqlx::query_scalar(
+                "select exists (select 1 from hub_plugin_versions
+                                where plugin_row_id = $1 and status = 'published')",
             )
             .bind(&plugin.id)
-            .bind(v.name)
-            .bind(v.description)
-            .bind(v.readme)
-            .bind(v.icon)
-            .bind(v.category)
-            .bind(v.tags)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-            plugin.name = v.name.to_string();
-            plugin.description = v.description.to_string();
-            if let Some(r) = v.readme {
-                plugin.readme = r.to_string();
+            if !has_published {
+                sqlx::query(
+                    "update hub_plugins
+                     set name = $2, description = $3,
+                         readme = coalesce($4, readme),
+                         icon = coalesce($5, icon),
+                         category = $6, tags = $7, updated_at = now()
+                     where id = $1",
+                )
+                .bind(&plugin.id)
+                .bind(v.name)
+                .bind(v.description)
+                .bind(v.readme)
+                .bind(v.icon)
+                .bind(v.category)
+                .bind(v.tags)
+                .execute(&mut *tx)
+                .await?;
+                plugin.name = v.name.to_string();
+                plugin.description = v.description.to_string();
+                if let Some(r) = v.readme {
+                    plugin.readme = r.to_string();
+                }
+                if let Some(i) = v.icon {
+                    plugin.icon = Some(i.to_string());
+                }
+                plugin.category = v.category.to_string();
+                plugin.tags = v.tags.to_vec();
+                plugin.updated_at = Utc::now();
             }
-            if let Some(i) = v.icon {
-                plugin.icon = Some(i.to_string());
-            }
-            plugin.category = v.category.to_string();
-            plugin.tags = v.tags.to_vec();
-            plugin.status = "published".into();
-            plugin.updated_at = Utc::now();
             plugin
         }
         None => {
@@ -2474,7 +2625,8 @@ pub async fn hub_create_draft(
     let prev = sqlx::query_as::<_, HubVersionRow>(
         "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
                 manifest, status, downloads, published_at, created_at,
-                source_asset_name, source_size, source_sha256, source_object_key
+                source_asset_name, source_size, source_sha256, source_object_key,
+                meta, review_note, reviewed_by, reviewed_at, submitted_at
          from hub_plugin_versions where plugin_row_id = $1 and version = $2 for update",
     )
     .bind(&plugin.id)
@@ -2518,8 +2670,22 @@ pub async fn hub_create_draft(
             }
             return Err(HubDraftError::VersionPublished { sha256: row.sha256 });
         }
+        Some(row) if row.status == "removed" => {
+            // Removed versions are terminal: restoring requires publishing a new version (⑤ §12.6).
+            return Err(HubDraftError::VersionRemoved);
+        }
+        Some(row) if row.status == "review" => {
+            if row.sha256 == v.sha256 {
+                // Idempotent retry while the same package already waits for review: no new upload target.
+                tx.commit().await?;
+                return Ok(HubDraftOutcome::ReviewPending { plugin, version: row });
+            }
+            return Err(HubDraftError::VersionInReview { sha256: row.sha256 });
+        }
         Some(row) => {
-            // Draft retry: overwrite metadata for the same version (replace the package if sha changed; the old object was never written).
+            // pending / rejected: (re)submission. A rejected version may be corrected in place:
+            // the old rejection note is cleared and the row returns to `pending` until the
+            // package body is uploaded again.
             // Source metadata uses coalesce: when the request has no source, keep the declared value (do not misinterpret
             // "the client omitted the source field this time" as "delete the source declaration"); once the request
             // carries new source metadata, clear object_key — the old source object corresponds to the
@@ -2528,6 +2694,7 @@ pub async fn hub_create_draft(
                 "update hub_plugin_versions
                  set asset_name = $2, size = $3, sha256 = $4, object_key = $5,
                      changelog = $6, manifest = $7, uploaded_by = $8, status = 'pending',
+                     meta = $12, review_note = null, reviewed_by = null, reviewed_at = null,
                      source_asset_name = coalesce($9, source_asset_name),
                      source_size = coalesce($10, source_size),
                      source_sha256 = coalesce($11, source_sha256),
@@ -2545,6 +2712,7 @@ pub async fn hub_create_draft(
             .bind(v.source_asset_name)
             .bind(v.source_size)
             .bind(v.source_sha256)
+            .bind(hub_meta(v))
             .execute(&mut *tx)
             .await?;
             HubVersionRow {
@@ -2554,6 +2722,11 @@ pub async fn hub_create_draft(
                 object_key: v.object_key.into(),
                 changelog: v.changelog.into(),
                 manifest: v.manifest.clone(),
+                meta: Some(hub_meta(v)),
+                review_note: None,
+                reviewed_by: None,
+                reviewed_at: None,
+                submitted_at: None,
                 source_asset_name: v
                     .source_asset_name
                     .map(str::to_string)
@@ -2573,8 +2746,8 @@ pub async fn hub_create_draft(
             sqlx::query(
                 "insert into hub_plugin_versions
                    (id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog, manifest, uploaded_by,
-                    source_asset_name, source_size, source_sha256)
-                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                    source_asset_name, source_size, source_sha256, meta)
+                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
             )
             .bind(&id)
             .bind(&plugin.id)
@@ -2589,12 +2762,14 @@ pub async fn hub_create_draft(
             .bind(v.source_asset_name)
             .bind(v.source_size)
             .bind(v.source_sha256)
+            .bind(hub_meta(v))
             .execute(&mut *tx)
             .await?;
             sqlx::query_as::<_, HubVersionRow>(
                 "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
                         manifest, status, downloads, published_at, created_at,
-                        source_asset_name, source_size, source_sha256, source_object_key
+                        source_asset_name, source_size, source_sha256, source_object_key,
+                        meta, review_note, reviewed_by, reviewed_at, submitted_at
                  from hub_plugin_versions where id = $1",
             )
             .bind(&id)
@@ -2611,35 +2786,173 @@ pub async fn hub_create_draft(
     })
 }
 
-/// After the package body is stored: move the version to `published` and advance the latest-version pointer (semver comparison is done in Rust).
-pub async fn hub_publish_version(pool: &Pool, version_id: &str) -> Result<Option<HubVersionRow>> {
+/// After the package body is stored: move the version `pending → review` (waiting for an
+/// administrator). Only [`hub_approve_version`] sets `published_at` / `reviewed_*`.
+///
+/// Idempotent: an already submitted (`review`) or approved (`published`) row is returned
+/// unchanged; `removed` rows are invisible (the upload handler already rejected them).
+pub async fn hub_submit_review(pool: &Pool, version_id: &str) -> Result<Option<HubVersionRow>> {
     let mut tx = pool.begin().await.map_err(db)?;
-    let version = sqlx::query_as::<_, HubVersionRow>(
+    let current = sqlx::query_as::<_, HubVersionRow>(
         "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
                 manifest, status, downloads, published_at, created_at,
-                source_asset_name, source_size, source_sha256, source_object_key
+                source_asset_name, source_size, source_sha256, source_object_key,
+                meta, review_note, reviewed_by, reviewed_at, submitted_at
          from hub_plugin_versions where id = $1 for update",
     )
     .bind(version_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(db)?;
-    let Some(mut version) = version else {
+    let Some(row) = current else {
+        tx.rollback().await.ok();
         return Ok(None);
+    };
+    match row.status.as_str() {
+        "published" | "review" => {
+            tx.commit().await.ok();
+            Ok(Some(row))
+        }
+        "removed" => {
+            tx.rollback().await.ok();
+            Ok(None)
+        }
+        _ => {
+            let updated = sqlx::query_as::<_, HubVersionRow>(
+                "update hub_plugin_versions
+                 set status = 'review', submitted_at = now(),
+                     review_note = null, reviewed_by = null, reviewed_at = null
+                 where id = $1
+                 returning id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
+                           manifest, status, downloads, published_at, created_at,
+                           source_asset_name, source_size, source_sha256, source_object_key,
+                           meta, review_note, reviewed_by, reviewed_at, submitted_at",
+            )
+            .bind(version_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+            sqlx::query("update hub_plugins set updated_at = now() where id = $1")
+                .bind(&updated.plugin_row_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            tx.commit().await.map_err(db)?;
+            Ok(Some(updated))
+        }
+    }
+}
+
+/// Result of an administrator review action.
+#[derive(Debug)]
+pub enum HubReviewOutcome {
+    Published(HubVersionRow),
+    Rejected(HubVersionRow),
+    /// Approval retried after the version was already published (idempotent).
+    AlreadyPublished(HubVersionRow),
+    NotFound,
+    /// The row exists but is not waiting for review (pending upload / rejected / removed).
+    NotInReview { status: String },
+    /// The plugin itself was removed while the version was waiting for review.
+    PluginRemoved,
+}
+
+/// Administrator approval: `review → published`.
+///
+/// On approval the version's `meta` snapshot is applied to `hub_plugins` (this is the only
+/// place a submission can change the public plugin page) and the latest published version
+/// pointer is recomputed with semver ordering.
+pub async fn hub_approve_version(
+    pool: &Pool,
+    version_id: &str,
+    reviewer: &str,
+) -> Result<HubReviewOutcome> {
+    let mut tx = pool.begin().await.map_err(db)?;
+    let current = sqlx::query_as::<_, HubVersionRow>(
+        "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
+                manifest, status, downloads, published_at, created_at,
+                source_asset_name, source_size, source_sha256, source_object_key,
+                meta, review_note, reviewed_by, reviewed_at, submitted_at
+         from hub_plugin_versions where id = $1 for update",
+    )
+    .bind(version_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db)?;
+    let Some(mut version) = current else {
+        tx.rollback().await.ok();
+        return Ok(HubReviewOutcome::NotFound);
     };
     if version.status == "published" {
         tx.commit().await.ok();
-        return Ok(Some(version));
+        return Ok(HubReviewOutcome::AlreadyPublished(version));
     }
+    if version.status != "review" {
+        let status = version.status.clone();
+        tx.rollback().await.ok();
+        return Ok(HubReviewOutcome::NotInReview { status });
+    }
+    // Approving a version of an already removed plugin would resurrect content the owner
+    // deleted: treat it as a stale submission instead.
+    let plugin_status: Option<String> =
+        sqlx::query_scalar("select status from hub_plugins where id = $1")
+            .bind(&version.plugin_row_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+    if plugin_status.as_deref() != Some("published") {
+        tx.rollback().await.ok();
+        return Ok(HubReviewOutcome::PluginRemoved);
+    }
+
+    let now = Utc::now();
     sqlx::query(
-        "update hub_plugin_versions set status = 'published', published_at = now() where id = $1",
+        "update hub_plugin_versions
+         set status = 'published', published_at = $2, reviewed_by = $3, reviewed_at = $2,
+             review_note = null
+         where id = $1",
     )
     .bind(&version.id)
+    .bind(now)
+    .bind(reviewer)
     .execute(&mut *tx)
     .await
     .map_err(db)?;
     version.status = "published".into();
-    version.published_at = Some(Utc::now());
+    version.published_at = Some(now);
+    version.reviewed_by = Some(reviewer.to_string());
+    version.reviewed_at = Some(now);
+    version.review_note = None;
+
+    if let Some(meta) = version.meta.clone() {
+        let text = |key: &str| meta.get(key).and_then(Value::as_str);
+        let tags: Option<Vec<String>> = meta
+            .get("tags")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok());
+        sqlx::query(
+            "update hub_plugins
+             set name = coalesce($2, name),
+                 description = coalesce($3, description),
+                 readme = coalesce($4, readme),
+                 icon = coalesce($5, icon),
+                 category = coalesce($6, category),
+                 tags = coalesce($7::text[], tags),
+                 status = 'published',
+                 updated_at = now()
+             where id = $1",
+        )
+        .bind(&version.plugin_row_id)
+        .bind(text("name"))
+        .bind(text("description"))
+        .bind(text("readme"))
+        .bind(text("icon"))
+        .bind(text("category"))
+        .bind(tags)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    }
 
     let published: Vec<(String,)> = sqlx::query_as(
         "select version from hub_plugin_versions where plugin_row_id = $1 and status = 'published'",
@@ -2660,7 +2973,154 @@ pub async fn hub_publish_version(pool: &Pool, version_id: &str) -> Result<Option
         .await
         .map_err(db)?;
     tx.commit().await.map_err(db)?;
-    Ok(Some(version))
+    Ok(HubReviewOutcome::Published(version))
+}
+
+/// Administrator rejection: `review → rejected`, storing the note for the owner.
+/// A rejected version cannot be installed; the owner may correct it and submit the same
+/// version again (it goes back to `pending`, then `review` after the upload).
+pub async fn hub_reject_version(
+    pool: &Pool,
+    version_id: &str,
+    reviewer: &str,
+    note: &str,
+) -> Result<HubReviewOutcome> {
+    let mut tx = pool.begin().await.map_err(db)?;
+    let current = sqlx::query_as::<_, HubVersionRow>(
+        "select id, plugin_row_id, version, asset_name, size, sha256, object_key, changelog,
+                manifest, status, downloads, published_at, created_at,
+                source_asset_name, source_size, source_sha256, source_object_key,
+                meta, review_note, reviewed_by, reviewed_at, submitted_at
+         from hub_plugin_versions where id = $1 for update",
+    )
+    .bind(version_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db)?;
+    let Some(mut version) = current else {
+        tx.rollback().await.ok();
+        return Ok(HubReviewOutcome::NotFound);
+    };
+    if version.status != "review" {
+        let status = version.status.clone();
+        tx.rollback().await.ok();
+        return Ok(HubReviewOutcome::NotInReview { status });
+    }
+    let now = Utc::now();
+    sqlx::query(
+        "update hub_plugin_versions
+         set status = 'rejected', review_note = $2, reviewed_by = $3, reviewed_at = $4
+         where id = $1",
+    )
+    .bind(&version.id)
+    .bind(note)
+    .bind(reviewer)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    version.status = "rejected".into();
+    version.review_note = Some(note.to_string());
+    version.reviewed_by = Some(reviewer.to_string());
+    version.reviewed_at = Some(now);
+    tx.commit().await.map_err(db)?;
+    Ok(HubReviewOutcome::Rejected(version))
+}
+
+/// One row of the administrator review queue (oldest submission first).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HubReviewRow {
+    pub plugin_id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub owner_username: String,
+    pub owner_display_name: Option<String>,
+    pub version: String,
+    pub asset_name: String,
+    pub size: i64,
+    pub sha256: String,
+    pub changelog: String,
+    pub has_source: bool,
+    pub submitted_at: DateTime<Utc>,
+}
+
+pub async fn hub_review_queue(
+    pool: &Pool,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<HubReviewRow>, i64)> {
+    let total: i64 = sqlx::query_scalar(
+        "select count(*) from hub_plugin_versions v
+         join hub_plugins p on p.id = v.plugin_row_id
+         where v.status = 'review' and p.status = 'published'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db)?;
+    let rows = sqlx::query_as::<_, HubReviewRow>(
+        "select p.plugin_id, p.name, p.owner_id,
+                u.username as owner_username, u.display_name as owner_display_name,
+                v.version, v.asset_name, v.size, v.sha256, v.changelog,
+                (v.source_object_key is not null) as has_source,
+                coalesce(v.submitted_at, v.created_at) as submitted_at
+         from hub_plugin_versions v
+         join hub_plugins p on p.id = v.plugin_row_id
+         join users u on u.id = p.owner_id
+         where v.status = 'review' and p.status = 'published'
+         order by coalesce(v.submitted_at, v.created_at) asc, v.id asc
+         limit $1 offset $2",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    Ok((rows, total))
+}
+
+/// The owner's own plugins (including unpublished / rejected ones) for the "my plugins" view.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HubMineRow {
+    pub plugin_id: String,
+    pub name: String,
+    pub description: String,
+    pub icon: Option<String>,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub status: String,
+    pub latest_version: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub versions_count: i64,
+    pub review_version: Option<String>,
+    pub rejected_version: Option<String>,
+    pub rejected_note: Option<String>,
+}
+
+pub async fn hub_my_plugins(pool: &Pool, owner_id: &str) -> Result<Vec<HubMineRow>> {
+    sqlx::query_as::<_, HubMineRow>(
+        "select p.plugin_id, p.name, p.description, p.icon, p.category, p.tags,
+                p.status, p.latest_version, p.created_at, p.updated_at,
+                (select count(*) from hub_plugin_versions v
+                  where v.plugin_row_id = p.id and v.status = 'published') as versions_count,
+                (select v.version from hub_plugin_versions v
+                  where v.plugin_row_id = p.id and v.status = 'review'
+                  order by v.submitted_at desc nulls last, v.created_at desc limit 1) as review_version,
+                (select v.version from hub_plugin_versions v
+                  where v.plugin_row_id = p.id and v.status = 'rejected'
+                  order by v.reviewed_at desc nulls last, v.created_at desc limit 1) as rejected_version,
+                (select v.review_note from hub_plugin_versions v
+                  where v.plugin_row_id = p.id and v.status = 'rejected'
+                  order by v.reviewed_at desc nulls last, v.created_at desc limit 1) as rejected_note
+         from hub_plugins p
+         where p.owner_id = $1 and p.status <> 'removed'
+         order by p.updated_at desc, p.plugin_id asc
+         limit 200",
+    )
+    .bind(owner_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db)
 }
 
 /// Unpublish a version; returns (whether the version existed, whether the plugin still has a published version).
@@ -2883,10 +3343,18 @@ pub async fn hub_install_delete(pool: &Pool, user_id: &str, plugin_id: &str) -> 
 
 /// Console statistics (⑤ §12.8).
 pub async fn hub_stats(pool: &Pool) -> Result<Value> {
-    let plugins: i64 = sqlx::query_scalar("select count(*) from hub_plugins where status = 'published'")
-        .fetch_one(pool)
-        .await
-        .map_err(db)?;
+    // Same visibility rule as the catalog: a plugin counts only when it has at least one
+    // approved version. Counting the bare plugin row would include first submissions that
+    // are still waiting for review (review flow, 2026-11-23).
+    let plugins: i64 = sqlx::query_scalar(
+        "select count(*) from hub_plugins p
+         where p.status = 'published'
+           and exists (select 1 from hub_plugin_versions v
+                        where v.plugin_row_id = p.id and v.status = 'published')",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db)?;
     let versions: i64 =
         sqlx::query_scalar("select count(*) from hub_plugin_versions where status = 'published'")
             .fetch_one(pool)
@@ -2958,6 +3426,9 @@ pub async fn hub_expire_drafts(pool: &Pool, limit: i64) -> Result<u64> {
 }
 
 /// Unpublished versions awaiting reclamation (objects retained 30 days, ⑥ §2.6).
+///
+/// `rejected` rows are included: after the retention window the owner can still re-submit
+/// the same version number (it becomes a fresh `pending` row, and the package is uploaded again).
 pub async fn hub_removed_versions_to_gc(
     pool: &Pool,
     older_than_days: i64,
@@ -2965,7 +3436,7 @@ pub async fn hub_removed_versions_to_gc(
 ) -> Result<Vec<(String, String, Option<String>)>> {
     sqlx::query_as::<_, (String, String, Option<String>)>(
         "select id, object_key, source_object_key from hub_plugin_versions
-         where status = 'removed'
+         where status in ('removed','rejected')
            and created_at < now() - make_interval(days => $1::int)
          order by created_at limit $2",
     )

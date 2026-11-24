@@ -1,0 +1,37 @@
+{{- if and .Values.transfer.enabled .Values.transfer.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "lattice.transfer.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transfer
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "lattice.transfer.fullname" . }}
+  minReplicas: {{ .Values.transfer.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.transfer.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.transfer.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    # scale downloads out fast and in slowly: shrinking a replica cuts its in-flight transfers
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+{{- end }}

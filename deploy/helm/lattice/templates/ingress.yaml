@@ -9,6 +9,7 @@ metadata:
     # WS/SSE need long connections: nginx ingress proxy-read-timeout overrides globally (the default 60s cuts the stream)
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # streamed downloads (/t) pass through byte-for-byte: buffering must stay off, like /v1/ws and SSE
     nginx.ingress.kubernetes.io/proxy-buffering: "off"
     {{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
     # cert-manager issues/renews for ingress.host (the Issuer is pre-created by operations; the chart creates no cluster-scoped resources)
@@ -29,6 +30,16 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
+          {{- if .Values.transfer.enabled }}
+          # download transfer plane: /t/{token} → transfer Service (longer prefix than "/", so it wins the match)
+          - path: /t
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "lattice.transfer.fullname" . }}
+                port:
+                  number: {{ .Values.transfer.service.port }}
+          {{- end }}
           - path: /
             pathType: Prefix
             backend:

@@ -14,7 +14,10 @@ import { useI18n } from '@/i18n'
 export default function DevicesPage() {
   const { t } = useI18n()
   const { message } = AntApp.useApp()
-  const { can } = useAuth()
+  const { can, role, session } = useAuth()
+  // Regular accounts only ever see their own devices (the server enforces the same scope);
+  // the "filter by user" box would be misleading there, so it is hidden.
+  const ownScope = role === 'user'
   const [rows, setRows] = useState<DeviceRow[]>([])
   const [user, setUser] = useState('')
   const [revoked, setRevoked] = useState<boolean>(false)
@@ -27,14 +30,14 @@ export default function DevicesPage() {
     setLoading(true)
     setErr(null)
     try {
-      const r = await listDevices({ user: user || undefined, revoked })
+      const r = await listDevices({ user: ownScope ? undefined : user || undefined, revoked })
       setRows(r.items ?? [])
     } catch (e) {
       setErr(errText(e))
     } finally {
       setLoading(false)
     }
-  }, [user, revoked])
+  }, [ownScope, user, revoked])
 
   useEffect(() => {
     void load()
@@ -52,12 +55,14 @@ export default function DevicesPage() {
               {t('Refresh')}
             </Button>
           </div>
-          <Input.Search
-            allowClear
-            placeholder={t('Filter by user ID')}
-            style={{ width: 300 }}
-            onSearch={(v) => setUser(v.trim())}
-          />
+          {!ownScope && (
+            <Input.Search
+              allowClear
+              placeholder={t('Filter by user ID')}
+              style={{ width: 300 }}
+              onSearch={(v) => setUser(v.trim())}
+            />
+          )}
           <Space size={6}>
             <Switch size="small" checked={revoked} onChange={setRevoked} />
             <Typography.Text type="secondary">{t('Revoked only')}</Typography.Text>
@@ -73,7 +78,7 @@ export default function DevicesPage() {
           loading={loading}
           dataSource={rows}
           locale={{ emptyText: <Empty description={t('No matching devices')} image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
-          pagination={{ pageSize, showTotal: (count) => t('{count} devices', { count }) }}
+          pagination={{ pageSize, showSizeChanger: false, showTotal: (count) => t('{count} devices', { count }) }}
           columns={[
             {
               title: t('Device'),
@@ -136,7 +141,7 @@ export default function DevicesPage() {
               title: t('Actions'),
               width: 96,
               render: (_, r) =>
-                can('dispose') ? (
+                can('dispose') || (ownScope && r.user_id === session?.userId) ? (
                   <Popconfirm
                     title={t('Revoke this device remotely?')}
                     description={t('The device goes offline immediately and the user must sign in again. The account itself is not affected.')}

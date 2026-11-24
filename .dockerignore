@@ -5,6 +5,9 @@ web/node_modules
 web/dist
 .git
 .gitignore
+# Local scratch: UI harnesses, Chrome profiles, screenshots, build logs (~1 GB per build otherwise)
+/.dev
+/tmp
 scripts/_*
 *.log
 Dockerfile

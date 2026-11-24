@@ -155,7 +155,7 @@ export default function AuditPage() {
           </Button>
           <HelpTip
             title={t(
-              'This version only filters by actor and action type (time-range filtering is not implemented yet), so there is no time picker — that avoids filters that look applied but are not.',
+              'This version only filters by actor and action type (time-range filtering is not implemented yet), so there is no time picker — that avoids filters that look applied but are not. Expand any row to see the full record of that action; audit data is read-only and cannot be modified or deleted from the console.',
             )}
           />
           <span className="muted">{t('{count} items', { count: total })}</span>
@@ -231,12 +231,6 @@ export default function AuditPage() {
           ]}
         />
       </Card>
-
-      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-        {t(
-          'Tip: expand any row to see the full record of that action. Audit data is read-only — it cannot be modified or deleted from the console.',
-        )}
-      </Typography.Text>
     </div>
   )
 }

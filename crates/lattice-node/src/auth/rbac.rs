@@ -57,6 +57,20 @@ impl AuthUser {
     pub fn is_admin(&self) -> bool {
         self.role == Role::Admin
     }
+
+    /// Data-scope filter for read/list endpoints.
+    ///
+    /// Product rule (2026-11-23): the least-privileged `user` role may only see and operate
+    /// its **own** content. `Some(user_id)` means "filter every query to this account";
+    /// `None` (ops/admin) keeps the global operator view. Handlers must pass this to the
+    /// store instead of trusting a query parameter supplied by the caller.
+    pub fn owner_scope(&self) -> Option<&str> {
+        if self.role == Role::User {
+            Some(self.user_id.as_str())
+        } else {
+            None
+        }
+    }
 }
 
 /// Extract the principal from `Authorization: Bearer` (shared by the message plane and parts of the admin plane).
@@ -128,8 +142,13 @@ mod tests {
         assert!(ops.require_act().is_ok());
         assert!(ops.require_change().is_err());
 
-        let admin = AuthUser { role: Role::Admin, ..user };
+        let admin = AuthUser { role: Role::Admin, ..user.clone() };
         assert!(admin.require_change().is_ok());
+
+        // Data isolation: only the `user` tier is pinned to its own rows.
+        assert_eq!(user.owner_scope(), Some("u"));
+        assert_eq!(ops.owner_scope(), None);
+        assert_eq!(admin.owner_scope(), None);
     }
 
     #[test]

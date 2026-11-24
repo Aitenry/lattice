@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
-import { App as AntApp, Button, Card, Input, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { App as AntApp, Button, Card, Empty, Input, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { ReloadOutlined, SearchOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
 import { listConversations } from '@/api/endpoints'
 import type { ConvRow } from '@/api/types'
+import { LIST_PAGE_SIZE, LIST_SCROLL_Y } from '@/components/listLayout'
 import { errText } from '@/lib/errors'
 import { fmtRelative, fmtTime } from '@/lib/format'
 import { HelpTip } from '@/components/HelpTip'
@@ -24,7 +25,7 @@ export default function TopicsPage() {
   const [items, setItems] = useState<ConvRow[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const pageSize = LIST_PAGE_SIZE
   const [q, setQ] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -95,54 +96,57 @@ export default function TopicsPage() {
   ]
 
   return (
-    <div className="page-scroll">
-      <Card
-        title={
-          <Space>
-            {t('Broadcast topics')}
-            <HelpTip title={t('A topic is created when a client calls /v1/topics/{t}/subscribe; offline broadcast messages are backfilled from the topic_offsets watermark. This is a troubleshooting view only; it does not subscribe for users.')} />
-          </Space>
-        }
-        extra={
-          <Space>
-            <Input
-              allowClear
-              size="small"
-              prefix={<SearchOutlined />}
-              placeholder={t('Search by topic ID or name')}
-              value={q}
-              onChange={(e) => {
-                setQ(e.target.value)
-                setPage(1)
-              }}
-              onPressEnter={() => void load()}
-              style={{ width: 220 }}
-            />
-            <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
+    <div className="page-fill">
+      <Card className="list-card">
+        <div className="toolbar">
+          <Input
+            allowClear
+            prefix={<SearchOutlined />}
+            placeholder={t('Search by topic ID or name')}
+            value={q}
+            onChange={(e) => {
+              setQ(e.target.value)
+              setPage(1)
+            }}
+            onPressEnter={() => void load()}
+            style={{ width: 260 }}
+          />
+          <span className="muted">{t('{count} topics', { count: total })}</span>
+          <HelpTip
+            title={t(
+              'A topic is created when a client calls /v1/topics/{t}/subscribe; offline broadcast messages are backfilled from the topic_offsets watermark. This is a troubleshooting view only; it does not subscribe for users.',
+            )}
+          />
+          <div className="toolbar-right">
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
               {t('Refresh')}
             </Button>
-          </Space>
-        }
-      >
+          </div>
+        </div>
+
         <Table
           rowKey="id"
           size="small"
           loading={loading}
           dataSource={items}
           columns={columns}
-          locale={{ emptyText: t('No broadcast topics yet (created when a client first subscribes)') }}
+          locale={{
+            emptyText: (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description={t('No broadcast topics yet (created when a client first subscribes)')}
+              />
+            ),
+          }}
+          scroll={{ y: LIST_SCROLL_Y }}
           pagination={{
             current: page,
             pageSize,
             total,
-            showSizeChanger: true,
+            showSizeChanger: false,
             showTotal: (count) => t('{count} topics', { count }),
-            onChange: (p, s) => {
-              setPage(p)
-              setPageSize(s)
-            }
+            onChange: (p) => setPage(p),
           }}
-          scroll={{ x: 760 }}
         />
       </Card>
     </div>

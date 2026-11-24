@@ -1,0 +1,15 @@
+{{- if and .Values.transfer.enabled .Values.transfer.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lattice.transfer.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transfer
+spec:
+  # the transfer plane is stateless, so one available replica is enough to keep downloads served while draining
+  minAvailable: {{ .Values.transfer.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "lattice.transfer.selectorLabels" . | nindent 6 }}
+{{- end }}

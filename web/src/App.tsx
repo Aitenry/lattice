@@ -16,6 +16,8 @@ import QueuePage from './pages/QueuePage'
 import AuditPage from './pages/AuditPage'
 import PluginsPage from './pages/PluginsPage'
 import PluginHubPage from './pages/PluginHubPage'
+import HubDataPage from './pages/HubDataPage'
+import HubReviewPage from './pages/HubReviewPage'
 import FormatsPage from './pages/FormatsPage'
 import ConfigPage from './pages/ConfigPage'
 import KeysPage from './pages/KeysPage'
@@ -56,6 +58,8 @@ export default function App() {
         <Route path="/queue" element={<QueuePage />} />
         <Route path="/audit" element={<AuditPage />} />
         <Route path="/hub" element={<PluginHubPage />} />
+        <Route path="/hub-data" element={<HubDataPage />} />
+        <Route path="/hub-review" element={<HubReviewPage />} />
         <Route path="/plugins" element={<PluginsPage />} />
         <Route path="/formats" element={<FormatsPage />} />
         <Route path="/config" element={<ConfigPage />} />

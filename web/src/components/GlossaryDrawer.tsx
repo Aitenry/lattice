@@ -46,7 +46,11 @@ const CONCEPTS: { term: string; alias?: string; desc: string }[] = [
   },
   {
     term: 'Plugin hub',
-    desc: 'Third-party plugin repository for desktop clients: users publish plugin packages, others browse, download and install them; install records and plugin settings follow the account across devices. The platform only stores and distributes packages and does not execute plugin code. Plugins under "Plugins" are server-side format processors — a different thing.',
+    desc: 'Third-party plugin repository for desktop clients: users publish plugin packages, others browse, download and install them; install records and plugin settings follow the account across devices. The platform only stores and distributes packages and does not execute plugin code. Server plugins are server-side format processors — a different thing.',
+  },
+  {
+    term: 'Plugin data',
+    desc: 'The install record plus the JSON snapshot that RytenBench syncs to the platform for a plugin (≤256 KiB). Stored per account and used to restore installs and resolve sync conflicts when switching devices. The console shows it read-only; the platform never executes plugin code.',
   },
   {
     term: 'File formats',

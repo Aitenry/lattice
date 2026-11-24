@@ -2,11 +2,11 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: Lattice Platform API (Unified Messaging Platform)
-  version: 0.5.0
+  version: 0.1.0
   summary: Machine-readable contract for all REST/SSE/probe routes in Doc ⑤ (with WS/MQTT/gRPC boundary registrations)
   description: |-
     The **machine-readable authoritative artifact** for the Lattice platform API contract, mapping one-to-one to
-    the platform API design document (Doc ⑤, v0.18; maintained outside this repository).
+    the platform API design document (Doc ⑤, v0.19; maintained outside this repository).
 
     ## Authority boundary
 
@@ -18,11 +18,11 @@ info:
       missing/extra.
     - Value conventions (key names/enums/thresholds/command sets/parameter tables) follow design doc §17; this file only references them.
 
-    ## Coverage (93 HTTP operations + non-HTTP protocol boundaries)
+    ## Coverage (97 HTTP operations + non-HTTP protocol boundaries)
 
     - REST message API: §1 auth, §2 users and devices, §3 conversations, §4 messages, §5 uploads, §7 topics, §9.7 media helpers;
     - REST admin API: §8.1–§8.6 (online/nodes/queues/SSE/metrics/users/devices/search/plugins/formats/config/keys/audit);
-    - User-facing plugin hub: §12 (`/v1/hub/*`, 13 operations);
+    - User-facing plugin hub: §12 (`/v1/hub/*`, 14 operations) plus the admin review plane (`/v1/admin/hub/*`, 3 operations);
     - Probes: §6 (`/v1/health`, `/v1/ready`);
     - WebSocket: `GET /v1/ws` (upgrade plus frame protocol registered in the `x-ws` extension, 13 commands total);
     - The MQTT gateway and internal gRPC **are not HTTP interfaces**; they are registered as top-level `x-mqtt-gateway` / `x-grpc-services`
@@ -687,7 +687,12 @@ components:
         idx: { type: integer }
         size: { type: integer, format: int64 }
         checksum: { type: string, description: Per-chunk xxhash64. }
-        presigned_url: { $ref: '#/components/schemas/NullableString' }
+        presigned_url:
+          allOf: [{ $ref: '#/components/schemas/NullableString' }]
+          description: >-
+            Chunk download URL. With `[transfer] enabled` this is a transfer-plane capability URL
+            (`{transfer.public_base_url}/t/{token}`, or a same-origin `/t/{token}` when
+            `public_base_url` is empty); otherwise a legacy MinIO presigned URL.
     ChunksResponse:
       type: object
       required: [items]
@@ -821,7 +826,7 @@ components:
             bus: { type: string, enum: [ok, degraded, down] }
         draining: { type: boolean }
         node_id: { $ref: '#/components/schemas/Ulid' }
-        version: { type: string, example: 0.5.0 }
+        version: { type: string, example: 0.1.0 }
 
     # ------------------------------------------------------------------ Media
     TurnCredentials:
@@ -867,7 +872,12 @@ components:
         - $ref: '#/components/schemas/Recording'
         - type: object
           properties:
-            presigned_url: { type: string, format: uri }
+            presigned_url:
+              type: string
+              format: uri
+              description: >-
+                Recording download URL: transfer-plane capability when `[transfer] enabled`,
+                otherwise a legacy MinIO presigned URL.
             download_url: { type: string }
             manifest_url: { $ref: '#/components/schemas/NullableString' }
     RecordingList:
@@ -1418,6 +1428,22 @@ components:
           description: Manifest snapshot submitted by the publisher (consistency with the plugin.json inside the package is verified by the installer as a fallback).
         downloads: { type: integer, format: int64 }
         published_at: { $ref: '#/components/schemas/Timestamp' }
+        status:
+          type: string
+          enum: [pending, review, published, rejected, removed]
+          description: |-
+            Review state (migration 0012). Only `published` is visible/installable to other users.
+            `review`/`rejected`/`pending` rows are returned only to the owner and admins.
+        submitted_at:
+          allOf: [{ $ref: '#/components/schemas/Timestamp' }]
+          description: Owner/admin only; latest submit-for-review time.
+        review_note:
+          type: string
+          nullable: true
+          description: Owner/admin only; rejection reason written by the administrator.
+        reviewed_at:
+          allOf: [{ $ref: '#/components/schemas/Timestamp' }]
+          description: Owner/admin only; last review action time.
         has_source: { type: boolean }
         source_asset_name: { $ref: '#/components/schemas/NullableString' }
         source_size: { type: integer, format: int64 }
@@ -1431,7 +1457,10 @@ components:
         data_rev: { type: integer, format: int64 }
         data_updated_at: { $ref: '#/components/schemas/Timestamp' }
     HubPluginDetail:
-      description: Plugin details (`versions` contains published versions only, ordered by published_at desc).
+      description: |-
+        Plugin details. For every other user `versions` contains published versions only; the owner and
+        admins also see `pending`/`review`/`rejected` rows (with `status`/`review_note`). Ordered by
+        `published_at desc`, then creation time.
       allOf:
         - $ref: '#/components/schemas/HubPluginSummary'
         - type: object
@@ -1502,7 +1531,7 @@ components:
       type: object
       properties:
         version: { type: string }
-        status: { type: string, enum: [pending, published, removed] }
+        status: { type: string, enum: [pending, review, published, rejected, removed] }
         size: { type: integer, format: int64 }
         sha256: { type: string }
         has_source: { type: boolean }
@@ -1527,22 +1556,29 @@ components:
             - type: 'null'
         idempotent_reused: { type: boolean }
         idempotent: { type: boolean }
+        submitted: { type: boolean, description: The same package is already waiting for review (upload null). }
     HubBlobUploadResponse:
       type: object
       properties:
         plugin_id: { type: string }
         version: { type: string }
-        status: { type: string, enum: [published] }
+        status:
+          type: string
+          enum: [review, published]
+          description: '`review` = stored and waiting for an administrator; `published` = already approved (idempotent retry).'
         sha256: { type: string }
         size: { type: integer, format: int64 }
         published_at: { $ref: '#/components/schemas/Timestamp' }
+        submitted_at: { $ref: '#/components/schemas/Timestamp' }
+        review_required: { type: boolean }
         download_path: { type: string }
+        idempotent: { type: boolean }
     HubSourceUploadResponse:
       type: object
       properties:
         plugin_id: { type: string }
         version: { type: string }
-        status: { type: string, enum: [published] }
+        status: { type: string, enum: [pending, review, published, rejected] }
         source_asset_name: { type: string }
         source_size: { type: integer, format: int64 }
         source_sha256: { type: string }
@@ -1592,6 +1628,65 @@ components:
           description: Plugin data snapshot (JSON, ≤256KiB).
         data_rev: { type: integer, format: int64 }
         device_id: { type: string }
+    HubMyPlugin:
+      type: object
+      description: |-
+        `GET /v1/hub/mine` row. `state` reflects what the owner must act on: an approved plugin stays
+        `published` even while a newer version is `review` (`review_version` is set alongside).
+      properties:
+        plugin_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        icon: { $ref: '#/components/schemas/NullableString' }
+        category: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        status: { type: string, description: 'Plugin row status (`published` / `removed`).' }
+        state: { type: string, enum: [published, review, rejected, pending] }
+        latest_version: { $ref: '#/components/schemas/NullableString' }
+        versions_count: { type: integer }
+        review_version: { $ref: '#/components/schemas/NullableString' }
+        rejected_version: { $ref: '#/components/schemas/NullableString' }
+        rejected_note: { $ref: '#/components/schemas/NullableString' }
+        created_at: { $ref: '#/components/schemas/Timestamp' }
+        updated_at: { $ref: '#/components/schemas/Timestamp' }
+    HubMyPluginPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HubMyPlugin' }
+    HubReviewItem:
+      type: object
+      description: One version waiting for an administrator (`GET /v1/admin/hub/reviews`).
+      properties:
+        plugin_id: { type: string }
+        name: { type: string }
+        owner: { $ref: '#/components/schemas/HubOwner' }
+        version: { type: string }
+        asset_name: { type: string }
+        size: { type: integer, format: int64 }
+        sha256: { type: string }
+        changelog: { type: string }
+        has_source: { type: boolean }
+        submitted_at: { $ref: '#/components/schemas/Timestamp' }
+    HubReviewPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/HubReviewItem' }
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+    HubRejectRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason: { type: string, minLength: 1, maxLength: 500, description: Shown to the publisher as `review_note`. }
     HubStats:
       type: object
       properties:
@@ -2193,10 +2288,13 @@ paths:
     get:
       tags: [messages]
       operationId: downloadMessagePayload
-      summary: Download a message payload (200 for small messages, 302 presigned for large objects)
+      summary: Download a message payload (200 for small messages, 302 to the transfer plane for large objects)
       description: |-
         ⑤ §4.3. Small messages (≤1MB) return the payload directly with 200 (`Content-Type` matches the envelope,
-        `Content-Disposition: attachment`); large objects return 302 → MinIO presigned URL (TTL 900s);
+        `Content-Disposition: attachment`); large objects return 302 to the download transfer plane
+        (`{transfer.public_base_url}/t/{token}`, or a same-origin `/t/{token}` when
+        `public_base_url` is empty: short-lived HMAC capability, `Range`/resume supported) when
+        `[transfer] enabled`; otherwise 302 to a legacy MinIO presigned URL (TTL 900s).
         `inspectable` mode is denied by default (requires an explicit admin action plus an audit trail).
       responses:
         '200':
@@ -2209,7 +2307,7 @@ paths:
             application/octet-stream:
               schema: { type: string, format: binary }
         '302':
-          description: Redirect to a MinIO presigned URL (TTL 900s).
+          description: Redirect to the transfer plane (`/t/{token}`) or, when the transfer plane is disabled, to a MinIO presigned URL (TTL 900s).
           headers:
             Location: { $ref: '#/components/headers/Location' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -2231,6 +2329,8 @@ paths:
       description: |-
         ⑤ §4.4. `?missing=3,7` selects missing chunk indexes (omitted = all); returns a chunk inventory
         of `{idx, size, checksum, presigned_url?}`, or reuses the WS `chunk` downstream.
+        `presigned_url` follows the same `[transfer]` switch as other downloads (transfer-plane capability URL
+        when enabled, legacy MinIO presign when disabled).
         Chunk envelopes are not stored in `messages` and are not assigned a `seq`.
       parameters:
         - name: missing
@@ -2634,6 +2734,33 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
       x-doc-ref: '⑤ §8.1'
 
+  /v1/admin/degrade:
+    get:
+      tags: [admin]
+      operationId: adminDegradeStatus
+      summary: Unified degradation / dependency status (bus, WAL, Redis stale cache, policy mode)
+      description: |-
+        ⑤ §8.1. Role: ops. Reports the **runtime** bus backend (a configured NATS that failed to connect is
+        reported as the Redis fallback actually in use), whether the local WAL is enabled, whether Redis is
+        serving through the stale route cache, and the active policy mode. Read-only.
+      responses:
+        '200':
+          description: Degradation summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [bus, bus_healthy, wal_enabled, redis_stale_cache, mode]
+                properties:
+                  bus: { type: string, enum: [redis-pubsub, nats], description: Runtime bus backend. }
+                  bus_healthy: { type: boolean }
+                  wal_enabled: { type: boolean }
+                  redis_stale_cache: { type: boolean }
+                  mode: { type: string, enum: [zero-knowledge, inspectable] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §8.1'
+
   /v1/admin/queue:
     get:
       tags: [admin]
@@ -2737,8 +2864,10 @@ paths:
     get:
       tags: [admin]
       operationId: adminListUsers
-      summary: User search (offset-based pagination)
-      description: '⑤ §8.2. Role: user (read-only).'
+      summary: User search (offset-based pagination; the user role sees only its own row)
+      description: |-
+        ⑤ §8.2. Role: user (read-only). Data isolation (2026-11-23): the `user` role gets only its own row;
+        ops/admin keep the global list.
       parameters:
         - name: q
           in: query
@@ -3037,8 +3166,10 @@ paths:
     get:
       tags: [admin]
       operationId: adminListDevices
-      summary: Device search (offset-based pagination)
-      description: '⑤ §8.2. Role: user (read-only).'
+      summary: Device search (offset-based pagination; the user role sees only its own devices)
+      description: |-
+        ⑤ §8.2. Role: user (read-only). Data isolation (2026-11-23): for the `user` role the server pins the
+        result to the caller's own devices and ignores a `user` filter; ops/admin see all devices.
       parameters:
         - name: user
           in: query
@@ -3072,8 +3203,10 @@ paths:
     delete:
       tags: [admin]
       operationId: adminRevokeDevice
-      summary: Force-revoke a device (ops)
-      description: ⑤ §8.2. Writes audit `device.revoke`.
+      summary: Revoke a device (ops/admin any device; the user role only its own)
+      description: |-
+        ⑤ §8.2. Writes audit `device.revoke`. Data isolation (2026-11-23): ops/admin may revoke any device;
+        the `user` role may revoke only a device it owns (403 `details.reason=rbac` otherwise).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       responses:
@@ -3090,7 +3223,9 @@ paths:
       tags: [admin]
       operationId: adminListConversations
       summary: Conversation search (member count / message count / last message time)
-      description: '⑤ §8.3. Role: user (read-only).'
+      description: |-
+        ⑤ §8.3. Role: user (read-only). Data isolation (2026-11-23): the `user` role only receives
+        conversations/topics it is a member of; ops/admin see everything.
       parameters:
         - name: q
           in: query
@@ -3123,7 +3258,9 @@ paths:
       tags: [admin]
       operationId: adminConversationDetail
       summary: Conversation details (payload not returned)
-      description: ⑤ §8.3.
+      description: |-
+        ⑤ §8.3. Data isolation (2026-11-23): a `user` role caller that is not a member gets 404 (the
+        existence of somebody else's conversation is not confirmed).
       responses:
         '200':
           description: Conversation details.
@@ -3143,6 +3280,9 @@ paths:
       description: |-
         ⑤ §8.3 / §14 I2. With massive message volumes, **at least one** high-selectivity filter (`id`/`conv` + time window) is required;
         otherwise 422 `FORMAT`.
+        Data isolation (2026-11-23): the `user` role only sees messages in conversations it belongs to (or
+        delivered to it); a `user` filter naming somebody else → 403 `details.reason=rbac`; other filters simply
+        return no rows. ops/admin keep the global search.
       parameters:
         - name: id
           in: query
@@ -3185,7 +3325,9 @@ paths:
       tags: [admin]
       operationId: adminMessageDelivery
       summary: Delivery detail (delivery_log all-device view)
-      description: '⑤ §8.3. Role: user (read-only).'
+      description: |-
+        ⑤ §8.3. Role: user (read-only). Data isolation (2026-11-23): the `user` role may only read delivery
+        details of a message it can see (conversation member or recipient); otherwise 404.
       responses:
         '200':
           description: Delivery detail.
@@ -3635,8 +3777,11 @@ paths:
     get:
       tags: [media]
       operationId: mediaRecordingDetail
-      summary: Recording segment metadata + presigned URL (TTL 300s) + download_url
-      description: '⑤ §9.7. Role: admin/ops.'
+      summary: Recording segment metadata + download URL (transfer plane capability, or legacy presigned URL)
+      description: |-
+        ⑤ §9.7. Role: admin/ops. `presigned_url` is the object's download URL: with `[transfer] enabled` it is a
+        transfer-plane capability URL; otherwise a legacy MinIO presigned URL. `presign_ttl_seconds` reports the
+        effective lifetime of that URL.
       responses:
         '200':
           description: Recording segment details.
@@ -3658,11 +3803,13 @@ paths:
     get:
       tags: [media]
       operationId: mediaRecordingDownload
-      summary: Download a recording segment (302 → MinIO presigned; audit media.recording.download)
-      description: '⑤ §9.7. Role: admin/ops; unknown id → 404, user → 403.'
+      summary: Download a recording segment (302 to the transfer plane; audit media.recording.download)
+      description: |-
+        ⑤ §9.7. Role: admin/ops; unknown id → 404, user → 403. With `[transfer] enabled` the 302 points at the
+        transfer plane (`/t/{token}`); otherwise at a legacy MinIO presigned URL.
       responses:
         '302':
-          description: Redirect to a MinIO presigned URL.
+          description: Redirect to the transfer plane (`/t/{token}`) or a legacy MinIO presigned GET.
           headers:
             Location: { $ref: '#/components/headers/Location' }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -3743,7 +3890,11 @@ paths:
         ⑤ §12.3. Any signed-in user; for an existing `plugin_id`, only the owner or admin can add versions,
         otherwise 403 (`details.reason=not_owner`). Rate limit: 10 per hour (429 `details.reason=hub_publish`).
         A retry with the same `(plugin_id, version)` and sha256 returns 200 (`idempotent_reused=true`);
-        an already-published version with the same sha returns 200 (`idempotent=true`, `upload:null`).
+        an already-published version with the same sha returns 200 (`idempotent=true`, `upload:null`), and a
+        version already waiting for review returns 200 with `submitted=true`.
+        **Review policy (2026-11-23):** a draft only becomes visible to other users after the package upload
+        (`review`) **and** an administrator's approval (`published`); a different sha for a version under review
+        is rejected with 409 `version_in_review`, and a removed version cannot be revived (409 `version_removed`).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -3781,10 +3932,12 @@ paths:
     get:
       tags: [hub]
       operationId: hubPluginDetail
-      summary: Plugin details (versions contains published versions only)
+      summary: Plugin details (published versions for other users; owner/admin also see review states)
       description: |-
         ⑤ §12.2. Not found (or `status=removed` and not owner/admin) → 404; `my_install` is always present
         (null when not installed); `versions` are ordered by `published_at desc`.
+        A non-owner only ever receives `status=published` rows; the owner and admins additionally see
+        `review`/`rejected`/`pending` rows together with `review_note`/`reviewed_at`/`submitted_at`.
       responses:
         '200':
           description: Plugin details.
@@ -3852,11 +4005,14 @@ paths:
     put:
       tags: [hub]
       operationId: hubUploadBlob
-      summary: Upload the installation package body (raw bytes ≤20MiB, SHA-256 computed on the fly)
+      summary: Upload the installation package body (raw bytes ≤20MiB); the version then waits for review
       description: |-
         ⑤ §12.4. Required headers: `X-Content-SHA256` (must match the `sha256` sent in POST) and `Content-Length`.
         Validation failure → 422 (`details.reason ∈ {checksum, package}`); for a published version, the same sha → 200,
         a different sha → 409 `version_published`. Writes to the `lattice-plugins` bucket.
+        **Review policy:** a successful upload moves the version `pending → review`; it is invisible/uninstallable
+        for other users until `POST .../approve` succeeds. A retry while the same sha is already in review → 200.
+        A version under review with a different sha → 409 `version_in_review`.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - name: X-Content-SHA256
@@ -3871,7 +4027,7 @@ paths:
             schema: { type: string, format: binary }
       responses:
         '200':
-          description: Published.
+          description: Stored and waiting for review (or already approved on an idempotent retry).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HubBlobUploadResponse' }
@@ -3899,14 +4055,20 @@ paths:
     get:
       tags: [hub]
       operationId: hubDownloadVersion
-      summary: Download the installation package (302 → MinIO presigned, TTL 900s)
+      summary: Download the installation package (302 to the transfer plane; legacy MinIO presign when disabled)
       description: |-
-        ⑤ §12.5. The presigned host comes from `[s3] public_endpoint` (falls back to `[s3] endpoint` when empty);
-        response headers include `X-Content-SHA256`/`X-Content-Length`; a missing or removed version → 404;
+        ⑤ §12.5. With `[transfer] enabled` the response is `302 {transfer.public_base_url}/t/{token}`
+        (or a same-origin `/t/{token}` when `public_base_url` is empty): the token is a
+        short-lived HMAC capability for exactly this object and is served by `lattice-transfer`, which streams the
+        package with `Range`/`If-Range` support (clients never need to reach the object store). With the transfer plane
+        disabled the response is the legacy `302 → [s3] public_endpoint` presigned GET.
+        Both variants include `X-Content-SHA256`/`X-Content-Length`; a missing or removed version → 404;
         the `downloads` counter is best-effort.
+        Only `published` versions are downloadable by other users; the owner and admins may also fetch
+        `review`/`rejected` versions (their previews do not increment `downloads`).
       responses:
         '302':
-          description: Redirect to a MinIO presigned GET.
+          description: Redirect to the transfer plane (`/t/{token}`) or a legacy MinIO presigned GET.
           headers:
             Location: { $ref: '#/components/headers/Location' }
             X-Content-SHA256: { $ref: '#/components/headers/XContentSha256' }
@@ -3928,13 +4090,15 @@ paths:
     get:
       tags: [hub]
       operationId: hubDownloadSource
-      summary: Download the source package (302 → MinIO presigned; no source → 404 source_missing)
+      summary: Download the source package (302 to the transfer plane; no source → 404 source_missing)
       description: |-
-        ⑤ §12.4.2. Visibility follows the same rule as package downloads (the plugin is visible to the caller and the version is published);
-        source downloads do **not** count toward `downloads`.
+        ⑤ §12.4.2. Visibility follows the same rule as package downloads (`published` for other users;
+        owner/admin also `review`/`rejected`); source downloads do **not** count toward `downloads`.
+        Delivery follows the same `[transfer]` switch as package downloads: transfer-plane capability URL when
+        enabled, legacy MinIO presign when disabled.
       responses:
         '302':
-          description: Redirect to a MinIO presigned GET.
+          description: Redirect to the transfer plane (`/t/{token}`) or a legacy MinIO presigned GET.
           headers:
             Location: { $ref: '#/components/headers/Location' }
             X-Content-SHA256: { $ref: '#/components/headers/XContentSha256' }
@@ -3950,7 +4114,8 @@ paths:
         ⑤ §12.4.1. Required header `X-Content-SHA256` (must equal `source.sha256` from POST); if no
         `source{}` was declared → 422 `source_not_declared`; validation failure → 422 (`size`/`checksum`/`package`);
         with existing source: the same sha → 200 (`idempotent=true`), a different sha → 409 `source_published`.
-        May be called before or after the package upload; uploading source does not affect version visibility.
+        Allowed while the version is `pending`/`review`/`rejected`; a `published` version is immutable and
+        rejects source uploads with 409 `version_published` (submit a new version instead).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - name: X-Content-SHA256
@@ -4016,6 +4181,8 @@ paths:
         ⑤ §12.7. No record → 201 (`data_rev` starts at 1); `data` omitted → 200, updating only
         version/enabled; `data` present with a matching `data_rev` → 200 (the server does `data_rev += 1`); a mismatch →
         409 `data_conflict`; `?force=1` overrides explicitly (must be confirmed by the user).
+        A `version` in the body must name an **approved (`published`)** version; otherwise 404
+        `details.reason=version_not_published` (review semantics: submit ≠ usable).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - name: force
@@ -4058,6 +4225,130 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
       x-doc-ref: '⑤ §12.7'
       x-idempotency: supported
+
+  /v1/hub/mine:
+    get:
+      tags: [hub]
+      operationId: hubMyPlugins
+      summary: My plugins including submissions that are not approved yet
+      description: |-
+        Any signed-in user. Unlike the catalog (`/v1/hub/plugins`, approved content only), this returns
+        every plugin owned by the caller with `state` (`published` / `review` / `rejected` / `pending`)
+        and the latest review metadata, so an owner can follow or fix a submission. Removed plugins are excluded.
+      responses:
+        '200':
+          description: Owner's plugins.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubMyPluginPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+      x-doc-ref: '⑤ §12'
+
+  /v1/admin/hub/reviews:
+    get:
+      tags: [hub, admin]
+      operationId: adminHubReviewList
+      summary: Versions waiting for administrator review (admin only)
+      description: |-
+        Product rule 2026-11-23: every user-published plugin version requires administrator approval before
+        other users can see, download or install it. Oldest submission first. Admin only (ops gets 403).
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: page_size
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Review queue page.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HubReviewPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+      x-doc-ref: '⑤ §12 (review extension)'
+
+  /v1/admin/hub/plugins/{plugin_id}/versions/{version}/approve:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [hub, admin]
+      operationId: adminHubApproveVersion
+      summary: Approve a submitted version (review → published; admin only)
+      description: |-
+        Publishes the version, applies its catalog-field snapshot to the plugin and recomputes
+        `latest_version` by semver. Idempotent when the version is already published. A version that is not
+        in `review` → 409 `not_in_review` (`details.status`). Writes audit `hub.version.approve`.
+      responses:
+        '200':
+          description: Approved.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plugin_id: { type: string }
+                  version: { type: string }
+                  status: { type: string, enum: [published] }
+                  published_at: { $ref: '#/components/schemas/Timestamp' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+      x-doc-ref: '⑤ §12 (review extension)'
+      x-idempotency: supported
+
+  /v1/admin/hub/plugins/{plugin_id}/versions/{version}/reject:
+    parameters:
+      - name: plugin_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [hub, admin]
+      operationId: adminHubRejectVersion
+      summary: Reject a submitted version (review → rejected; admin only)
+      description: |-
+        Requires `reason` (1-500 chars), stored as the version's `review_note`; the publisher may correct and
+        resubmit the same version. A version that is not in `review` → 409 `not_in_review`.
+        Writes audit `hub.version.reject`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HubRejectRequest' }
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plugin_id: { type: string }
+                  version: { type: string }
+                  status: { type: string, enum: [rejected] }
+                  review_note: { $ref: '#/components/schemas/NullableString' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Format' }
+      x-doc-ref: '⑤ §12 (review extension)'
 
   /v1/hub/stats:
     get:
@@ -4165,7 +4456,7 @@ x-grpc-services:
 
 x-openapi-provenance:
   artifact: openapi/lattice.openapi.yaml
-  authority: 'platform API design document (Doc ⑤ v0.18; maintained outside this repository)'
+  authority: 'platform API design document (Doc ⑤ v0.19; maintained outside this repository)'
   generated: false
   note: |-
     This file is a **hand-written authoritative artifact**, not generated from Rust route macros/utoipa (no heavyweight generation dependency was introduced).
@@ -4173,8 +4464,8 @@ x-openapi-provenance:
     missing/extra between the Doc ⑤ route list and this file. The historical §13 count table (v0.6 basis) has a known gap against the actual §1–§12
     list; the diff script emits count differences as WARN instead of failing.
   coverage:
-    http_operations: 93
-    http_paths: 78
+    http_operations: 97
+    http_paths: 82
     domains:
       probes: 2
       auth: 3
@@ -4185,6 +4476,6 @@ x-openapi-provenance:
       topics: 5
       admin: 39
       media: 5
-      hub: 13
+      hub: 17
       ws: 1
     non_http: ['WS 13 commands (x-ws)', 'MQTT topic mapping (x-mqtt-gateway)', 'internal gRPC 6 methods (x-grpc-services)']

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Alert, Button, Card, Empty, Form, Input, Modal, Space, Table, Tag, Typography, App as AntApp } from 'antd'
 import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
+import { LIST_PAGE_SIZE, LIST_SCROLL_Y } from '@/components/listLayout'
 import { errText } from '@/lib/errors'
 import { listFormats, upsertFormat } from '@/api/endpoints'
 import type { FormatRow } from '@/api/types'
@@ -15,6 +16,8 @@ export default function FormatsPage() {
   const { can } = useAuth()
   const [rows, setRows] = useState<FormatRow[]>([])
   const [loading, setLoading] = useState(false)
+  const [page, setPage] = useState(1)
+  const pageSize = LIST_PAGE_SIZE
   const [err, setErr] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
   const [form] = Form.useForm()
@@ -35,6 +38,12 @@ export default function FormatsPage() {
   useEffect(() => {
     void load()
   }, [load])
+
+  // Keep the current page valid when the registry shrinks
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(rows.length / pageSize))
+    if (page > maxPage) setPage(maxPage)
+  }, [rows.length, page, pageSize])
 
   async function submit() {
     const v = await form.validateFields()
@@ -59,33 +68,39 @@ export default function FormatsPage() {
   }
 
   return (
-    <div className="page-scroll">
-
-      <div className="toolbar">
-        <div className="toolbar-right">
-        <Space>
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
-            {t('Refresh')}
-          </Button>
-          {can('mutate') && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>
-              {t('Add / update format')}
-            </Button>
-          )}
-        </Space>
-        </div>
-      </div>
-
+    <div className="page-fill">
       {err && <Alert type="error" showIcon message={t('Failed to load')} description={err} />}
 
-      <Card>
+      <Card className="list-card">
+        <div className="toolbar">
+          <span className="muted">{t('{count} formats', { count: rows.length })}</span>
+          <div className="toolbar-right">
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
+              {t('Refresh')}
+            </Button>
+            {can('mutate') && (
+              <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>
+                {t('Add / update format')}
+              </Button>
+            )}
+          </div>
+        </div>
+
         <Table<FormatRow>
           size="small"
+          scroll={{ y: LIST_SCROLL_Y }}
           rowKey={(r) => String(r.id ?? `${r.type}:${r.mime}`)}
           loading={loading}
-          dataSource={rows}
+          dataSource={rows.slice((page - 1) * pageSize, page * pageSize)}
           locale={{ emptyText: <Empty description={t('No formats registered yet')} image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
-          pagination={false}
+          pagination={{
+            current: page,
+            pageSize,
+            total: rows.length,
+            showSizeChanger: false,
+            onChange: (p) => setPage(p),
+            showTotal: (count) => t('{count} formats', { count }),
+          }}
           expandable={{
             expandedRowRender: (r) => (
               <JsonPeek data={r} label={t('Raw response of the format registry endpoint (GET /v1/admin/formats)')} />

@@ -29,6 +29,24 @@ MQTT gateway:
   account = device id; password = that device's refresh token (PSK, see ⑤ §11)
 {{- end }}
 
+{{- if .Values.transfer.enabled }}
+Download transfer plane (`lattice-transfer`, same image as the node, entrypoint /usr/local/bin/lattice-transfer):
+  Deployment {{ include "lattice.transfer.fullname" . }} ({{ .Values.transfer.replicaCount }} replicas)
+  Service {{ include "lattice.transfer.fullname" . }}:{{ .Values.transfer.service.port }} (http) and :{{ .Values.transfer.service.metricsPort }} (metrics)
+  public base URL: {{ include "lattice.transfer.publicBaseUrl" . }}
+    the node answers downloads with 302 to {public base URL}/t/{token}; set transfer.publicBaseUrl when the public
+    scheme/host differs from this derived value, or when no Ingress routes /t/
+  {{- if .Values.ingress.enabled }}
+  Ingress path /t → {{ include "lattice.transfer.fullname" . }}:{{ .Values.transfer.service.port }} (Prefix, proxy buffering off, 3600s read timeout)
+  {{- else }}
+  Ingress disabled: route /t/ at the external LB to {{ include "lattice.transfer.fullname" . }}:{{ .Values.transfer.service.port }}, or pin transfer.publicBaseUrl to an edge that does
+  {{- end }}
+  shared HMAC key: key transfer-secret of Secret {{ include "lattice.secretName" . }} (>= 32 bytes)
+    source: secrets.transferSecret, or the transfer-secret key of secrets.existingSecret; the node signs and the
+    transfer Deployment verifies, so both must read the same value — rotating it requires a rollout of both.
+  metrics: {{ include "lattice.transfer.fullname" . }}:{{ .Values.transfer.service.metricsPort }}/metrics (scraped by its own ServiceMonitor when metrics.serviceMonitor.enabled)
+{{- end }}
+
 {{- if .Values.tls.enabled }}
 TLS (termination points and certificate sources: deploy/production/tls/README.md; the chart generates no private keys):
   {{- if .Values.tls.certManager.enabled }}

@@ -24,6 +24,7 @@ import { DELIVERY_STATE, DELIVERY_STATE_HINT, pick, toneOf } from '@/lib/labels'
 import { HelpTip } from '@/components/HelpTip'
 import { collectAllPages, csvFilename, downloadText, toCsv } from '@/lib/csv'
 import { JsonPeek } from '@/components/JsonPeek'
+import { useAuth } from '@/auth/AuthProvider'
 import { useI18n } from '@/i18n'
 
 const STATES = ['persisted', 'routed', 'delivered', 'acked', 'expired', 'dlq', 'failed']
@@ -31,6 +32,10 @@ const STATES = ['persisted', 'routed', 'delivered', 'acked', 'expired', 'dlq', '
 export default function MessagesPage() {
   const { t } = useI18n()
   const { message } = AntApp.useApp()
+  const { role, session } = useAuth()
+  // A regular account can only search its own messages; the server enforces the same scope,
+  // so the sender filter is replaced by a fixed "me" scope instead of an editable input.
+  const ownScope = role === 'user'
   const [rows, setRows] = useState<MessageRow[]>([])
   const [loading, setLoading] = useState(false)
   // Rows per page follow the viewport height so the table fills the card without a scrollbar
@@ -50,7 +55,8 @@ export default function MessagesPage() {
 
   const run = useCallback(
     async (p = page, ps = pageSize) => {
-      if (!byId && !byConv && !byUser) {
+      const scopedUser = ownScope ? session?.userId : byUser || undefined
+      if (!byId && !byConv && !scopedUser) {
         setErr(
           t(
             'Enter at least one search condition (message ID, conversation ID or sender ID). An unfiltered full-table search would strain the database, so the server rejects it.',
@@ -65,7 +71,7 @@ export default function MessagesPage() {
         const r = await searchMessages({
           id: byId || undefined,
           conv: byConv || undefined,
-          user: byUser || undefined,
+          user: scopedUser,
           state,
           page: p,
           page_size: ps,
@@ -78,10 +84,10 @@ export default function MessagesPage() {
         setLoading(false)
       }
     },
-    [byId, byConv, byUser, state, page, pageSize, t],
+    [byId, byConv, byUser, ownScope, session?.userId, state, page, pageSize, t],
   )
 
-  const hasFilter = Boolean(byId || byConv || byUser)
+  const hasFilter = Boolean(byId || byConv || byUser || ownScope)
   const exportCsv = useCallback(async () => {
     if (!hasFilter) {
       message.warning(t('Enter at least one search condition before exporting (an unfiltered export would saturate the database)'))
@@ -89,11 +95,12 @@ export default function MessagesPage() {
     }
     setExporting(true)
     try {
+      const scopedUser = ownScope ? session?.userId : byUser || undefined
       const { rows: all, total: serverTotal, truncated } = await collectAllPages<MessageRow>((p, ps) =>
         searchMessages({
           id: byId || undefined,
           conv: byConv || undefined,
-          user: byUser || undefined,
+          user: scopedUser,
           state,
           page: p,
           page_size: ps
@@ -118,7 +125,7 @@ export default function MessagesPage() {
     } finally {
       setExporting(false)
     }
-  }, [byConv, byId, byUser, hasFilter, message, state, t])
+  }, [byConv, byId, byUser, hasFilter, message, ownScope, session?.userId, state, t])
 
   const summary = delivery
     ? delivery.deliveries.reduce(
@@ -154,13 +161,19 @@ export default function MessagesPage() {
             value={byConv}
             onChange={(e) => setByConv(e.target.value.trim())}
           />
-          <Input
-            allowClear
-            placeholder={t('Sender user ID')}
-            style={{ width: 200 }}
-            value={byUser}
-            onChange={(e) => setByUser(e.target.value.trim())}
-          />
+          {ownScope ? (
+            <Tag color="blue" style={{ alignSelf: 'center' }}>
+              {t('Only my messages')}
+            </Tag>
+          ) : (
+            <Input
+              allowClear
+              placeholder={t('Sender user ID')}
+              style={{ width: 200 }}
+              value={byUser}
+              onChange={(e) => setByUser(e.target.value.trim())}
+            />
+          )}
           <Select
             allowClear
             placeholder={t('Delivery state')}
@@ -170,6 +183,7 @@ export default function MessagesPage() {
             options={STATES.map((s) => ({ value: s, label: t(pick(DELIVERY_STATE, s)) }))}
           />
           <HelpTip title={t('Fill in at least one of the three conditions; results contain metadata only, never content — messages are encrypted on the client before upload, so the server only holds ciphertext. Reading content is a separate compliance process ("inspectable mode") that requires explicit authorisation and full audit; it is not available in this console.')} />
+          <span className="muted">{t('{count} items', { count: total })}</span>
           <div className="toolbar-right">
             <Button icon={<DownloadOutlined />} loading={exporting} onClick={() => void exportCsv()}>
               {t('Export CSV')}
@@ -197,7 +211,13 @@ export default function MessagesPage() {
           locale={{
             emptyText: (
               <Empty
-                description={searched ? t('No matching messages') : t('Fill in a condition and click "Search"')}
+                description={
+                  searched
+                    ? t('No matching messages')
+                    : ownScope
+                      ? t('Click "Search" to list my messages')
+                      : t('Fill in a condition and click "Search"')
+                }
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
               />
             ),
@@ -211,7 +231,7 @@ export default function MessagesPage() {
               setPage(p)
               void run(p)
             },
-            showTotal: (count) => t('{count} rows', { count }),
+            showTotal: (count) => t('{count} items', { count }),
           }}
           columns={[
             {

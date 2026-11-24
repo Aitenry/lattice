@@ -1,0 +1,27 @@
+{{- if .Values.transfer.enabled }}
+{{/*
+ Transfer Service: /t/{token} downloads (http) plus the metrics port the ServiceMonitor scrapes.
+ Only the Ingress (or an external LB) reaches it: object bytes flow from this Service straight to the client, never
+ through the node or web. ClusterIP by default — public exposure belongs to the Ingress / external LB, not to this Service.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lattice.transfer.fullname" . }}
+  labels:
+    {{- include "lattice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transfer
+spec:
+  type: {{ .Values.transfer.service.type }}
+  selector:
+    {{- include "lattice.transfer.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.transfer.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: {{ .Values.transfer.service.metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

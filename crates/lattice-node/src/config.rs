@@ -16,6 +16,9 @@ pub struct Config {
     pub wal: WalCfg,
     pub redis: RedisCfg,
     pub s3: S3Cfg,
+    /// Download transfer plane (design §6.10 / §17.17): content is delivered by a dedicated
+    /// stateless `lattice-transfer` service instead of a presigned object-store URL.
+    pub transfer: TransferCfg,
     pub bus: BusCfg,
     pub audit: AuditCfg,
     /// Risk-control rule engine (E03 / PL-12 12.6/12.7; off by default, and when off there is no collection or side effect).
@@ -187,7 +190,138 @@ pub struct S3Cfg {
     pub bucket_plugins: String,
     pub presign_ttl: u64,
     pub upload_parallel: u32,
+    /// Additional internal S3 endpoints for failover (transfer service only).
+    ///
+    /// All endpoints must serve the same buckets (a MinIO erasure-coded cluster or replicated
+    /// gateways). `endpoint` is tried first, then these in order. Empty = single endpoint.
+    pub endpoints: Vec<String>,
 }
+/// Download transfer plane (`[transfer]`, design §6.10 / §17.17).
+///
+/// The plugin hub, large-message and recording download endpoints no longer hand clients a
+/// presigned object-store URL. They return `302` to `{public_base_url}/t/{token}` where the
+/// token is a short-lived HMAC capability for exactly one object (bucket/key/sha256/size).
+/// A separate stateless service (`lattice-transfer`) verifies the token and streams the object
+/// from the internal S3 endpoint with `Range`/`If-Range` support. The node therefore never
+/// proxies object bytes and clients never need to reach MinIO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferCfg {
+    /// Emit transfer URLs instead of presigned object-store URLs. Off by default: the legacy
+    /// presign path stays byte-for-byte compatible until a deployment opts in.
+    pub enabled: bool,
+    /// Externally reachable transfer service base URL (no trailing slash), e.g.
+    /// `http://127.0.0.1:8088` when nginx routes `/t/` to the transfer service.
+    ///
+    /// **Empty (default) = same-origin relative redirect** `Location: /t/{token}`: the edge
+    /// fronts the API and the transfer service under one origin, so each client resolves the
+    /// redirect against the host it already reached (a LAN client never receives `127.0.0.1`).
+    /// Set an absolute URL only when the transfer plane lives on a different origin.
+    pub public_base_url: String,
+    /// Shared HMAC-SHA256 secret (node signs, transfer verifies). >= 32 bytes when enabled.
+    /// Inject with `LATTICE__TRANSFER__SECRET`; never write it into a TOML file.
+    pub secret: String,
+    /// Capability TTL in seconds (default 300). The token carries its own `exp`.
+    pub token_ttl_secs: u64,
+    /// Transfer service bind address (service binary only).
+    pub listen: String,
+    /// Transfer service metrics bind address; empty = metrics listener disabled.
+    pub metrics_listen: String,
+    /// Upstream TCP connect timeout (milliseconds).
+    pub connect_timeout_ms: u64,
+    /// Per-read idle timeout while streaming an object body (milliseconds).
+    pub read_timeout_ms: u64,
+    /// Whole-request cap for the transfer service (milliseconds; 0 = unlimited).
+    pub request_timeout_ms: u64,
+    /// Max concurrent in-flight downloads per transfer instance (0 = 256).
+    pub max_inflight: usize,
+}
+impl Default for TransferCfg {
+    fn default() -> Self {
+        TransferCfg {
+            enabled: false,
+            public_base_url: String::new(),
+            secret: String::new(),
+            token_ttl_secs: 300,
+            listen: "0.0.0.0:8090".into(),
+            metrics_listen: String::new(),
+            connect_timeout_ms: 3_000,
+            read_timeout_ms: 30_000,
+            request_timeout_ms: 300_000,
+            max_inflight: 256,
+        }
+    }
+}
+impl TransferCfg {
+    /// Effective TTL: 0 → 300s; clamp to 30..=3600 so a typo cannot create long-lived capabilities.
+    pub fn effective_token_ttl_secs(&self) -> u64 {
+        if self.token_ttl_secs == 0 {
+            300
+        } else {
+            self.token_ttl_secs.clamp(30, 3_600)
+        }
+    }
+    /// Effective in-flight cap: 0 → 256.
+    pub fn effective_max_inflight(&self) -> usize {
+        if self.max_inflight == 0 {
+            256
+        } else {
+            self.max_inflight
+        }
+    }
+    /// Fail-fast checks for the transfer plane (node and service share the same contract).
+    ///
+    /// A half-configured transfer plane must never start: signing with an empty/short secret
+    /// would produce forgeable URLs, and a relative base URL would produce download links that
+    /// no client can resolve (the exact failure mode that presigned `public_endpoint` had).
+    pub fn validate(&self, s3: &S3Cfg) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let base = self.public_base_url.trim();
+        if self.secret.as_bytes().len() < MIN_TRANSFER_SECRET_BYTES {
+            return Err(crate::error::internal(format!(
+                "[transfer] secret must be at least {MIN_TRANSFER_SECRET_BYTES} bytes (inject LATTICE__TRANSFER__SECRET); got {}",
+                self.secret.as_bytes().len()
+            )));
+        }
+        // Empty = same-origin relative Location (`/t/{token}`): the edge fronts the API and the
+        // transfer service under one origin, so the client resolves the redirect against the host
+        // it already used. A non-empty value must be an absolute base and must not end with '/'.
+        if !base.is_empty() {
+            let ok = (base.starts_with("http://") || base.starts_with("https://"))
+                && base.len() > "https://".len()
+                && !base.contains(char::is_whitespace);
+            if !ok {
+                return Err(crate::error::internal(
+                    "[transfer] public_base_url must be empty (same-origin /t) or an absolute http(s) URL, e.g. http://127.0.0.1:8088",
+                ));
+            }
+            if base.ends_with('/') {
+                return Err(crate::error::internal(
+                    "[transfer] public_base_url must not end with '/' (the token path starts with /t/)",
+                ));
+            }
+        }
+        if !self.listen.contains(':') {
+            return Err(crate::error::internal(
+                "[transfer] listen must be host:port, e.g. 0.0.0.0:8090",
+            ));
+        }
+        // The transfer service talks to object storage over plain internal HTTP only (TLS is
+        // terminated by the fronting proxy), same constraint as S3::presign internals.
+        for ep in std::iter::once(&s3.endpoint).chain(s3.endpoints.iter()) {
+            if !ep.trim().is_empty() && !ep.trim().starts_with("http://") {
+                return Err(crate::error::internal(format!(
+                    "[s3] endpoint {ep:?} must start with http:// (transfer plane has no TLS client)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+/// Minimum shared secret length for the transfer capability token (bytes).
+pub const MIN_TRANSFER_SECRET_BYTES: usize = 32;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BusCfg {
@@ -1249,6 +1383,7 @@ impl Default for Config {
             wal: WalCfg::default(),
             redis: RedisCfg::default(),
             s3: S3Cfg::default(),
+            transfer: TransferCfg::default(),
             bus: BusCfg::default(),
             audit: AuditCfg::default(),
             risk: RiskCfg::default(),
@@ -1327,6 +1462,7 @@ impl Default for S3Cfg {
             bucket_plugins: "lattice-plugins".into(),
             presign_ttl: 900,
             upload_parallel: 8,
+            endpoints: Vec::new(),
         }
     }
 }
@@ -1498,6 +1634,20 @@ impl Default for AdminCfg {
 impl Config {
     /// Read TOML + environment overrides (`LATTICE__SECTION__FIELD`, e.g. `LATTICE__PG__URL`).
     pub fn load(path: Option<&Path>) -> Result<Self> {
+        Self::load_inner(path, true)
+    }
+    /// Load configuration for the **transfer service** (design §6.10).
+    ///
+    /// The transfer process shares the deployment's TOML (so `[s3]`/`[transfer]` cannot drift),
+    /// but node-only startup work must not run there: `inspectable` mode loads a node-local KEK,
+    /// and the pipeline/inspectable validation concerns the node's message path. Running that in
+    /// `lattice-transfer` would either fail (the KEK secret is not mounted in the transfer Pod)
+    /// or couple a stateless download service to node-local secrets. This path still fails fast
+    /// on the transfer plane's own contract (`[transfer]` + `[s3]`).
+    pub fn load_for_transfer(path: Option<&Path>) -> Result<Self> {
+        Self::load_inner(path, false)
+    }
+    fn load_inner(path: Option<&Path>, node: bool) -> Result<Self> {
         let mut cfg = match path {
             Some(p) if p.exists() => {
                 let raw = std::fs::read_to_string(p)
@@ -1508,17 +1658,23 @@ impl Config {
             _ => Config::default(),
         };
         cfg.apply_env();
-        // Startup validation must fail fast: config errors such as an invalid bypass stage name / missing inspectable KEK
-        // would silently turn into "thought it was bypassed" / "thought there was a KEK", which is more dangerous than refusing to start (E31/E15).
-        cfg.validate()?;
-        // inspectable node-local KEK load + startup self-check (no side effects when disabled).
-        crate::pipeline::inspectable::bootstrap(&cfg.inspectable)?;
+        if node {
+            // Startup validation must fail fast: config errors such as an invalid bypass stage name / missing inspectable KEK
+            // would silently turn into "thought it was bypassed" / "thought there was a KEK", which is more dangerous than refusing to start (E31/E15).
+            cfg.validate()?;
+            // inspectable node-local KEK load + startup self-check (no side effects when disabled).
+            crate::pipeline::inspectable::bootstrap(&cfg.inspectable)?;
+        } else {
+            // Only the transfer plane's contract matters in this process.
+            cfg.transfer.validate(&cfg.s3)?;
+        }
         Ok(cfg)
     }
     /// Startup validation of static config (fail-fast; `Config::load` and unit tests use the same contract).
     pub fn validate(&self) -> Result<()> {
         self.pipeline.validate()?;
         crate::pipeline::inspectable::validate_config(&self.inspectable, self.mode())?;
+        self.transfer.validate(&self.s3)?;
         Ok(())
     }
     /// Environment overrides (deployments only change env vars; secrets never hit disk).
@@ -1559,6 +1715,52 @@ impl Config {
                 [s, f] if s == "s3" && f == "endpoint" => self.s3.endpoint = v,
                 [s, f] if s == "s3" && f == "access_key" => self.s3.access_key = v,
                 [s, f] if s == "s3" && f == "secret_key" => self.s3.secret_key = v,
+                // Failover endpoints for the transfer plane (comma-separated, tried after `endpoint`).
+                [s, f] if s == "s3" && f == "endpoints" => {
+                    self.s3.endpoints = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|x| !x.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }
+                // Download transfer plane (design §6.10): node signing + service bind/limits.
+                [s, f] if s == "transfer" && f == "enabled" => {
+                    self.transfer.enabled = matches!(v.as_str(), "1" | "true" | "TRUE" | "True")
+                }
+                [s, f] if s == "transfer" && f == "public_base_url" => {
+                    self.transfer.public_base_url = v
+                }
+                [s, f] if s == "transfer" && f == "secret" => self.transfer.secret = v,
+                [s, f] if s == "transfer" && f == "token_ttl_secs" => {
+                    if let Ok(n) = v.parse() {
+                        self.transfer.token_ttl_secs = n;
+                    }
+                }
+                [s, f] if s == "transfer" && f == "listen" => self.transfer.listen = v,
+                [s, f] if s == "transfer" && f == "metrics_listen" => {
+                    self.transfer.metrics_listen = v
+                }
+                [s, f] if s == "transfer" && f == "connect_timeout_ms" => {
+                    if let Ok(n) = v.parse() {
+                        self.transfer.connect_timeout_ms = n;
+                    }
+                }
+                [s, f] if s == "transfer" && f == "read_timeout_ms" => {
+                    if let Ok(n) = v.parse() {
+                        self.transfer.read_timeout_ms = n;
+                    }
+                }
+                [s, f] if s == "transfer" && f == "request_timeout_ms" => {
+                    if let Ok(n) = v.parse() {
+                        self.transfer.request_timeout_ms = n;
+                    }
+                }
+                [s, f] if s == "transfer" && f == "max_inflight" => {
+                    if let Ok(n) = v.parse() {
+                        self.transfer.max_inflight = n;
+                    }
+                }
                 [s, f] if s == "auth" && f == "key_dir" => self.auth.key_dir = v,
                 [s, f] if s == "policy" && f == "mode" => self.policy.mode = v,
                 // Pipeline stage bypass (E31): `LATTICE__PIPELINE__BYPASS=validate,dedup` (empty = no bypass).
@@ -2115,6 +2317,18 @@ bucket_cold = "lattice-cold"
 bucket_plugins = "lattice-plugins"
 presign_ttl = 900
 upload_parallel = 8
+# endpoints = []                         # transfer-plane failover endpoints (tried after `endpoint`)
+[transfer]
+enabled = false                          # true = downloads 302 to lattice-transfer; false = legacy presigned object-store URLs
+public_base_url = ""                     # empty = same-origin relative /t/{token}; or an absolute URL when the transfer plane is on another origin
+secret = ""                              # shared HMAC secret (>= 32 bytes); inject with LATTICE__TRANSFER__SECRET
+token_ttl_secs = 300
+listen = "0.0.0.0:8090"                  # transfer service bind address
+metrics_listen = ""                      # transfer service metrics bind (empty = disabled)
+connect_timeout_ms = 3000
+read_timeout_ms = 30000
+request_timeout_ms = 300000              # cap until the object-store response head (not the whole body)
+max_inflight = 256
 [bus]
 kind = "redis-pubsub"
 [risk]
@@ -2317,6 +2531,61 @@ mod tests {
             cfg.policy.effective_member_cache_ttl(),
             Duration::from_millis(60_000)
         );
+    }
+    #[test]
+    fn transfer_plane_defaults_and_validation() {
+        let def = Config::default();
+        assert!(!def.transfer.enabled, "transfer plane must be opt-in");
+        assert_eq!(def.transfer.effective_token_ttl_secs(), 300);
+        assert_eq!(def.transfer.effective_max_inflight(), 256);
+        assert!(def.s3.endpoints.is_empty());
+        // Disabled: no secret/base URL required (legacy presign path).
+        def.validate().unwrap();
+
+        let mut cfg = Config::default();
+        cfg.transfer.enabled = true;
+        assert!(cfg.validate().is_err(), "enabled without secret must fail");
+        cfg.transfer.secret = "0123456789abcdef0123456789abcdef".into();
+        // Empty public_base_url is valid: the node emits a same-origin relative /t/{token}.
+        cfg.validate().unwrap();
+        // A non-empty but relative/invalid base or a trailing slash is a configuration error.
+        cfg.transfer.public_base_url = "127.0.0.1:8088".into();
+        assert!(cfg.validate().is_err());
+        cfg.transfer.public_base_url = "http://127.0.0.1:8088/".into();
+        assert!(cfg.validate().is_err());
+        cfg.transfer.public_base_url = "http://127.0.0.1:8088".into();
+        cfg.validate().unwrap();
+        cfg.s3.endpoint = "https://minio:9000".into();
+        assert!(cfg.validate().is_err());
+        cfg.s3.endpoint = "http://minio:9000".into();
+        cfg.transfer.token_ttl_secs = 1;
+        assert_eq!(cfg.transfer.effective_token_ttl_secs(), 30);
+        cfg.transfer.token_ttl_secs = 99_999;
+        assert_eq!(cfg.transfer.effective_token_ttl_secs(), 3_600);
+    }
+    #[test]
+    fn sample_toml_transfer_section_matches_defaults() {
+        let sample: Config = toml::from_str(SAMPLE_TOML).unwrap();
+        let def = Config::default();
+        assert_eq!(sample.transfer.enabled, def.transfer.enabled);
+        assert_eq!(sample.transfer.public_base_url, def.transfer.public_base_url);
+        assert_eq!(sample.transfer.token_ttl_secs, def.transfer.token_ttl_secs);
+        assert_eq!(sample.transfer.listen, def.transfer.listen);
+        assert_eq!(sample.transfer.metrics_listen, def.transfer.metrics_listen);
+        assert_eq!(
+            sample.transfer.connect_timeout_ms,
+            def.transfer.connect_timeout_ms
+        );
+        assert_eq!(
+            sample.transfer.read_timeout_ms,
+            def.transfer.read_timeout_ms
+        );
+        assert_eq!(
+            sample.transfer.request_timeout_ms,
+            def.transfer.request_timeout_ms
+        );
+        assert_eq!(sample.transfer.max_inflight, def.transfer.max_inflight);
+        assert_eq!(sample.s3.endpoints, def.s3.endpoints);
     }
     #[test]
     fn perf_tuning_env_overrides_parse() {

@@ -324,9 +324,13 @@ export interface MediaRecordingDetail extends MediaRecordingRow {
 /** ⑤ §8.4 Plugins / formats / config / keys */
 export interface PluginRow {
   ns: string
-  version?: string
+  id?: string
+  version?: number
   status?: string
   canary_ratio?: number
+  /** Plugin form: WASM in the sandbox, or a separate sidecar process */
+  form?: string
+  published_at?: string
   calls?: number
   [k: string]: unknown
 }
@@ -408,7 +412,8 @@ export interface WasmRuntimeSources {
 
 export interface PluginActionReq {
   ns: string
-  version: string
+  /** The server's `plugins.version` is an integer, not a semver string */
+  version: number
   action: 'publish' | 'rollback' | 'canary'
   ratio?: number
   reason: string
@@ -486,6 +491,16 @@ export interface HubPluginRow {
   install_enabled?: boolean | null
 }
 
+/**
+ * Review state of a hub version (migration 0012 / product rule 2026-11-23).
+ *
+ * `pending`  → metadata submitted, package body not uploaded yet
+ * `review`   → package stored, waiting for an administrator
+ * `published`→ approved; the only state other users can see/install
+ * `rejected` → rejected; the owner sees `review_note` and may correct + resubmit
+ */
+export type HubVersionStatus = 'pending' | 'review' | 'published' | 'rejected' | 'removed'
+
 /** ⑤ §12.2 Version row (v2 contract §1.5 adds four source fields) */
 export interface HubVersionRow {
   version: string
@@ -497,6 +512,14 @@ export interface HubVersionRow {
   manifest: unknown
   downloads: number
   published_at: string | null
+  /** Review state; the public catalog only ever returns `published` */
+  status?: HubVersionStatus
+  /** Owner/admin only: when this submission entered review */
+  submitted_at?: string | null
+  /** Owner/admin only: rejection reason */
+  review_note?: string | null
+  /** Owner/admin only: last review action time */
+  reviewed_at?: string | null
   /** Whether this version has a source package uploaded */
   has_source: boolean
   source_asset_name: string | null
@@ -580,6 +603,8 @@ export interface HubPublishResp {
   source_upload?: HubUploadTarget | null
   idempotent_reused?: boolean
   idempotent?: boolean
+  /** True when the same package is already waiting for administrator review */
+  submitted?: boolean
 }
 
 /** ⑤ §12.4 Upload response */
@@ -590,6 +615,10 @@ export interface HubUploadResp {
   sha256: string
   size: number
   published_at: string | null
+  /** Set when the upload moved the version into `review` (2026-11-23 review flow) */
+  submitted_at?: string | null
+  /** True when the package is now waiting for an administrator */
+  review_required?: boolean
   download_path: string
   idempotent?: boolean
 }
@@ -629,6 +658,44 @@ export interface HubInstallRow {
   plugin?: { name: string; icon: string | null; latest_version: string | null; status: string } | null
   /** Returned only when `include_data=1` */
   data?: unknown
+}
+
+/**
+ * `GET /v1/hub/mine` row: my plugin including submissions that are not approved yet.
+ *
+ * `state` reflects what the owner most needs to see: an approved plugin stays `published`
+ * even while a newer version is `review` (then `review_version` is set as well).
+ */
+export interface HubMineRow {
+  plugin_id: string
+  name: string
+  description: string
+  icon: string | null
+  category: string
+  tags: string[]
+  status: string
+  state: 'published' | 'review' | 'rejected' | 'pending'
+  latest_version: string | null
+  versions_count: number
+  review_version: string | null
+  rejected_version: string | null
+  rejected_note: string | null
+  created_at: string
+  updated_at: string
+}
+
+/** `GET /v1/admin/hub/reviews` row (administrator review queue) */
+export interface HubReviewRow {
+  plugin_id: string
+  name: string
+  owner: HubOwner
+  version: string
+  asset_name: string
+  size: number
+  sha256: string
+  changelog: string
+  has_source: boolean
+  submitted_at: string
 }
 
 /** ⑤ §8.5 SSE event */

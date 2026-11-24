@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { Navigate, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { Alert, App as AntApp, Button, Dropdown, Form, Input, Layout, Menu, Modal, Space, Tooltip } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   ApiOutlined,
   AppstoreOutlined,
   CloudServerOutlined,
+  CloudSyncOutlined,
   DeleteOutlined,
   PictureOutlined,
   TagsOutlined,
@@ -23,6 +24,7 @@ import {
   MessageOutlined,
   MoonOutlined,
   QuestionCircleOutlined,
+  SafetyCertificateOutlined,
   SettingOutlined,
   SunOutlined,
   TeamOutlined,
@@ -51,45 +53,135 @@ interface NavItem {
   /** Visible roles (menu differences are a product requirement: admin sees everything, ops sees operations, users see business pages only) */
   roles: Role[]
   label: string
+}
+
+interface NavGroup {
+  key: string
+  label: string
+  icon: ReactNode
+  items: NavItem[]
+}
+
+interface NavEntry extends NavItem {
+  /** Breadcrumb label (same wording as the group header) */
   group: string
+  /** Submenu key; the pinned dashboard has none */
+  groupKey: string
 }
 
 /**
- * Navigation groups by "what do you want to do right now" instead of flattening a dozen
- * endpoints into a menu. Group order = usage frequency: daily dashboard → people →
- * content → operations → compliance → system.
+ * Navigation is grouped by "what do you want to do right now" instead of flattening a dozen
+ * endpoints into a menu. The dashboard is pinned above the groups — it is the landing page and
+ * must stay one click away — and every other destination lives in a collapsible group
+ * (accordion: opening one closes the other, see `handleOpenChange`).
+ *
+ * Group order = usage frequency: messaging → users → operations → plugins → platform →
+ * compliance. Inside a group a specific route must come after its prefixes
+ * (`/hub` → `/hub-data` → `/hub-review`): matching takes the longest prefix.
  */
-const NAV: NavItem[] = [
-  { key: '/', icon: <DashboardOutlined />, label: 'Dashboard', group: 'Overview', roles: ['admin', 'ops', 'user'] },
-  { key: '/users', icon: <TeamOutlined />, label: 'Users', group: 'Users & devices', roles: ['admin', 'ops'] },
-  { key: '/nodes', icon: <CloudServerOutlined />, label: 'Server nodes', group: 'Operations', roles: ['admin', 'ops'] },
-  { key: '/devices', icon: <ApiOutlined />, label: 'Devices', group: 'Users & devices', roles: ['admin', 'ops'] },
-  { key: '/conversations', icon: <MessageOutlined />, label: 'Conversations', group: 'Conversations & messages', roles: ['admin', 'ops', 'user'] },
-  { key: '/messages', icon: <DatabaseOutlined />, label: 'Message search', group: 'Conversations & messages', roles: ['admin', 'ops', 'user'] },
-  { key: '/topics', icon: <TagsOutlined />, label: 'Broadcast topics', group: 'Conversations & messages', roles: ['admin', 'ops', 'user'] },
-  { key: '/dlq', icon: <WarningOutlined />, label: 'Delivery failures', group: 'Operations', roles: ['admin', 'ops'] },
-  { key: '/queue', icon: <ThunderboltOutlined />, label: 'Offline queue', group: 'Operations', roles: ['admin', 'ops'] },
-  { key: '/recordings', icon: <VideoCameraOutlined />, label: 'Media recordings', group: 'Operations', roles: ['admin', 'ops'] },
-  { key: '/audit', icon: <AuditOutlined />, label: 'Audit log', group: 'Compliance', roles: ['admin', 'ops'] },
-  { key: '/hub', icon: <AppstoreOutlined />, label: 'Plugin hub', group: 'Extensions', roles: ['admin', 'ops', 'user'] },
-  { key: '/plugins', icon: <DeploymentUnitOutlined />, label: 'Plugins', group: 'Extensions', roles: ['admin'] },
-  { key: '/formats', icon: <CodeOutlined />, label: 'File formats', group: 'Extensions', roles: ['admin', 'ops'] },
-  { key: '/config', icon: <SettingOutlined />, label: 'Dynamic config', group: 'Extensions', roles: ['admin'] },
-  { key: '/keys', icon: <KeyOutlined />, label: 'Key management', group: 'Extensions', roles: ['admin'] },
+const DASHBOARD: NavEntry = {
+  key: '/',
+  icon: <DashboardOutlined />,
+  label: 'Dashboard',
+  group: 'Overview',
+  groupKey: '',
+  roles: ['admin', 'ops'],
+}
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    key: 'messaging',
+    label: 'Messaging',
+    icon: <MessageOutlined />,
+    items: [
+      { key: '/conversations', icon: <MessageOutlined />, label: 'Conversations', roles: ['admin', 'ops', 'user'] },
+      { key: '/messages', icon: <DatabaseOutlined />, label: 'Message search', roles: ['admin', 'ops', 'user'] },
+      { key: '/topics', icon: <TagsOutlined />, label: 'Broadcast topics', roles: ['admin', 'ops', 'user'] },
+    ],
+  },
+  {
+    key: 'users',
+    label: 'Users & devices',
+    icon: <TeamOutlined />,
+    items: [
+      { key: '/users', icon: <TeamOutlined />, label: 'Users', roles: ['admin', 'ops'] },
+      { key: '/devices', icon: <ApiOutlined />, label: 'Devices', roles: ['admin', 'ops', 'user'] },
+    ],
+  },
+  {
+    key: 'operations',
+    label: 'Operations',
+    icon: <CloudServerOutlined />,
+    items: [
+      { key: '/nodes', icon: <CloudServerOutlined />, label: 'Server nodes', roles: ['admin', 'ops'] },
+      { key: '/queue', icon: <ThunderboltOutlined />, label: 'Offline queue', roles: ['admin', 'ops'] },
+      { key: '/dlq', icon: <WarningOutlined />, label: 'Delivery failures', roles: ['admin', 'ops'] },
+      { key: '/recordings', icon: <VideoCameraOutlined />, label: 'Media recordings', roles: ['admin', 'ops'] },
+    ],
+  },
+  {
+    key: 'plugins',
+    label: 'Plugins & extensions',
+    icon: <AppstoreOutlined />,
+    items: [
+      { key: '/hub', icon: <AppstoreOutlined />, label: 'Plugin hub', roles: ['admin', 'ops', 'user'] },
+      { key: '/hub-data', icon: <CloudSyncOutlined />, label: 'My plugin data', roles: ['admin', 'ops', 'user'] },
+      { key: '/hub-review', icon: <SafetyCertificateOutlined />, label: 'Plugin review', roles: ['admin'] },
+      { key: '/plugins', icon: <DeploymentUnitOutlined />, label: 'Server plugins', roles: ['admin'] },
+      { key: '/formats', icon: <CodeOutlined />, label: 'File formats', roles: ['admin', 'ops'] },
+    ],
+  },
+  {
+    key: 'platform',
+    label: 'Platform settings',
+    icon: <SettingOutlined />,
+    items: [
+      { key: '/config', icon: <SettingOutlined />, label: 'Dynamic config', roles: ['admin'] },
+      { key: '/keys', icon: <KeyOutlined />, label: 'Key management', roles: ['admin'] },
+    ],
+  },
+  {
+    key: 'compliance',
+    label: 'Compliance',
+    icon: <AuditOutlined />,
+    items: [{ key: '/audit', icon: <AuditOutlined />, label: 'Audit log', roles: ['admin', 'ops'] }],
+  },
 ]
 
-const GROUP_ORDER = ['Overview', 'Users & devices', 'Conversations & messages', 'Operations', 'Compliance', 'Extensions']
+const GROUP_NAV: NavEntry[] = NAV_GROUPS.flatMap((group) =>
+  group.items.map((item) => ({ ...item, group: group.label, groupKey: `group:${group.key}` })),
+)
 
-function buildMenu(role: Role, t: Translate): MenuProps['items'] {
-  return GROUP_ORDER.map((group) => {
-    const items = NAV.filter((n) => n.group === group && n.roles.includes(role)).map((n) => ({
-      key: n.key,
-      icon: n.icon,
-      label: t(n.label),
-    }))
-    if (items.length === 0) return null
-    return { type: 'group' as const, label: t(group), children: items }
-  }).filter(Boolean) as MenuProps['items']
+const NAV: NavEntry[] = [DASHBOARD, ...GROUP_NAV]
+
+/** Longest matching route wins, so `/hub-data` never resolves to `/hub`. */
+function matchNav(path: string): NavEntry | undefined {
+  return NAV.filter((item) => (item.key === '/' ? path === '/' : path.startsWith(item.key)))
+    .sort((a, b) => a.key.length - b.key.length)
+    .pop()
+}
+
+function buildMenu(role: Role, t: Translate, activeGroup: string): MenuProps['items'] {
+  const pinned = [DASHBOARD]
+    .filter((item) => item.roles.includes(role))
+    .map((item) => ({ key: item.key, icon: item.icon, label: t(item.label) }))
+  const groups = NAV_GROUPS.map((group) => {
+    const children = group.items
+      .filter((item) => item.roles.includes(role))
+      .map((item) => ({ key: item.key, icon: item.icon, label: t(item.label) }))
+    if (children.length === 0) return null
+    const key = `group:${group.key}`
+    return {
+      key,
+      icon: group.icon,
+      label: t(group.label),
+      children,
+      // With the rail collapsed only group icons are visible: mark the group that owns the
+      // current route so the active area does not disappear.
+      className: key === activeGroup ? 'nav-group-current' : undefined,
+    }
+  }).filter(Boolean)
+  return [...pinned, ...groups] as MenuProps['items']
 }
 
 // ---------------------------------------------------------------------------
@@ -186,11 +278,16 @@ export default function AppLayout() {
   const { mode, toggle: toggleTheme } = useThemeMode()
   const { message } = AntApp.useApp()
   const currentRole = (role as Role) || 'user'
-  const menuItems = useMemo(() => buildMenu(currentRole, t), [currentRole, t])
   const nav = useNavigate()
   const loc = useLocation()
+  const current = useMemo(() => matchNav(loc.pathname) ?? DASHBOARD, [loc.pathname])
+  // Accordion state lives here (not in the Menu): at most one group is open at a time. The
+  // pinned dashboard has no group key, so landing on it leaves the groups closed.
+  const activeGroup = current.groupKey
+  const [openGroups, setOpenGroups] = useState<string[]>(() => (activeGroup ? [activeGroup] : []))
   const [collapsed, setCollapsed] = useState(false)
   const [glossary, setGlossary] = useState(false)
+  const menuItems = useMemo(() => buildMenu(currentRole, t, activeGroup), [currentRole, t, activeGroup])
   // Renaming in the account menu updates the header/sidebar immediately (and writes back to the local session, no re-login needed)
   const [shownName, setShownName] = useState<string | null>(session?.displayName ?? null)
   // Avatar shown in the header/account menu (null = no avatar, fall back to the name initial); updated right after saving
@@ -277,10 +374,38 @@ export default function AppLayout() {
     }
   }, [t])
 
-  const current = useMemo(() => {
-    const matched = NAV.filter((n) => (n.key === '/' ? loc.pathname === '/' : loc.pathname.startsWith(n.key)))
-    return matched.length ? matched[matched.length - 1] : NAV[0]
-  }, [loc.pathname])
+  // Follow the route: navigation opens the destination's group (closing the previous one), so
+  // a reload, a deep link or a link inside a page always lands with the active group visible.
+  useEffect(() => {
+    if (activeGroup) setOpenGroups([activeGroup])
+  }, [activeGroup, loc.pathname])
+
+  // The sidebar can be taller than the viewport: keep the active entry visible instead of
+  // leaving it clipped under the footer.
+  useEffect(() => {
+    const active = document.querySelector('.sider-menu .ant-menu-item-selected')
+    if (active) (active as HTMLElement).scrollIntoView({ block: 'nearest' })
+  }, [loc.pathname, openGroups])
+
+  /**
+   * Accordion: keep only the group that was just opened. Clicking the open group closes it;
+   * while the sidebar is collapsed the Menu renders popups on hover instead, so the handler
+   * stays out of the way.
+   */
+  function handleOpenChange(keys: string[]) {
+    if (collapsed) return
+    const opened = keys.filter((key) => !openGroups.includes(key))
+    setOpenGroups(opened.length > 0 ? [opened[opened.length - 1]] : [])
+  }
+
+  // Menu differences are enforced twice: the server rejects out-of-scope reads, and the
+  // shell never renders a page the role cannot use (typing the URL redirects as well).
+  // A regular account has no global dashboard: its home is the plugin hub.
+  const matched = matchNav(loc.pathname)
+  const routeAllowed = Boolean(matched && matched.roles.includes(currentRole))
+  if (!routeAllowed) {
+    return <Navigate to={currentRole === 'user' ? '/hub' : '/'} replace />
+  }
 
   async function openProfile() {
     setProfileErr(null)
@@ -426,6 +551,10 @@ export default function AppLayout() {
             mode="inline"
             selectedKeys={[current.key]}
             items={menuItems}
+            /* Controlled only while expanded: a collapsed Sider switches the Menu to popups,
+               and forcing open keys there would pin a popup open after hover. */
+            openKeys={collapsed ? undefined : openGroups}
+            onOpenChange={handleOpenChange}
             onClick={({ key }) => nav(key)}
           />
         </div>

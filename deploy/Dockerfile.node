@@ -30,11 +30,14 @@ COPY crates ./crates
 
 # Use a cache mount for target: compiled crates survive an interrupted build and are reused next time.
 # Image builds skip LTO (the host release profile sets lto="thin", which notably lengthens the build).
+# `--bins` builds both lattice-node and lattice-transfer: the download data plane ships in the
+# same image and a Deployment/Compose service selects it with `entrypoint`/`command`.
 RUN --mount=type=cache,target=/src/target,sharing=locked \
     CARGO_PROFILE_RELEASE_LTO=false \
-    cargo build --release --locked --offline -p lattice-node --features quic,wasm-host,webtransport \
+    cargo build --release --locked --offline -p lattice-node --bins --features quic,wasm-host,webtransport \
  && cp target/release/lattice-node /src/lattice-node.bin \
- && ls -lh /src/lattice-node.bin
+ && cp target/release/lattice-transfer /src/lattice-transfer.bin \
+ && ls -lh /src/lattice-node.bin /src/lattice-transfer.bin
 
 # ---------------------------------------------------------------- runtime
 FROM debian:bookworm-slim AS runtime
@@ -43,14 +46,16 @@ RUN groupadd --gid 10001 lattice \
  && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin lattice
 
 COPY --from=builder /src/lattice-node.bin /usr/local/bin/lattice-node
+COPY --from=builder /src/lattice-transfer.bin /usr/local/bin/lattice-transfer
 COPY deploy/config/dev.toml /etc/lattice/config.toml
 
-RUN chmod +x /usr/local/bin/lattice-node \
+RUN chmod +x /usr/local/bin/lattice-node /usr/local/bin/lattice-transfer \
  && mkdir -p /etc/lattice/keys && chown -R 10001:10001 /etc/lattice
 
 USER 10001
 WORKDIR /etc/lattice
-EXPOSE 8080 9090 4433/udp
+# 8080 node HTTP, 9090 node gRPC, 8090 transfer data plane, 9101 transfer metrics, 4433/udp QUIC
+EXPOSE 8080 9090 8090 9101 4433/udp
 STOPSIGNAL SIGTERM
 
 # The runtime image has no curl, so probe HTTP with bash's /dev/tcp

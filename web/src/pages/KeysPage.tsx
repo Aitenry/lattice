@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, Button, Card, Descriptions, Form, Input, Modal, Select, Space, Table, Tag, Typography, App as AntApp } from 'antd'
+import { Alert, Button, Card, Form, Input, Modal, Select, Space, Table, Tag, Typography, App as AntApp } from 'antd'
 import { ReloadOutlined, SwapOutlined } from '@ant-design/icons'
 import { errText } from '@/lib/errors'
 import { listKeys, rotateKeys } from '@/api/endpoints'
 import type { KeysResp } from '@/api/types'
+import { LIST_PAGE_SIZE, LIST_SCROLL_Y } from '@/components/listLayout'
 import { useAuth } from '@/auth/AuthProvider'
 import { fmtDuration } from '@/lib/format'
 import { KEY_ROLE, KEY_TARGET, pick } from '@/lib/labels'
@@ -16,6 +17,8 @@ export default function KeysPage() {
   const { can } = useAuth()
   const [data, setData] = useState<KeysResp | null>(null)
   const [loading, setLoading] = useState(false)
+  const [page, setPage] = useState(1)
+  const pageSize = LIST_PAGE_SIZE
   const [err, setErr] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
   const [form] = Form.useForm()
@@ -36,6 +39,13 @@ export default function KeysPage() {
     void load()
   }, [load])
 
+  const keyRows = data?.items ?? []
+  // Keep the current page valid when keys are rotated out
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(keyRows.length / pageSize))
+    if (page > maxPage) setPage(maxPage)
+  }, [keyRows.length, page, pageSize])
+
   async function submit() {
     const v = await form.validateFields()
     try {
@@ -50,68 +60,72 @@ export default function KeysPage() {
   }
 
   return (
-    <div className="page-scroll">
-
-      <div className="toolbar">
-        <div className="toolbar-right">
-        <Space>
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
-            {t('Refresh')}
-          </Button>
-          {can('mutate') && (
-            <Button
-              danger
-              type="primary"
-              icon={<SwapOutlined />}
-              onClick={() => {
-                setOpen(true)
-              }}
-            >
-              {t('Rotate keys')}
-            </Button>
-          )}
-        </Space>
-        </div>
-      </div>
-
+    <div className="page-fill">
       {err && <Alert type="error" showIcon message={t('Failed to load')} description={err} />}
 
-      <Card
-        title={
-          <Space size={4}>
-            {t('Current keys')}
-            <HelpTip
-              title={t(
-                'The fingerprint is a public digest of the key: it tells you which key is in use, but it cannot be reversed into the key itself.',
-              )}
-            />
-          </Space>
-        }
-      >
-        <Descriptions size="small" column={2} style={{ marginBottom: 14 }}>
-          <Descriptions.Item label={t('Login token lifetime')}>
+      <Card className="list-card">
+        <div className="toolbar">
+          <span className="muted">
+            {t('Login token lifetime')}:{' '}
             {data?.ttl_seconds != null
               ? t('{duration} ({seconds} s)', {
                   duration: fmtDuration(data.ttl_seconds),
                   seconds: data.ttl_seconds,
                 })
-              : '—'}
-          </Descriptions.Item>
-          <Descriptions.Item label={t('Keys in use')}>
-            {t('{count} keys', { count: data?.items?.length ?? 0 })}
-          </Descriptions.Item>
-        </Descriptions>
+              : '—'}{' '}
+            · {t('{count} keys', { count: data?.items?.length ?? 0 })}
+          </span>
+          <HelpTip
+            title={t(
+              'The new key starts issuing tokens while the old key keeps verifying signatures; both run in parallel for 24 hours. Users are not signed out during this window. After 24 hours the old key expires, and tokens that have not been refreshed by then require signing in again.',
+            )}
+          />
+          <div className="toolbar-right">
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
+              {t('Refresh')}
+            </Button>
+            {can('mutate') && (
+              <Button
+                danger
+                type="primary"
+                icon={<SwapOutlined />}
+                onClick={() => {
+                  setOpen(true)
+                }}
+              >
+                {t('Rotate keys')}
+              </Button>
+            )}
+          </div>
+        </div>
 
         <Table<{ fingerprint: string; role: string }>
           size="small"
+          scroll={{ y: LIST_SCROLL_Y }}
           rowKey="fingerprint"
           loading={loading}
-          dataSource={data?.items ?? []}
-          pagination={false}
+          dataSource={keyRows.slice((page - 1) * pageSize, page * pageSize)}
+          pagination={{
+            current: page,
+            pageSize,
+            total: keyRows.length,
+            showSizeChanger: false,
+            onChange: (p) => setPage(p),
+            showTotal: (count) => t('{count} keys', { count }),
+          }}
           locale={{ emptyText: t('No key records') }}
           columns={[
             {
-              title: t('Fingerprint'),
+              title: (
+                <Space size={2}>
+                  {t('Fingerprint')}
+                  <HelpTip
+                    title={t(
+                      'The fingerprint is a public digest of the key: it tells you which key is in use, but it cannot be reversed into the key itself.',
+                    )}
+                  />
+                </Space>
+              ),
               dataIndex: 'fingerprint',
               render: (v: string) => (
                 <Typography.Text className="cell-sub" copyable={{ text: v, tooltips: [t('Copy fingerprint'), t('Copied')] }}>
@@ -129,13 +143,6 @@ export default function KeysPage() {
             },
           ]}
         />
-
-        <div className="soft-panel" style={{ marginTop: 14 }}>
-          <b>{t('How rotation works:')}</b>{' '}
-          {t(
-            'The new key starts issuing tokens while the old key keeps verifying signatures; both run in parallel for 24 hours. Users are not signed out during this window. After 24 hours the old key expires, and tokens that have not been refreshed by then require signing in again.',
-          )}
-        </div>
       </Card>
 
       <Modal

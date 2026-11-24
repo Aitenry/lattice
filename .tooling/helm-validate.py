@@ -110,8 +110,20 @@ def main(path: str) -> int:
         ok(f"Secret {name} contains key {key}", key in keys, f"have {sorted(keys)}")
 
     # 4) selector consistency
+    #    The chart renders one HPA/PDB per workload (node, transfer); the selector check
+    #    targets the node workload. Pick the item whose selector matches the node pod labels
+    #    instead of assuming the node resource renders first (template file ordering is lexical).
     for kind in ("HorizontalPodAutoscaler", "PodDisruptionBudget"):
-        doc = one(kind)
+        items = kinds.get(kind, [])
+        doc = None
+        for item in items:
+            sel = item["spec"].get("selector") or {}
+            match = sel.get("matchLabels") or sel
+            if all(pod_labels.get(k) == v for k, v in match.items()):
+                doc = item
+                break
+        if doc is None:
+            doc = items[0] if items else None
         if not doc:
             continue
         sel = doc["spec"].get("selector") or {}

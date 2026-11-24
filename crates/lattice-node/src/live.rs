@@ -203,14 +203,14 @@ mod tests {
         let rows = vec![(
             "n1".to_string(),
             json!({
-                "version": "0.5.0",
+                "version": "0.1.0",
                 "connections": 3,
                 "health": "ok",
                 "heartbeat_at": "2026-01-01T00:00:00Z"
             })
             .to_string(),
         )];
-        let items = nodes_from_rows("n1", "0.5.0", 3, rows);
+        let items = nodes_from_rows("n1", "0.1.0", 3, rows);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["health"], "ok");
         assert_eq!(items[0]["heartbeat_at"], "2026-01-01T00:00:00Z");
@@ -223,7 +223,7 @@ mod tests {
     fn legacy_heartbeat_without_fields_still_renders() {
         // Heartbeats before v0.12 only had node_id/version/connections, missing health/heartbeat_at
         let rows = vec![("n2".to_string(), json!({"version": "0.4.0"}).to_string())];
-        let items = nodes_from_rows("n1", "0.5.0", 0, rows);
+        let items = nodes_from_rows("n1", "0.1.0", 0, rows);
         assert_eq!(items[0]["health"], "ok");
         assert!(items[0]["heartbeat_at"].is_null());
         assert_eq!(items[0]["local"], false);
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn empty_rows_fall_back_to_self() {
-        let items = nodes_from_rows("n1", "0.5.0", 2, vec![]);
+        let items = nodes_from_rows("n1", "0.1.0", 2, vec![]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["node_id"], "n1");
         assert_eq!(items[0]["connections"], 2);

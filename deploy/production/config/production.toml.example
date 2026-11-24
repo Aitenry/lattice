@@ -75,6 +75,24 @@ bucket_cold = "lattice-cold"
 bucket_plugins = "lattice-plugins"
 presign_ttl = 900
 upload_parallel = 8
+# Failover endpoints for the transfer plane (same buckets, tried in order after `endpoint`).
+# Point these at the MinIO L4 VIP or at individual nodes behind it; http:// only.
+endpoints = []
+
+[transfer]
+# Download transfer plane (design §6.10): hub/message/recording downloads answer 302 to
+# `{public_base_url}/t/{token}`; `lattice-transfer` verifies the token and streams the object.
+# Enable it together with the transfer Deployment; leave disabled to keep legacy presigned URLs.
+enabled = true
+public_base_url = "https://lattice.example.com"   # the public edge that routes /t/ to lattice-transfer
+secret = ""             # -> LATTICE__TRANSFER__SECRET (>= 32 bytes, shared by node + transfer service)
+token_ttl_secs = 300
+listen = "0.0.0.0:8090"                           # transfer service bind (same config file on both workloads)
+metrics_listen = "0.0.0.0:9101"                   # Prometheus scrape (internal only)
+connect_timeout_ms = 3000
+read_timeout_ms = 30000
+request_timeout_ms = 300000
+max_inflight = 256
 
 [bus]
 # NATS is the primary path (JetStream); when NATS is unavailable the node degrades to Redis per ② §4.8 and alerts.

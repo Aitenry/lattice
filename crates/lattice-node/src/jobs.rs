@@ -397,8 +397,8 @@ pub const PURGE_OBJECT_ERROR_BUDGET: u64 = 10;
 ///
 /// The key name `lattice:purge:{user}` **is not in `lattice-core::keys`**: that crate is out of scope this round
 /// (same treatment as `lattice:upload:` / `lattice:idem:` in `store/redis.rs`), and it is only a job progress
-/// snapshot, not authoritative data (after loss the purge cascade still reruns idempotently from PG rows; `purge-residual-scan.ps1`
-/// uses the object_keys it records to HEAD each key after the PG rows are gone and verify the objects really are absent).
+/// snapshot, not authoritative data (after loss the purge cascade still reruns idempotently from PG rows; the residual
+/// scanner uses the object keys it records to HEAD each key after the PG rows are gone and verify the objects really are absent).
 pub const PURGE_PROGRESS_TTL_SECS: u64 = 30 * 24 * 3_600;
 /// Max object keys recorded in progress (for the residual scanner's per-key HEAD; over the cap sets `manifest_truncated`).
 pub const PURGE_MANIFEST_MAX_KEYS: usize = 10_000;

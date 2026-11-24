@@ -1,7 +1,8 @@
 # =============================================================================
 # Lattice Prometheus alert rules (Alertmanager rule file)
 # =============================================================================
-# single source of metric names: crates/lattice-node/src/observe/metrics.rs
+# single source of metric names: crates/lattice-node/src/observe/metrics.rs (node) and
+#   crates/lattice-node/src/transfer/metrics.rs (download transfer plane, separate registry on :9101)
 # spec reference: the platform implementation document (outside this repository) §8.3 "Alerts (Alertmanager rules)" +
 #           §10 "Load tests and SLO validation"
 #
@@ -9,7 +10,7 @@
 # each rule's summary/description states the meaning + handling direction;
 # handling details are in the "Alert meanings and handling" section of deploy/observability/README.md.
 #
-# ⚠ instrumentation/scrape status (metrics.rs and call sites checked against node v0.5.0 on 2026-11-21):
+# ⚠ instrumentation/scrape status (metrics.rs and call sites checked against node v0.1.0 on 2026-11-21):
 #   - scrape endpoint: primarily the standalone /metrics endpoint from observe/metrics_server.rs (unauthenticated, read-only,
 #     bind [node] metrics, default 127.0.0.1:9100; LATTICE__NODE__METRICS=0.0.0.0:9100 in containers);
 #     the /v1/admin/metrics fallback needs an admin JWT (used only for old binaries or when the listener is disabled, see prometheus.yml option B).
@@ -49,10 +50,10 @@ groups:
             so the service may still be working — check node logs "metrics listener bind failed" / "prometheus metrics listening",
             and confirm [node] metrics is not set to off); ③ scrape port/firewall/network unreachable (container maps 9100, host runs 127.0.0.1:9100);
             ④ scrape timeout (scrape_timeout=10s); ⑤ if the /v1/admin/metrics fallback is enabled, an expired or
-            unrefreshed admin JWT causes 401 (JWT TTL=900s; check the scripts/obs-refresh-admin-jwt.ps1 scheduled task).
-            Handling: first confirm the process and port (Get-Process lattice-node / Get-NetTCPConnection -LocalPort 9100),
+            unrefreshed admin JWT causes 401 (JWT TTL=900s; check the token refresh job).
+            Handling: first confirm the process and port (pgrep -a lattice-node / ss -ltnp 'sport = :9100'),
             then curl http://<target>:9100/metrics and /v1/ready, and finally read the error on the Prometheus target page.
-          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+          runbook: "deploy/observability/README.md#handling-notes"
 
       - alert: LatticeNodeOnlineConnectionsCollapsed
         expr: >-
@@ -397,4 +398,76 @@ groups:
             or a load test is running; sustained rate limiting shows up as upstream 429s and as a leading signal of backpressure/error-rate changes.
             Handling: locate the account and source IP for user_hash and check the quota field via /v1/admin/users;
             route abnormal flooding to risk control (lattice:risk); for organic growth, review quotas or scale out.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+  # ---------------------------------------------------------------------------
+  #   # 7) download transfer plane (v0.19; separate process/registry on :9101)
+  # ---------------------------------------------------------------------------
+  - name: lattice-transfer
+    interval: 30s
+    rules:
+      - alert: LatticeTransferScrapeDown
+        expr: up{job="lattice-transfer"} == 0
+        for: 1m
+        labels:
+          severity: P1
+          component: transfer
+          service: lattice
+        annotations:
+          summary: "Lattice transfer plane metrics scrape failed (all download replicas may be down)"
+          description: >-
+            up{job="lattice-transfer"} == 0 for 1 minute. Downloads answer 302 to the transfer plane, so a full outage
+            makes every plugin/source/large-message/recording download fail even though the message API is healthy.
+            Handling: check the transfer Deployment/Compose service, its /healthz and /readyz, the /t ingress route,
+            and whether the [transfer] secret is present in both workloads.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeTransferNotReady
+        expr: lattice_transfer_ready == 0
+        for: 1m
+        labels:
+          severity: P1
+          component: transfer
+          service: lattice
+        annotations:
+          summary: "Lattice transfer plane reports no healthy object-storage endpoint"
+          description: >-
+            lattice_transfer_ready == 0 for 1 minute: /readyz found zero reachable [s3] endpoints (or [s3] endpoints
+            is empty/misconfigured). Node business APIs stay healthy but every download returns 503.
+            Handling: check MinIO/LB reachability from the transfer pods, [s3] endpoint(s), credentials, and the
+            upstream_failures metric to see which endpoint failed.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeTransferErrorRate
+        expr: >-
+          sum(rate(lattice_transfer_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(lattice_transfer_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: P2
+          component: transfer
+          service: lattice
+        annotations:
+          summary: "Lattice transfer plane 5xx rate exceeds 5%"
+          description: >-
+            More than 5% of transfer responses are 5xx for 5 minutes (upstream_unavailable / upstream_error / busy /
+            upstream_denied). Meaning: object storage degraded, endpoint failover exhausted, concurrency cap reached,
+            or the S3 credentials are wrong. Expired/invalid tokens are 4xx/410 and do not trigger this rule.
+            Handling: inspect the status breakdown, lattice_transfer_upstream_failures_total{endpoint}, and the transfer
+            logs; scale replicas if the cause is `busy`.
+          runbook: "deploy/observability/README.md#alert-meanings-and-handling"
+
+      - alert: LatticeTransferUpstreamFailover
+        expr: sum(increase(lattice_transfer_upstream_failures_total[5m])) > 0
+        for: 3m
+        labels:
+          severity: P2
+          component: transfer
+          service: lattice
+        annotations:
+          summary: "Lattice transfer plane is failing over object-storage endpoints"
+          description: >-
+            At least one [s3] endpoint attempt failed in the last 5 minutes and the pattern persists for 3 minutes.
+            Downloads may still succeed through a replica, but the failing endpoint needs attention (network, MinIO node,
+            LB health check). Check lattice_transfer_upstream_failures_total by endpoint and the MinIO cluster health.
           runbook: "deploy/observability/README.md#alert-meanings-and-handling"

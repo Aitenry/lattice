@@ -7,6 +7,7 @@ import { listDlq, replayDlq } from '@/api/endpoints'
 import type { DlqRow } from '@/api/types'
 import { useAuth } from '@/auth/AuthProvider'
 import { ReasonModal } from '@/components/ReasonModal'
+import { HelpTip } from '@/components/HelpTip'
 import { fmtTime } from '@/lib/format'
 import { DELIVERY_STATE, DELIVERY_STATE_HINT, pick, toneOf } from '@/lib/labels'
 import { useI18n } from '@/i18n'
@@ -82,13 +83,11 @@ export default function DlqPage() {
             onSearch={(v) => setUser(v.trim())}
           />
           <span className="muted">{t('{count} items', { count: rows.length })}</span>
-        </div>
-
-        <div className="soft-panel" style={{ marginBottom: 12 }}>
-          <b>{t('What replay does:')}</b>{' '}
-          {t(
-            'Puts these messages back into the delivery queue and sends them again in the original order. Messages that have expired or been deleted cannot be replayed; after you submit, they are listed separately and do not count as a failure.',
-          )}
+          <HelpTip
+            title={t(
+              'Replay puts the selected messages back into the delivery queue and sends them again in the original order. Messages that have expired or been deleted cannot be replayed; after you submit, they are listed separately and do not count as a failure.',
+            )}
+          />
         </div>
 
         <Table<DlqRow>
@@ -110,7 +109,7 @@ export default function DlqPage() {
             onChange: (keys) => setSelected(keys.map(String)),
             getCheckboxProps: (r) => ({ disabled: !r.msg_id }),
           }}
-          pagination={{ pageSize, showTotal: (count) => t('{count} items', { count }) }}
+          pagination={{ pageSize, showSizeChanger: false, showTotal: (count) => t('{count} items', { count }) }}
           columns={[
             {
               title: t('Message'),

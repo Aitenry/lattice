@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Descriptions,
+  Empty,
   Form,
   Input,
   InputNumber,
@@ -17,6 +18,7 @@ import {
 } from 'antd'
 import { ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import type { ColumnsType } from 'antd/es/table'
+import { LIST_PAGE_SIZE, LIST_SCROLL_Y } from '@/components/listLayout'
 import { drainNode, getDrainProgress, listNodes } from '@/api/endpoints'
 import { probeReady } from '@/api/http'
 import type { DrainProgress, NodeRow } from '@/api/types'
@@ -41,6 +43,8 @@ export default function NodesPage() {
   const { message } = AntApp.useApp()
   const [rows, setRows] = useState<NodeRow[]>([])
   const [loading, setLoading] = useState(false)
+  const [page, setPage] = useState(1)
+  const pageSize = LIST_PAGE_SIZE
   const [ready, setReady] = useState<{ ready: boolean; deps: Record<string, string> } | null>(null)
   const [drainOpen, setDrainOpen] = useState(false)
   const [drainTarget, setDrainTarget] = useState<string | null>(null)
@@ -69,6 +73,12 @@ export default function NodesPage() {
       if (timer.current) window.clearInterval(timer.current)
     }
   }, [load])
+
+  // Keep the current page valid when the cluster shrinks
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(rows.length / pageSize))
+    if (page > maxPage) setPage(maxPage)
+  }, [rows.length, page, pageSize])
 
   const openDrain = (nodeId: string) => {
     setDrainTarget(nodeId)
@@ -187,33 +197,41 @@ export default function NodesPage() {
   ]
 
   return (
-    <div className="page-scroll">
-      <Card
-        title={
-          <Space>
-            {t('Server nodes')}
-            <HelpTip title={t('Heartbeats are written every 10s; the connection count is realtime. Draining stops the node from accepting new connections and sends byef to live ones — used for rolling upgrades and decommissioning.')} />
-          </Space>
-        }
-        extra={
-          <Space>
-            {ready ? (
-              <Tag color={ready.ready ? 'green' : 'red'}>{ready.ready ? t('Ready') : t('Not ready')}</Tag>
-            ) : null}
-            <Button size="small" icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
+    <div className="page-fill">
+      <Card className="list-card">
+        <div className="toolbar">
+          {ready ? (
+            <Tag color={ready.ready ? 'green' : 'red'}>{ready.ready ? t('Ready') : t('Not ready')}</Tag>
+          ) : null}
+          <span className="muted">{t('{count} nodes', { count: rows.length })}</span>
+          <HelpTip
+            title={t(
+              'Heartbeats are written every 10s; the connection count is realtime. Draining stops the node from accepting new connections and sends byef to live ones — used for rolling upgrades and decommissioning.',
+            )}
+          />
+          <div className="toolbar-right">
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
               {t('Refresh')}
             </Button>
-          </Space>
-        }
-      >
+          </div>
+        </div>
+
         <Table
           rowKey="node_id"
           size="small"
           loading={loading}
-          dataSource={rows}
+          dataSource={rows.slice((page - 1) * pageSize, page * pageSize)}
           columns={columns}
-          pagination={false}
-          scroll={{ x: 820 }}
+          scroll={{ y: LIST_SCROLL_Y }}
+          pagination={{
+            current: page,
+            pageSize,
+            total: rows.length,
+            showSizeChanger: false,
+            onChange: (p) => setPage(p),
+            showTotal: (count) => t('{count} nodes', { count }),
+          }}
+          locale={{ emptyText: <Empty description={t('No server nodes are reporting')} image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
         />
       </Card>
 

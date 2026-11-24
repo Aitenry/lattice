@@ -21,6 +21,7 @@ pub mod plugins;
 pub mod routing;
 pub mod state;
 pub mod store;
+pub mod transfer;
 pub mod transport;
 
 pub use error::{LatticeError, Result};

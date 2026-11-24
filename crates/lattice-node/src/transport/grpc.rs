@@ -703,7 +703,7 @@ mod tests {
     fn proto_stubs_compile_and_roundtrip() {
         let info = NodeInfo {
             node_id: "node-a".into(),
-            version: "0.5.0".into(),
+            version: "0.1.0".into(),
             connections: 3,
             protocol_version: 1,
             seq_watermark: std::collections::HashMap::new(),

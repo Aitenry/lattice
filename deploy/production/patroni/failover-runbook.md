@@ -145,11 +145,11 @@ SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), r
   FROM pg_replication_slots;
 ```
 
-Application side (following the general flow in `deploy/production/README.md` §5):
+Application side (following the general flow in `deploy/production/README.md`):
 
 1. `curl -fsS http://<node>:8080/v1/ready` → 200;
-2. Run login/message round-trip/WS upgrade/large-file download once each (`scripts/smoke.ps1` equivalent production smoke test);
-3. `python scripts/reconcile.py`: `delivery_log` and `messages` watermarks agree, pending rebuild is idempotent;
+2. Run login/message round-trip/WS upgrade/large-file download once each as an equivalent production smoke test;
+3. Reconcile pending state with the `lock:reconcile` task: `delivery_log` and `messages` watermarks agree, and the pending rebuild is idempotent;
 4. Observe for ≥10 minutes: error rate, `pg_stat_replication` Lag, archive failure count, node reconnect logs.
 
 ## 8. Failback principles (do not fail back just to "look restored")

@@ -79,7 +79,7 @@ pub async fn build(cfg: Config) -> crate::Result<Arc<AppState>> {
                                 &db,
                                 username,
                                 &hash,
-                                Some(if username == "admin" { "Eddie" } else { "bootstrap admin" }),
+                                Some(if username == "admin" { "Administrator" } else { "Bootstrap admin" }),
                                 "admin",
                             )
                             .await
@@ -204,11 +204,25 @@ pub async fn build(cfg: Config) -> crate::Result<Arc<AppState>> {
     //      and the bus type (nats/redis) decides in 6.0/6.1 whether to use producer+durable consumer or direct writes.
     let (recorder, record_rx) = crate::routing::media::build_recorder(&cfg.media, metrics.clone());
 
+    // 5.10) Download transfer plane signer (design §6.10): `None` unless `[transfer] enabled`.
+    //       When enabled, hub/message/recording downloads 302 to the stateless transfer service
+    //       with a short-lived HMAC capability; the node never proxies object bytes and never
+    //       exposes the object-store address to clients. The secret is validated at startup.
+    let transfer = crate::transfer::build_signer(&cfg.transfer)?;
+    if let Some(signer) = &transfer {
+        tracing::info!(
+            ttl_secs = signer.ttl_secs(),
+            base = %cfg.transfer.public_base_url,
+            "download transfer plane enabled"
+        );
+    }
+
     let state = Arc::new(AppState {
         db,
         admin_db,
         redis,
         s3,
+        transfer,
         bus,
         wal,
         pg_degrade: crate::state::PgDegradeCache::default(),
