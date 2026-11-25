@@ -4,6 +4,7 @@ import {
   Alert,
   Button,
   Card,
+  Descriptions,
   Drawer,
   Dropdown,
   Form,
@@ -48,7 +49,6 @@ import { UserAvatar, initialOfName } from '@/components/UserAvatar'
 import { fmtBytes, fmtTime } from '@/lib/format'
 import { ACCOUNT_STATUS, pick, toneOf } from '@/lib/labels'
 import { HelpTip } from '@/components/HelpTip'
-import { JsonPeek } from '@/components/JsonPeek'
 import { useI18n, type Translate } from '@/i18n'
 
 const ROLES: Role[] = ['admin', 'ops', 'user']
@@ -57,6 +57,68 @@ const ROLE_HINT: Record<Role, string> = {
   admin: 'Full access, including change operations',
   ops: 'Can perform disposition actions, but cannot change config or accounts',
   user: 'Regular user (read-only)',
+}
+
+/**
+ * The part of `GET /v1/admin/users/{id}/purge` the progress drawer renders.
+ *
+ * The endpoint returns three blocks: `progress` (per-store item counts), `cleanup`
+ * (background cascade progress; null until a compliance delete actually starts) and
+ * `residual` (measured right now, to confirm nothing is left).
+ */
+interface PurgeCounts {
+  pg_messages?: number
+  pg_devices?: number
+  minio_objects?: number
+}
+
+interface PurgeCleanup {
+  phase?: string
+  messages_deleted?: number
+  chunks_deleted?: number
+  objects_deleted?: number
+  objects_failed?: number
+  redis_keys_deleted?: number
+  started_at?: string | null
+  finished_at?: string | null
+  last_error?: string | null
+  object_keys?: string[]
+  manifest_truncated?: boolean
+}
+
+interface PurgeResidual {
+  pg_messages?: number
+  pg_chunks?: number
+  pg_delivery_log?: number
+  pg_devices?: number
+  pg_user_status?: string | null
+  minio_objects_recorded?: number
+  cleanup_phase?: string
+}
+
+interface PurgeProgressData {
+  user_id?: string
+  progress?: PurgeCounts
+  cleanup?: PurgeCleanup | null
+  residual?: PurgeResidual
+}
+
+/** Cleanup phases written by the node (`jobs.rs::PurgeProgress`) in plain language */
+const PURGE_PHASE_LABEL: Record<string, string> = {
+  queued: 'Queued',
+  objects: 'Deleting files',
+  redis: 'Clearing cache',
+  done: 'Done',
+  error: 'Failed',
+}
+
+function purgePhaseText(phase: string | undefined, t: Translate): string {
+  if (!phase) return '—'
+  return t(PURGE_PHASE_LABEL[phase] ?? phase)
+}
+
+function purgeCountText(v: number | undefined): string {
+  return typeof v === 'number' ? String(v) : '—'
 }
 
 /** One-line quota summary (the table cannot stack four fields) */
@@ -198,7 +260,7 @@ export default function UsersPage() {
     | { kind: 'purge'; user: AdminUser }
   >(null)
 
-  const [purgeInfo, setPurgeInfo] = useState<{ user: AdminUser; data: unknown } | null>(null)
+  const [purgeInfo, setPurgeInfo] = useState<{ user: AdminUser; data: PurgeProgressData } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -412,6 +474,9 @@ export default function UsersPage() {
     return items
   }
 
+  const purgeCleanup = purgeInfo?.data.cleanup
+  const purgeResidual = purgeInfo?.data.residual
+
   return (
     <div className="page-fill">
 
@@ -561,7 +626,7 @@ export default function UsersPage() {
                         setReason({ kind: key, user: r })
                       } else if (key === 'progress') {
                         try {
-                          setPurgeInfo({ user: r, data: await getPurgeProgress(r.id) })
+                          setPurgeInfo({ user: r, data: (await getPurgeProgress(r.id)) as PurgeProgressData })
                         } catch (e) {
                           message.error(errText(e))
                         }
@@ -882,7 +947,74 @@ export default function UsersPage() {
         <Typography.Paragraph type="secondary" style={{ fontSize: 13 }}>
           {t('Deletion runs in steps: disable the account, clean up messages and files, then remove it from the database. Below is the current progress.')}
         </Typography.Paragraph>
-        <JsonPeek data={purgeInfo?.data} label={t('Raw response of the purge-job endpoint (GET /v1/admin/users/{id}/purge)')} />
+
+        {purgeCleanup ? (
+          <Descriptions column={1} size="small" bordered style={{ marginBottom: 12 }}>
+            <Descriptions.Item label={t('Cleanup phase')}>
+              {purgePhaseText(purgeCleanup.phase, t)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Deleted messages')}>
+              {purgeCountText(purgeCleanup.messages_deleted)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Deleted chunks')}>
+              {purgeCountText(purgeCleanup.chunks_deleted)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Deleted files')}>
+              {purgeCountText(purgeCleanup.objects_deleted)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('File deletions that failed')}>
+              {purgeCountText(purgeCleanup.objects_failed)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Cleared cache keys')}>
+              {purgeCountText(purgeCleanup.redis_keys_deleted)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Started / ended')}>
+              {purgeCleanup.started_at ? fmtTime(purgeCleanup.started_at) : '—'}
+              {' / '}
+              {purgeCleanup.finished_at ? fmtTime(purgeCleanup.finished_at) : '—'}
+            </Descriptions.Item>
+          </Descriptions>
+        ) : (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={t('No deletion task has been started for this account.')}
+          />
+        )}
+
+        {purgeCleanup?.last_error ? (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={t('The last cleanup attempt failed')}
+            description={purgeCleanup.last_error}
+          />
+        ) : null}
+
+        {purgeResidual ? (
+          <Descriptions column={1} size="small" bordered title={t('Remaining right now')}>
+            <Descriptions.Item label={t('Remaining messages')}>
+              {purgeCountText(purgeResidual.pg_messages)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Remaining chunks')}>
+              {purgeCountText(purgeResidual.pg_chunks)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Remaining delivery records')}>
+              {purgeCountText(purgeResidual.pg_delivery_log)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Remaining devices')}>
+              {purgeCountText(purgeResidual.pg_devices)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Recorded objects')}>
+              {purgeCountText(purgeResidual.minio_objects_recorded)}
+            </Descriptions.Item>
+            <Descriptions.Item label={t('Account status')}>
+              {t(pick(ACCOUNT_STATUS, purgeResidual.pg_user_status))}
+            </Descriptions.Item>
+          </Descriptions>
+        ) : null}
       </Drawer>
     </div>
   )

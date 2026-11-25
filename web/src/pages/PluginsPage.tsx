@@ -32,7 +32,6 @@ import { useAuth } from '@/auth/AuthProvider'
 import { PLUGIN_STATUS, pick, toneOf } from '@/lib/labels'
 import { fmtBytes, fmtRelative, fmtTime } from '@/lib/format'
 import { HelpTip } from '@/components/HelpTip'
-import { JsonPeek } from '@/components/JsonPeek'
 import { useI18n, type Translate } from '@/i18n'
 
 /** The stats endpoint has an unstable shape: scalars go straight into the table, complex values are collapsed */
@@ -208,9 +207,7 @@ function WasmStatusPanel({ wasm }: { wasm: WasmRuntimeState }) {
                   )
                 })}
                 {rejected.length > 5 ? (
-                  <span className="wasm-block-sub">
-                    {t('Showing the first 5 only; see technical details for every reason.')}
-                  </span>
+                  <span className="wasm-block-sub">{t('Only the first 5 are shown.')}</span>
                 ) : null}
               </div>
             </div>
@@ -256,15 +253,6 @@ function WasmStatusPanel({ wasm }: { wasm: WasmRuntimeState }) {
             </div>
           </div>
         </aside>
-      </div>
-
-      <div className="wasm-raw">
-        <JsonPeek
-          data={wasm}
-          label={t(
-            'Raw response of the WASM section of the plugin API (read-only; with load and rejection details and safety notes)',
-          )}
-        />
       </div>
     </section>
   )
@@ -559,7 +547,6 @@ export default function PluginsPage() {
             ))}
           </Descriptions>
         ) : null}
-        <JsonPeek data={stats?.data} label={t('Raw response of the plugin stats endpoint (GET /v1/admin/plugins/{ns}/stats)')} />
       </Drawer>
     </div>
   )

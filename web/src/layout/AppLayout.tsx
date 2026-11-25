@@ -560,7 +560,7 @@ export default function AppLayout() {
         </div>
         {!collapsed && (
           <div className="sider-footer">
-            <div>{t('v0.1.0 · Admin')}</div>
+            <div>{t('v0.1.1 · Admin')}</div>
             <div>{session?.username ? t('Signed in: {user}', { user: session.username }) : ''}</div>
           </div>
         )}

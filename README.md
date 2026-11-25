@@ -160,6 +160,7 @@ The node reads a TOML file from `--config` or `LATTICE_CONFIG`, then applies env
 ## Deployment
 
 - `deploy/compose/dev.yaml`: single-host development stack with PostgreSQL, Redis, MinIO, NATS, node, and web, plus an optional TURN profile.
+- `deploy/compose/prod.yaml`: isolated single-host production-profile stack with generated secrets, password-protected middleware, NATS JetStream, a writable WAL volume, and only the console port exposed off loopback (seed it with `deploy/migrate/`).
 - `deploy/compose/ha-dev.yaml`: multi-node development stack behind a load balancer for failover drills.
 - `deploy/helm/lattice`: Helm chart with autoscaling, disruption budget, network policy, ingress, backup, point-in-time recovery, and optional canary release.
 - `deploy/production/`: component-level templates for Patroni and etcd, NATS JetStream, Redis Sentinel, MinIO erasure coding, TLS, backup, and recovery.

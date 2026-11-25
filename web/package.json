@@ -1,7 +1,7 @@
 {
   "name": "lattice-admin",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "Lattice administration console for the platform admin API",
   "scripts": {

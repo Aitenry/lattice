@@ -117,7 +117,7 @@ export default function LoginPage() {
 
         <div className="login-foot">
           {node?.version ? `${t('Node version {version}', { version: node.version })} · ` : ''}
-          {t('Lattice admin console v0.1.0')}
+          {t('Lattice admin console v0.1.1')}
         </div>
       </aside>
 

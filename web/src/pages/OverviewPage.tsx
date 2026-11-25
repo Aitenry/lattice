@@ -13,7 +13,6 @@ import { probeReady } from '@/api/http'
 import { fmtRelative, fmtTime } from '@/lib/format'
 import { NODE_HEALTH, pick } from '@/lib/labels'
 import { HelpTip } from '@/components/HelpTip'
-import { JsonPeek } from '@/components/JsonPeek'
 import { useI18n } from '@/i18n'
 
 /**
@@ -328,8 +327,6 @@ export default function OverviewPage() {
                 </span>
               </div>
             </div>
-
-            <JsonPeek data={online} label={t('Raw payload (all fields of the online event)')} />
           </section>
         </div>
       </Card>

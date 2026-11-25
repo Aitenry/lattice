@@ -2,7 +2,7 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: Lattice Platform API (Unified Messaging Platform)
-  version: 0.1.0
+  version: 0.1.1
   summary: Machine-readable contract for all REST/SSE/probe routes in Doc ⑤ (with WS/MQTT/gRPC boundary registrations)
   description: |-
     The **machine-readable authoritative artifact** for the Lattice platform API contract, mapping one-to-one to
@@ -826,7 +826,7 @@ components:
             bus: { type: string, enum: [ok, degraded, down] }
         draining: { type: boolean }
         node_id: { $ref: '#/components/schemas/Ulid' }
-        version: { type: string, example: 0.1.0 }
+        version: { type: string, example: 0.1.1 }
 
     # ------------------------------------------------------------------ Media
     TurnCredentials:

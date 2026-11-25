@@ -127,6 +127,44 @@ When the node starts against NATS it creates the four streams (`LATTICE_ROUTE`, 
 
 - [`quic-lb-udp.yaml`](quic-lb-udp.yaml) sketches the Kubernetes UDP ingress for QUIC, WebTransport, and TURN: an NLB Service with `externalTrafficPolicy: Local` and client source-IP preservation. It defines the network shape only; the LB-to-node mapping and the node's optional `quic` feature still have to be configured for the target cluster.
 
+## Production profile (single host)
+
+[`compose/prod.yaml`](compose/prod.yaml) is an isolated, production-profile stack for one
+Docker host. It uses its own Compose project (`lattice-prod`), volumes, network and
+credentials, and runs next to the development stack without sharing ports:
+
+| Entry point | Address |
+|---|---|
+| Console (nginx proxying `/v1` and `/t/`) | http://127.0.0.1:8089 |
+| Node (health/debug) | `127.0.0.1:8180` |
+| Transfer plane (direct) | `127.0.0.1:8190` |
+| PostgreSQL / Redis / NATS / MQTT | `127.0.0.1:5433` / `6380` / `4223` / `1884` |
+| MinIO S3 API / console | `127.0.0.1:9002` / `9003` |
+| Prometheus metrics | `127.0.0.1:9110` (node), `127.0.0.1:9111` (transfer) |
+
+Differences from the development stack: the console is the only port published off
+loopback; PostgreSQL, Redis and MinIO require generated passwords; the bus is NATS
+JetStream; internal gRPC is disabled (single node, no plaintext listener); the node runs
+with the production TOML mounted read-only over the image default; the node entrypoint
+hands its WAL volume to the unprivileged UID and drops to it before exec (no separate init
+container); and every secret comes from a git-ignored `config/prod.env` file generated on
+first start.
+
+Large-upload part URLs are presigned against `[s3] public_endpoint`, which this profile sets
+to `http://127.0.0.1:9002` because the host name of a real deployment is unknown; change it
+to a client-reachable address before serving desktop clients from other machines. Plugin
+downloads and their sources go through the transfer plane and are unaffected.
+
+```powershell
+pwsh -File deploy/migrate/init-prod.ps1   # secrets + images + stack + readiness
+node deploy/migrate/seed.mjs              # migrate users, latest plugin versions, install data
+```
+
+[`migrate/README.md`](migrate/README.md) documents the exact seed scope (three users, the
+latest version of each published plugin, and user plugin data) and its verification.
+The single-host profile still relies on an edge proxy for TLS; the HA topologies, mTLS,
+backup/PITR and multi-host assets remain under [`production/`](production/README.md).
+
 ## Production assets
 
 Everything under [`production/`](production/README.md) is a set of copyable templates, not a running cluster. The assets have been reviewed statically (YAML/TOML structure, replica counts, ports, probes, secret placeholders, and erasure-coding parameters); they have not been validated on multi-host, load-balancer, or cloud infrastructure.

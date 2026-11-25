@@ -112,6 +112,8 @@ services:
       # so nothing needs overriding inside containers; only override them to 127.0.0.1 when running directly on the host.
       # dev.toml binds the metrics port to 127.0.0.1:9100, and inside a container it must listen on all interfaces to be scraped
       LATTICE__NODE__METRICS: "0.0.0.0:9100"
+      # Batch plugin releases: raise the hub publish quota (default 10/hour) for the dev stack.
+      LATTICE_HUB_PUBLISH_LIMIT: "100"
     ports:
       - "8080:8080"
       # MQTT gateway (P3, ⑤ §11): [mqtt] enabled=true in dev.toml; TLS is terminated by the front proxy

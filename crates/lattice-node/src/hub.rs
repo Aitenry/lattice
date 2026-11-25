@@ -375,7 +375,7 @@ async fn create(
     user: AuthUser,
     Json(req): Json<CreateReq>,
 ) -> ApiResult<Response> {
-    rate_limit(&st, "publish", &user.user_id, 3600, 10, "hub_publish").await?;
+    rate_limit(&st, "publish", &user.user_id, 3600, publish_rate_limit(), "hub_publish").await?;
     validate_create(&req)?;
 
     let category = req.category.clone().unwrap_or_else(|| "other".into());
@@ -2205,6 +2205,19 @@ fn inflate_raw(
 // ---------------------------------------------------------------------------
 // General helpers
 // ---------------------------------------------------------------------------
+
+/// Hub publish quota (per user per hour).
+///
+/// The contract default stays 10/hour (⑤ §12.3), but local and test stacks need to release
+/// several plugins in one batch. Environment override avoids rebuilding the node just to change
+/// an operational quota: `LATTICE_HUB_PUBLISH_LIMIT=100`.
+fn publish_rate_limit() -> i64 {
+    std::env::var("LATTICE_HUB_PUBLISH_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10)
+}
 
 async fn rate_limit(
     st: &Arc<AppState>,

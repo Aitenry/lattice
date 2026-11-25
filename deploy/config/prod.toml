@@ -1,0 +1,126 @@
+# =============================================================================
+# Lattice production-profile configuration (single-host Compose stack)
+# -----------------------------------------------------------------------------
+# Mounted read-only at /etc/lattice/config.toml by deploy/compose/prod.yaml.
+# Isomorphic with SAMPLE_TOML in crates/lattice-node/src/config.rs: every key that is
+# not listed here keeps the code default.
+#
+# Secrets are NOT in this file. They are injected as LATTICE__* environment variables
+# from deploy/config/prod.env (config.rs::apply_env), which take precedence over TOML:
+#   LATTICE__PG__URL                    postgres://lattice_app:<pw>@pg:5432/lattice?sslmode=disable
+#   LATTICE__REDIS__URL                 redis://:<pw>@redis:6379/0
+#   LATTICE__S3__ACCESS_KEY/SECRET_KEY  MinIO credentials (must equal MINIO_ROOT_*)
+#   LATTICE__TRANSFER__SECRET           >=32-byte HMAC secret shared by node + transfer
+#   LATTICE__BUS__NATS_URL              nats://lattice:<pw>@nats:4222
+#   LATTICE__ADMIN__BOOTSTRAP_PASSWORD  first-boot administrator only (removed after seeding)
+#
+# TLS is deliberately terminated by the edge in a real production deployment. This
+# profile binds the console on the host and keeps every middleware port on loopback.
+# =============================================================================
+
+[node]
+# Empty = the node generates a ULID at startup (single replica in this profile).
+id = ""
+listen_http = "0.0.0.0:8080"
+listen_ws = "0.0.0.0:8443"
+# Must listen on all interfaces inside the container so Prometheus can scrape it.
+metrics = "0.0.0.0:9100"
+log = "json"
+
+[auth]
+jwt_alg = "RS256"
+jwt_ttl = 900
+jwt_issuer = "lattice"
+# Named volume; in a cluster this is a Secret-mounted directory instead.
+key_dir = "/etc/lattice/keys"
+fingerprint_required = true
+key_overlap_hours = 24.0
+key_prune_interval_ms = 60000
+
+[pg]
+# The password is injected through LATTICE__PG__URL (env wins over this value).
+url = "postgres://lattice_app@pg:5432/lattice?sslmode=disable"
+pool_size = 32
+statement_timeout_ms = 5000
+admin_statement_timeout_ms = 30000
+
+[wal]
+# Small messages are buffered locally while PostgreSQL is unwritable. The Compose stack
+# mounts the waldata volume; the node entrypoint hands it to UID 10001 before dropping
+# privileges (a fresh named volume is root-owned).
+enabled = true
+dir = "/var/lib/lattice/wal"
+max_bytes = 67108864
+replay_interval_ms = 2000
+
+[redis]
+url = "redis://redis:6379/0"
+pool_size = 64
+
+[s3]
+# Internal, in-network endpoint (http only; TLS is terminated at the edge in production).
+endpoint = "http://minio:9000"
+# Client-reachable address used by large-upload part URLs. Downloads go through the
+# transfer plane instead, so this is not part of the download path.
+public_endpoint = "http://127.0.0.1:9002"
+region = "us-east-1"
+access_key = ""            # -> LATTICE__S3__ACCESS_KEY
+secret_key = ""            # -> LATTICE__S3__SECRET_KEY
+bucket_large = "lattice-large"
+bucket_media = "lattice-media"
+bucket_cold = "lattice-cold"
+bucket_plugins = "lattice-plugins"
+presign_ttl = 900
+upload_parallel = 8
+
+[transfer]
+# Download data plane: hub/message/recording downloads 302 to /t/{token}; the stateless
+# lattice-transfer process verifies the capability token and streams from MinIO.
+enabled = true
+public_base_url = ""       # empty = same-origin relative /t/{token} (nginx in front routes /t/)
+secret = ""                # -> LATTICE__TRANSFER__SECRET (>= 32 bytes)
+token_ttl_secs = 300
+listen = "0.0.0.0:8090"
+metrics_listen = "0.0.0.0:9101"
+connect_timeout_ms = 3000
+read_timeout_ms = 30000
+request_timeout_ms = 300000
+max_inflight = 256
+
+[bus]
+# NATS JetStream is the primary bus; the node degrades to Redis Pub/Sub per the
+# degradation matrix when NATS is unavailable (② §4.8).
+kind = "nats"
+nats_url = "nats://nats:4222"   # credentials injected through LATTICE__BUS__NATS_URL
+jetstream = true
+
+[mqtt]
+# Internal plaintext listener (1883); production devices use 8883 with TLS/mTLS at the edge.
+enabled = true
+bind = "0.0.0.0:1883"
+max_connections = 10000
+
+[grpc]
+# Single-node profile: no cross-node delivery, so the plaintext internal gRPC listener
+# stays off. A multi-node deployment enables it together with mandatory mTLS
+# (deploy/production/config/production.toml.example, deploy/production/tls).
+enabled = false
+bind = "127.0.0.1:9090"
+fallback = true
+
+[policy]
+mode = "zero-knowledge"    # inspectable mode must be enabled explicitly (§17.7)
+dedup_ttl = 86400
+chunk_threshold_max = 33554432
+chunk_part = 262144
+protocol_version = 1
+protocol_min_supported = 1
+msg_per_s = 100
+bytes_per_s = 26214400
+topics_per_user = 100
+
+[admin]
+# First-boot administrator only. The production database is seeded from the development
+# instance right after the first start, so this account is replaced by the migrated
+# `admin` (Eddie) row and the bootstrap password is removed from prod.env afterwards.
+bootstrap_username = "admin"

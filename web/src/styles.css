@@ -1440,10 +1440,6 @@ body {
   overflow-wrap: anywhere;
 }
 
-.wasm-raw {
-  margin-top: 8px;
-}
-
 @media (max-width: 1200px) {
   .wasm-grid {
     grid-template-columns: minmax(0, 1fr);
